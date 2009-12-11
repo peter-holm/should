@@ -1,0 +1,59 @@
+SHOULD's configuration files and command line
+
+Should accepts its configuration from the command line or from files.
+The format is identical (although extra quotes may be required in the
+command line to protect things from the shell). The format is either
+"name" or "name=value".
+
+When starting up, "should" sets some default configuration, decided
+at compile time, and then reads a configuration file, if found. The
+path to the configuration file is set at compile time, but normally
+"should" will look for a file in ~/.should.conf, and if that does not
+exist, in /etc/should.conf. If neither file exists, the default
+configuration is left unchanged. If a configuration file is read, it
+can override defaults.
+
+Command line options are processed after any default configuration
+file, and override their settings.
+
+A special command-line option, "config=FILE" can be used to read another
+configuration file. An option contained in the file override a corresponding
+option which appears before in the command line (or in the default
+configuration file), and can be overridden by options following "config=FILE",
+including a subsequent "config=SECOND_FILE". The "config=FILE" option can
+be used inside a configuration file too, to include another file, and it
+can be written as "include=FILE".
+
+The best way to find out about the configuration file format is to use
+one of the following commands:
+
+should printconfig
+    Prints the current configuration on standard output, with comments.
+    The output can be redirected to a file, for example:
+
+    should printconfig > myconfig
+
+    the result can be used as a configuration file, for example:
+    
+    should config=myconfig
+
+should serverconfig
+    Similar to "printconfig", but gets the current configuration from a
+    running server (you'll need to add more command line options to explain
+    how to connect to the server).
+
+should help
+    it does.
+
+The following three commands allow "should" to be used as an initscript:
+
+should start
+    Does the default thing: starts a server.
+
+should status
+    Connects to a server and asks its current status.
+
+should stop
+    Connects to a server and asks it to exit. ("should kill" can also be
+    used with the same result).
+

@@ -1,0 +1,49 @@
+TODO:
+* test file copy with mmap()
+* test copy with compression
+* re-test all server functions
+
+Future improvements:
+* split out client code to a client library to connect/do things/etc, which
+  encapsulates the protocol and just offers library calls. Modify client.c
+  and Should::Client to use this library.
+* there is some time between creating a directory and adding the watch;
+  perhaps the client or the store thread could recurse through any newly
+  created directory and adding create events (and creating watches) for
+  all files found?
+* allow a "rsync" style of behaviour: this would be implemented by the client
+  which would "POLL" to see if events are available, and process them if so;
+  if no events are available, request a directory listing with "GETDIR".
+  Have a queue of directories waiting sync, relative to copy_from/copy_to,
+  initially just ".", and add any subdirs found by "GETDIR" to the queue,
+  process all non-dirs, then try again. If the queue is empty, just skip the
+  "POLL". The "rsync" could be requested by a signal, which will add
+  the root if the queue is empty, or maybe could be timer-based.
+  Also, "add_tree" could trigger one of them.
+* allow client to change some of the server's configs (e.g. error messages
+  and destinations)
+* allow_unix=user[:what], allow_tcp=user:pass[:what] -- what, if present,
+  controls what actions the user is allowed to request (and of course check
+  for this before executing anything); what could be a comma-separated list
+  of copy, status(+watches), stop, add(+remove), rotate(=closelog)
+* maybe the control thread could provide periodic stats (if enabled in config)
+* "should remove" could also remove the parent watch (etc) if its only subdir
+  has just been removed
+* "should remove" could also do with a "find" parameter
+* Add a config parameter to increase fs:inotify:max_user_watches and
+  fs:inotify:max_queued_events on startup, possibly automatically tweaking
+  them somehow if possible and limits are about to be reached.
+* monitor fs:inotify:max_user_watches and fs:inotify:max_queued_events and
+  possibly autoincrease them depending on configurable limits
+* allow to dynamically load "store" methods if not predefined in
+  store_thread.c:store_init()
+* Change should to create a real process (with fork rather than
+  pthread_create) after parsing config, and have the child creating all the
+  threads, while the parent just waits for the child, removes the socket and
+  exits with the child's status. Do this only if a socket is going to be
+  created.
+* [i]exclude_event[_glob] -- does filtering at the event level rather than at
+  the watch level.
+* if a new dir is created which happens to be in a different fs, this will
+  be automatically watched even if "nocross" was specified on the watch.
+
