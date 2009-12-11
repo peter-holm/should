@@ -1,19 +1,31 @@
-#ifndef __SHOULD_PROTOCOL_H__
-#define __SHOULD_PROTOCOL_H__ 1
-
 /* functions to encode and decode data in a network-independent way
  *
  * this file is part of SHOULD
  *
- * Copyright (c) 2008, 2009 Claudio Calvelli <should@intercal.org.uk>
+ * Copyright (c) 2008, 2009 Claudio Calvelli <should@shouldbox.co.uk>
  * 
- * Licenced under the terms of the GPL v3. See file COPYING in the
- * distribution for further details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program (see the file COPYING in the distribution).
+ * If not, see <http://www.gnu.org/licenses/>.
  */
+
+#ifndef __SHOULD_PROTOCOL_H__
+#define __SHOULD_PROTOCOL_H__ 1
 
 #include <time.h>
 #include "notify_thread.h"
 #include "store_thread.h"
+#include "copy_thread.h"
 #include "socket.h"
 
 /* server status information */
@@ -25,9 +37,12 @@ typedef struct {
     struct timespec systime;
     long long memory;
     int clients;
-    notify_status_t ns;
-    store_status_t cs;
+    notify_status_t notify;
+    store_status_t store;
+    copy_status_t copy;
+    int has_status;
     int server_pid;
+    int server_mode;
     int version[3];
 } protocol_status_t;
 

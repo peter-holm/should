@@ -1,3 +1,23 @@
+# Perl client to interface to a running "should" server
+
+# This file is part of SHOULD
+
+# Copyright (c) 2008, 2009 Claudio Calvelli <should@shouldbox.co.uk>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING in the distribution).
+# If not, see <http://www.gnu.org/licenses/>.
+
 =head1 NAME
 
 Should::Client - Interface to a running should server
@@ -38,6 +58,7 @@ use IO::Socket;
 use IO::Socket::INET;
 my $ipclass;
 BEGIN {
+    # use IPv6 if possible, fall back to IPv4 if not
     $ipclass = 'IO::Socket::INET';
     eval {
 	require IO::Socket::INET6;
@@ -50,18 +71,20 @@ use Socket qw(SOL_SOCKET SO_PASSCRED SCM_CREDENTIALS);
 use Digest::MD5;
 use Time::Local 'timegm';
 
-our $VERSION = '1.0.-7';
+our $VERSION = '1.0.-6';
 
 my %compression = (
     null => sub { $_[0] },
 );
 
 eval {
+    # if supported, add "gzip" compression
     require Compress::Zlib;
     $compression{gzip} = sub { Compress::Zlib::uncompress($_[0]) };
 };
 
 eval {
+    # if supported, add "bzip2" compression
     require Compress::Bzip2;
     $compression{bzip2} = sub { Compress::Bzip2::memBunzip($_[0]) };
 };
@@ -77,7 +100,7 @@ credentials. If successful, returns an object reference which can be
 used with the methods described below. On failure, it calls C<die>
 with an appropriate message.
 
-Note that the current version uses IPv6 if possible, falling back to
+That connection will be over IPv6 if possible, falling back to
 IPv4 if necessary.
 
 =item new(SOCKET)
@@ -945,14 +968,25 @@ L<should(1)>
 
 =head1 AUTHOR
 
-Claudio Calvelli <should@intercal.org.uk>
+Claudio Calvelli <should@shouldbox.co.uk>
 
 =head1 COPYRIGHT
 
-Copyright (c) 2008,2009 Claudio Calvelli <should@intercal.org.uk>.
-All rights reserved.
-This module is free software; you can redistribute it and/or
-modify it under the same terms as Perl itself.
+Copyright (c) 2008,2009 Claudio Calvelli <should@shouldbox.co.uk>.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program (see the file COPYING in the distribution).
+If not, see <http://www.gnu.org/licenses/>.
 
 =cut
 

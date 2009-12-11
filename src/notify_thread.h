@@ -1,22 +1,34 @@
-#ifndef __SHOULD_NOTIFY_THREAD_H__
-#define __SHOULD_NOTIFY_THREAD_H__ 1
-
 /* interface to should's notify thread
  *
  * this file is part of SHOULD
  *
- * Copyright (c) 2008, 2009 Claudio Calvelli <should@intercal.org.uk>
+ * Copyright (c) 2008, 2009 Claudio Calvelli <should@shouldbox.co.uk>
  * 
- * Licenced under the terms of the GPL v3. See file COPYING in the
- * distribution for further details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program (see the file COPYING in the distribution).
+ * If not, see <http://www.gnu.org/licenses/>.
  */
 
+#ifndef __SHOULD_NOTIFY_THREAD_H__
+#define __SHOULD_NOTIFY_THREAD_H__ 1
+
+#define NOTIFY_NONE              0
+#define NOTIFY_INOTIFY           1
+
+#define SYS_INOTIFY             10
+#define OUR_INOTIFY             11
+
 #include <sys/types.h>
-#include "config.h"
-
-/* opaque type used by the thread to identify a watch */
-
-typedef struct notify_watch_s notify_watch_t;
 
 /* type used to identify a single event */
 
@@ -89,10 +101,16 @@ typedef struct {
     int kernel_max_events;
 } notify_status_t;
 
+#if NOTIFY != NOTIFY_NONE
+
+/* opaque type used by the thread to identify a watch */
+
+typedef struct notify_watch_s notify_watch_t;
+
 /* initialisation required before the notify thread starts;
  * returns NULL if OK, otherwise an error message */
 
-const char * notify_init(const config_t * cfg);
+const char * notify_init(void);
 
 /* run notify thread; returns NULL on normal termination,
  * or an error message */
@@ -146,6 +164,7 @@ int notify_get(notify_event_t *, int blocking, char * buffer, int * size);
 /* executes a callback once for each active watch */
 
 int notify_forall_watches(int (*)(const char *, void *), void *);
+#endif /* NOTIFY != NOTIFY_NONE */
 
 /* convert a mode_t to a notify_filetype_t */
 

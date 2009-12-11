@@ -2,13 +2,26 @@
  *
  * this file is part of SHOULD
  *
- * Copyright (c) 2008, 2009 Claudio Calvelli <should@intercal.org.uk>
+ * Copyright (c) 2008, 2009 Claudio Calvelli <should@shouldbox.co.uk>
  * 
- * Licenced under the terms of the GPL v3. See file COPYING in the
- * distribution for further details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program (see the file COPYING in the distribution).
+ * If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define _GNU_SOURCE
+#define _GNU_SOURCE /* undo some of glibc's brain damage; works fine
+                     * on BSD and other real OSs without this */
+#include "site.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +31,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/poll.h>
+#if DIRENT_TYPE == DIRENT
 #include <dirent.h>
+#else
+#include <sys/dirent.h>
+#endif
 #include <errno.h>
 #include <ctype.h>
 #include <unistd.h>
@@ -28,13 +45,14 @@
 #include <signal.h>
 #include <syslog.h>
 #include "store_thread.h"
-#include "notify_thread.h"
 #include "main_thread.h"
 #include "config.h"
 #include "error.h"
 #include "mymalloc.h"
 #include "socket.h"
 #include "usermap.h"
+#include "notify_thread.h"
+#if NOTIFY != NOTIFY_NONE
 
 #define SUFFIX_SIZE 32
 #define BLOCK_ADD 512
@@ -74,7 +92,7 @@ typedef struct {
 
 typedef struct {
     const char * name;
-    const char * (*init)(const config_t *, const char *);
+    const char * (*init)(const config_data_t *, const char *);
     const char * (*process)(const notify_event_t *);
     void (*flush)(void);
     void (*exit)(void);
@@ -82,10 +100,9 @@ typedef struct {
 
 static FILE * save_file;
 static char * save_name, * save_suffix;
-static int save_count, save_size, save_earliest, save_current, save_len;
+static int save_count, save_earliest, save_current, save_len;
 static long save_pos;
 static pthread_mutex_t save_lock;
-static int optimise_count;
 
 /* encode/decode integers in system-independent way */
 
@@ -163,7 +180,7 @@ static const char * filetype(notify_filetype_t type) {
     return "";
 }
 
-static const char * open_file(void) {
+static const char * open_file(const config_data_t * cfg) {
     long pos;
     int errcode;
     if (save_file) fclose(save_file);
@@ -183,6 +200,8 @@ static const char * open_file(void) {
     save_pos = pos;
     pthread_mutex_unlock(&save_lock);
     save_count++;
+    if (cfg->intval[cfg_autopurge_days] > 0)
+	store_purge(cfg->intval[cfg_autopurge_days]);
     return NULL;
 }
 
@@ -200,7 +219,7 @@ static int count_files(const char * eventdir, int * earliest, int * newest) {
 	if (en[0] != 'e') continue;
 	if (en[1] != 'v') continue;
 	ptr = 2;
-	while (en[ptr] && isdigit(en[ptr])) ptr++;
+	while (en[ptr] && isdigit((int)en[ptr])) ptr++;
 	if (ptr < 3) continue;
 	if (en[ptr] != '.') continue;
 	if (en[ptr + 1] != 'l') continue;
@@ -215,15 +234,15 @@ static int count_files(const char * eventdir, int * earliest, int * newest) {
     return 1;
 }
 
-static const char * save_init(const config_t * cfg, const char * cmd) {
-    int len = strlen(cfg->eventdir);
+static const char * save_init(const config_data_t * cfg, const char * cmd) {
+    int len = strlen(cfg->strval[cfg_eventdir]);
     const char * err;
     struct stat sbuff;
     int code = pthread_mutex_init(&save_lock, NULL);
     if (code)
 	return error_sys_errno("save_init", "pthread_mutex_init", code);
-    if (stat(cfg->eventdir, &sbuff) < 0) {
-	if (mkdir(cfg->eventdir, 0700) < 0) {
+    if (stat(cfg->strval[cfg_eventdir], &sbuff) < 0) {
+	if (mkdir(cfg->strval[cfg_eventdir], 0700) < 0) {
 	    int e = errno;
 	    pthread_mutex_destroy(&save_lock);
 	    return error_sys_errno("save_init", "mkdir", e);
@@ -232,7 +251,6 @@ static const char * save_init(const config_t * cfg, const char * cmd) {
 	if (! S_ISDIR(sbuff.st_mode))
 	    return "eventdir exists but is not a directory";
     }
-    save_size = cfg->eventsize;
     save_len = len + SUFFIX_SIZE + 2;
     save_name = mymalloc(save_len);
     if (! save_name) {
@@ -240,33 +258,37 @@ static const char * save_init(const config_t * cfg, const char * cmd) {
 	pthread_mutex_destroy(&save_lock);
 	return error_sys_errno("save_init", "malloc", e);
     }
-    strcpy(save_name, cfg->eventdir);
+    strcpy(save_name, cfg->strval[cfg_eventdir]);
     save_suffix = save_name + len;
     *save_suffix++ = '/';
-    if (! count_files(cfg->eventdir, &save_earliest, &save_count)) {
+    if (! count_files(cfg->strval[cfg_eventdir], &save_earliest, &save_count)) {
 	int e = errno;
 	myfree(save_name);
 	pthread_mutex_destroy(&save_lock);
-	return error_sys_errno("save_init", cfg->eventdir, e);
+	return error_sys_errno("save_init", cfg->strval[cfg_eventdir], e);
     }
     if (save_count <= 0)
 	save_count = 1;
     save_file = NULL;
-    err = open_file();
+    cfg = config_get();
+    err = open_file(cfg);
     if (err) {
 	myfree(save_name);
 	pthread_mutex_destroy(&save_lock);
+	config_put(cfg);
 	return err;
     }
     /* see if we are going to rotate the file */
-    if (save_pos > (long)INT_MAX || save_pos >= save_size) {
-	err = open_file();
+    if (save_pos > (long)INT_MAX || save_pos >= cfg->intval[cfg_eventsize]) {
+	err = open_file(cfg);
 	if (err) {
 	    myfree(save_name);
 	    pthread_mutex_destroy(&save_lock);
+	    config_put(cfg);
 	    return err;
 	}
     }
+    config_put(cfg);
     if (save_earliest < 0)
 	save_earliest = save_current;
     return NULL;
@@ -275,6 +297,7 @@ static const char * save_init(const config_t * cfg, const char * cmd) {
 static const char * save_process(const notify_event_t * ev) {
     event_t sev;
     long pos;
+    const config_data_t * cfg;
     memset(&sev, 0, sizeof(sev));
     sev.event_type = ev->event_type;
     sev.file_type = ev->file_type;
@@ -313,10 +336,12 @@ static const char * save_process(const notify_event_t * ev) {
     pos = ftell(save_file);
     if (pos < 0)
 	return error_sys("save_process", save_name);
-    if (pos > INT_MAX || pos >= save_size)
-	open_file();
+    cfg = config_get();
+    if (pos > INT_MAX || pos >= cfg->intval[cfg_eventsize])
+	open_file(cfg);
     else
 	save_pos = pos;
+    config_put(cfg);
     return NULL;
 }
 
@@ -324,148 +349,6 @@ static void save_exit(void) {
     if (save_file) fclose(save_file);
     if (save_name) myfree(save_name);
     pthread_mutex_destroy(&save_lock);
-}
-
-void store_printname(const char * name, char next) {
-    const char * ptr;
-    char quote = 0;
-    for (ptr = name; *ptr; ptr++) {
-	if (isgraph(*ptr)) continue;
-	quote = '\'';
-	break;
-    }
-    if (quote) putc(quote, stdout);
-    for (ptr = name; *ptr; ptr++) {
-	switch (*ptr) {
-	    case '\n' :
-		putc('\\', stdout);
-		putc('n', stdout);
-		break;
-	    case '\t' :
-		putc('\\', stdout);
-		putc('t', stdout);
-		break;
-	    case '\\' :
-	    case '\''  :
-		putc('\\', stdout);
-		putc(*ptr, stdout);
-		break;
-	    default   :
-		if (isprint(*ptr))
-		    putc(*ptr, stdout);
-		else
-		    printf("\\%03o", (unsigned char)*ptr);
-	}
-    }
-    if (quote) putc(quote, stdout);
-    if (next) putc(next, stdout);
-}
-
-void store_printevent(const notify_event_t * ev,
-		      const char * user, const char * group)
-{
-    const char * evtype = "?";
-    switch (ev->event_type) {
-	case notify_change_meta : {
-	    evtype = "CHANGE";
-	    break;
-	}
-	case notify_change_data :
-	    evtype = "WRITE";
-	    break;
-	case notify_create :
-	    evtype = "CREATE";
-	    break;
-	case notify_delete :
-	    evtype = "DELETE";
-	    break;
-	case notify_rename :
-	    evtype = "RENAME";
-	    break;
-	case notify_overflow :
-	    evtype = "OVERFLOW";
-	    break;
-	case notify_nospace :
-	    evtype = "NOSPACE";
-	    break;
-	case notify_add_tree :
-	    evtype = "ADD_TREE";
-	    break;
-    }
-    printf("%-9s", evtype);
-    if (ev->from_name)
-	store_printname(ev->from_name, '\n');
-    else
-	putchar('\n');
-    if (ev->to_name) {
-	printf("%-9s", "TO");
-	store_printname(ev->to_name, '\n');
-    }
-    evtype = NULL;
-    if (ev->stat_valid) {
-	char mode[11];
-	switch (ev->file_type) {
-	    case notify_filetype_regular      : mode[0] = '-'; break;
-	    case notify_filetype_dir          : mode[0] = 'd'; break;
-	    case notify_filetype_device_char  : mode[0] = 'c'; break;
-	    case notify_filetype_device_block : mode[0] = 'b'; break;
-	    case notify_filetype_fifo         : mode[0] = 'p'; break;
-	    case notify_filetype_symlink      : mode[0] = 'l'; break;
-	    case notify_filetype_socket       : mode[0] = '='; break;
-	    case notify_filetype_unknown      : mode[0] = '?'; break;
-	}
-	mode[1] = ev->file_mode & S_IRUSR ? 'r' : '-';
-	mode[2] = ev->file_mode & S_IWUSR ? 'w' : '-';
-	switch (ev->file_mode & (S_IXUSR | S_ISUID)) {
-	    case 0                 : mode[3] = '-'; break;
-	    case S_IXUSR           : mode[3] = 'x'; break;
-	    case S_ISUID           : mode[3] = 'S'; break;
-	    case S_ISUID | S_IXUSR : mode[3] = 's'; break;
-	}
-	mode[4] = ev->file_mode & S_IRGRP ? 'r' : '-';
-	mode[5] = ev->file_mode & S_IWGRP ? 'w' : '-';
-	switch (ev->file_mode & (S_IXGRP | S_ISGID)) {
-	    case 0                 : mode[6] = '-'; break;
-	    case S_IXGRP           : mode[6] = 'x'; break;
-	    case S_ISGID           : mode[6] = 'S'; break;
-	    case S_ISGID | S_IXGRP : mode[6] = 's'; break;
-	}
-	mode[7] = ev->file_mode & S_IROTH ? 'r' : '-';
-	mode[8] = ev->file_mode & S_IWOTH ? 'w' : '-';
-	switch (ev->file_mode & (S_IXOTH | S_ISVTX)) {
-	    case 0                 : mode[9] = '-'; break;
-	    case S_IXOTH           : mode[9] = 'x'; break;
-	    case S_ISVTX           : mode[9] = 'T'; break;
-	    case S_ISVTX | S_IXOTH : mode[9] = 't'; break;
-	}
-	mode[10] = 0;
-	printf("         mode=%04o (%s)\n", ev->file_mode, mode);
-	if (user)
-	    printf("         owner=%d (%s)\n", ev->file_user, user);
-	else
-	    printf("         owner=%d\n", ev->file_user);
-	if (group)
-	    printf("         group=%d (%s)\n", ev->file_group, group);
-	else
-	    printf("         group=%d\n", ev->file_group);
-	if (ev->file_type == notify_filetype_device_block ||
-	    ev->file_type == notify_filetype_device_char) {
-	    printf("         device=%d,%d\n",
-		   major(ev->file_device), minor(ev->file_device));
-	} else {
-	    printf("         size=%lld\n", ev->file_size);
-	}
-	evtype = "mtime";
-    } else if (ev->event_type == notify_add_tree) {
-	evtype = "add_time";
-    }
-    if (evtype) {
-	char when[32];
-	ctime_r(&ev->file_mtime, when);
-	when[strlen(when) - 1] = 0;
-	printf("         %s=%lld (%s)\n",
-	       evtype, (long long)ev->file_mtime, when);
-    }
 }
 
 static const char * print_process(const notify_event_t * ev) {
@@ -481,7 +364,7 @@ static const char * print_process(const notify_event_t * ev) {
     return NULL;
 }
 
-static const char * logfile_init(const config_t * cfg, const char * cmd) {
+static const char * logfile_init(const config_data_t * cfg, const char * cmd) {
     if (! cmd || ! cmd[0] || ! cmd[1])
 	return "Missing filename: use \"store=log:FILENAME\"";
     cmd++;
@@ -504,7 +387,8 @@ static void logfile_sendname(const char * pre, notify_filetype_t type,
     set_timestamp(timebuff, time(NULL));
     fprintf(save_file, "%-19s %-6s %-4s ", timebuff, pre, ft);
     while (namelen > 0) {
-	if (isprint(*name) && *name != '\n' && *name != '\r' && *name != '%')
+	if (isprint((int)*name) &&
+	    *name != '\n' && *name != '\r' && *name != '%')
 	    putc(*name, save_file);
 	else
 	    fprintf(save_file, "%%%02X", (unsigned char)*name);
@@ -562,7 +446,7 @@ static void logfile_exit(void) {
     if (save_name) myfree(save_name);
 }
 
-static const char * syslog_init(const config_t * cfg, const char * cmd) {
+static const char * syslog_init(const config_data_t * cfg, const char * cmd) {
     int fac = LOG_LOCAL7 | LOG_INFO;
     if (cmd && cmd[0] && cmd[1]) {
 	const char * err = config_getfacility(cmd + 1, &fac);
@@ -580,7 +464,8 @@ static void syslog_sendname(const char * pre, notify_filetype_t type,
     int buflen = 0;
     const char * ft = filetype(type);
     while (namelen > 0) {
-	if (isprint(*name) && *name != '\n' && *name != '\r' && *name != '%')
+	if (isprint((int)*name) &&
+	    *name != '\n' && *name != '\r' && *name != '%')
 	    buffer[buflen++] = *name;
 	else
 	    buflen += sprintf(buffer + buflen, "%%%02X", (unsigned char)*name);
@@ -640,28 +525,55 @@ static store_t store_data;
 /* initialisation required before the store thread starts; returns
  * NULL if OK, or an error message */
 
-const char * store_init(const config_t * cfg) {
+const char * store_init(void) {
+    const config_data_t * cfg = config_get();
     int i, len;
-    const char * colon = strchr(cfg->store, ':');
+    const char * colon = strchr(cfg->strval[cfg_store], ':');
     if (colon)
-	len = colon - cfg->store;
+	len = colon - cfg->strval[cfg_store];
     else
-	len = strlen(cfg->store);
+	len = strlen(cfg->strval[cfg_store]);
     save_current = save_earliest = save_pos = -1;
     save_name = NULL;
-    optimise_count = cfg->optimise_server;
     /* search for a predefined store method */
     for (i = 0; store_methods[i].name; i++) {
-	if (strncmp(store_methods[i].name, cfg->store, len) == 0) {
+	if (strncmp(store_methods[i].name, cfg->strval[cfg_store], len) == 0) {
 	    if (! store_methods[i].name[len]) {
 		store_data = store_methods[i];
-		if (store_data.init)
-		    return store_data.init(cfg, colon);
+		if (store_data.init) {
+		    const char * err = store_data.init(cfg, colon);
+		    config_put(cfg);
+		    return err;
+		}
+		config_put(cfg);
 		return NULL;
 	    }
 	}
     }
+    config_put(cfg);
     return "No such store method";
+}
+
+static config_filter_t filter_type(notify_filetype_t ft) {
+    switch (ft) {
+	case notify_filetype_regular :
+	    return config_file_regular;
+	case notify_filetype_dir :
+	    return config_file_dir;
+	case notify_filetype_device_char :
+	    return config_file_char;
+	case notify_filetype_device_block :
+	    return config_file_block;
+	case notify_filetype_fifo :
+	    return config_file_fifo;
+	case notify_filetype_symlink :
+	    return config_file_symlink;
+	case notify_filetype_socket :
+	    return config_file_socket;
+	case notify_filetype_unknown :
+	    return config_file_unknown;
+    }
+    return config_file_unknown;
 }
 
 /* run store thread; returns NULL on normal termination,
@@ -670,10 +582,11 @@ const char * store_init(const config_t * cfg) {
 const char * store_thread(void) {
     int ov, bsize = 0, do_flush = 0;
     char * buffer = NULL;
+    const config_data_t * cfg = NULL;
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &ov);
     while (main_running) {
-	const char * err;
 	notify_event_t ev;
+	config_filter_t filter = config_file_all, check;
 	int reqsize = bsize;
 	int g = notify_get(&ev, POLL_TIME, buffer, &reqsize);
 	if (g == -3) {
@@ -681,8 +594,11 @@ const char * store_thread(void) {
 	    reqsize += BLOCK_ADD;
 	    bsize = reqsize;
 	    buffer = mymalloc(bsize);
-	    if (! buffer)
-		return error_sys("store_thread", "malloc");
+	    if (! buffer) {
+		int e = errno;
+		if (cfg) config_put(cfg);
+		return error_sys_errno("store_thread", "malloc", e);
+	    }
 	    g = notify_get(&ev, POLL_TIME, buffer, &reqsize);
 	}
 	if (g == -2) {
@@ -690,25 +606,115 @@ const char * store_thread(void) {
 		store_data.flush();
 		do_flush = 0;
 	    }
+	    if (cfg) config_put(cfg);
+	    cfg = NULL;
 	    continue;
 	}
 	if (g < 0) {
-	    err = error_sys("store_thread", "notify_get");
+	    const char * err = error_sys("store_thread", "notify_get");
 	    if (buffer) myfree(buffer);
+	    if (cfg) config_put(cfg);
 	    return err;
 	}
 	if (g == 0) {
 	    if (buffer) myfree(buffer);
+	    if (cfg) config_put(cfg);
 	    return NULL;
 	}
-	err = store_data.process(&ev);
-	if (err) {
-	    if (buffer) myfree(buffer);
-	    return err;
+	/* check against the event filter if we do want to process this */
+	if (! cfg) cfg = config_get();
+	switch (ev.event_type) {
+	    case notify_change_meta :
+		filter = cfg->filter[config_event_meta];
+		break;
+	    case notify_change_data :
+		filter = cfg->filter[config_event_data];
+		break;
+	    case notify_create :
+		filter = cfg->filter[config_event_create];
+		break;
+	    case notify_delete :
+		filter = cfg->filter[config_event_delete];
+		break;
+	    case notify_rename :
+		filter = cfg->filter[config_event_rename];
+		break;
+	    case notify_overflow :
+	    case notify_nospace :
+	    case notify_add_tree :
+		filter = config_file_all;
+		break;
 	}
-	do_flush = 1;
+	check = filter_type(ev.file_type);
+	if (filter & check) {
+	    const char * err = store_data.process(&ev);
+	    if (err) {
+		if (buffer) myfree(buffer);
+		if (cfg) config_put(cfg);
+		return err;
+	    }
+	    do_flush = 1;
+	    /* have they just created a directory? */
+	    if (ev.stat_valid &&
+		ev.file_type == notify_filetype_dir &&
+		ev.event_type == notify_create)
+	    {
+		/* scan this directory and generate synthetic events for
+		 * everything already in it */
+		DIR * D;
+		D = opendir(ev.from_name);
+		if (D) {
+		    int slen = strlen(ev.from_name);
+		    char sname[slen + NAME_MAX + 2];
+		    notify_event_t sev;
+		    struct dirent * E;
+		    strcpy(sname, ev.from_name);
+		    sname[slen++] = '/';
+		    sev.event_type = notify_create;
+		    sev.to_length = 0;
+		    sev.to_name = NULL;
+		    sev.stat_valid = 1;
+		    if (! cfg) cfg = config_get();
+		    filter = cfg->filter[config_event_create];
+		    while ((E = readdir(D)) != NULL) {
+			int len = strlen(E->d_name);
+			struct stat ebuff;
+			if (E->d_name[0] == '.') {
+			    if (len == 1) continue;
+			    if (len == 2 && E->d_name[1] == '.') continue;
+			}
+			if (len > NAME_MAX) continue;
+			strcpy(sname + slen, E->d_name);
+			if (lstat(sname, &ebuff) < 0) continue;
+			sev.file_type = notify_filetype(ebuff.st_mode);
+			check = filter_type(sev.file_type);
+			/* check event filter */
+			if (! (filter & check)) continue;
+			/* store this event too */
+			sev.from_length = slen + len;
+			sev.from_name = sname;
+			sev.file_mode = ebuff.st_mode;
+			sev.file_user = ebuff.st_uid;
+			sev.file_group = ebuff.st_gid;
+			sev.file_device = ebuff.st_rdev;
+			sev.file_size = ebuff.st_size;
+			sev.file_mtime = ebuff.st_mtime;
+			err = store_data.process(&sev);
+			if (err) {
+			    if (buffer) myfree(buffer);
+			    closedir(D);
+			    if (cfg) config_put(cfg);
+			    return err;
+			}
+			do_flush = 1;
+		    }
+		    closedir(D);
+		}
+	    }
+	}
     }
     if (buffer) myfree(buffer);
+    if (cfg) config_put(cfg);
     return NULL;
 }
 
@@ -737,15 +743,21 @@ void store_status(store_status_t * status) {
 
 /* purges event files */
 
-int store_purge(const config_t * cfg, int days) {
-    int len = strlen(cfg->eventdir), earliest, count;
+int store_purge(int days) {
+    const config_data_t * cfg = config_get();
+    int len = strlen(cfg->strval[cfg_eventdir]), earliest, count;
     char name[len + SUFFIX_SIZE + 2], * suffix;
     time_t limit = time(NULL) - days * 86400;
-    strcpy(name, cfg->eventdir);
+    strcpy(name, cfg->strval[cfg_eventdir]);
     suffix = name + len;
     *suffix++ = '/';
-    if (! count_files(cfg->eventdir, &earliest, &count))
+    if (! count_files(cfg->strval[cfg_eventdir], &earliest, &count)) {
+	int e = errno;
+	config_put(cfg);
+	errno = e;
 	return 0;
+    }
+    config_put(cfg);
     while (earliest < count - 2) {
 	struct stat sbuff;
 	snprintf(suffix, SUFFIX_SIZE, "ev%06d.log", earliest);
@@ -760,19 +772,27 @@ int store_purge(const config_t * cfg, int days) {
 /* prepare to read events back from store; note that the caller must make
  * sure "root" isn't modified after this call */
 
-store_get_t * store_prepare(const config_t * cfg,
-			    int filenum, int filepos, const char * root)
-{
-    int len = strlen(cfg->eventdir);
+store_get_t * store_prepare(int filenum, int filepos, const char * root) {
+    const config_data_t * cfg = config_get();
+    int len = strlen(cfg->strval[cfg_eventdir]);
     int size = sizeof(store_get_t) + strlen(root) + len + SUFFIX_SIZE + 3;
     char * rptr;
     store_get_t * sg;
-    if (! count_files(cfg->eventdir, &save_earliest, &save_count))
+    if (! count_files(cfg->strval[cfg_eventdir], &save_earliest, &save_count)) {
+	int e = errno;
+	config_put(cfg);
+	errno = e;
 	return NULL;
+    }
     sg = mymalloc(size);
-    if (! sg) return NULL;
+    if (! sg) {
+	int e = errno;
+	config_put(cfg);
+	errno = e;
+	return NULL;
+    }
     sg->name = (void *)&sg[1];
-    strcpy(sg->name, cfg->eventdir);
+    strcpy(sg->name, cfg->strval[cfg_eventdir]);
     sg->suffix = sg->name + len;
     *sg->suffix++ = '/';
     rptr = sg->suffix + SUFFIX_SIZE + 1;
@@ -783,6 +803,7 @@ store_get_t * store_prepare(const config_t * cfg,
     sg->file_num = filenum;
     sg->file_pos = filepos;
     sg->page_size = getpagesize();
+    config_put(cfg);
     return sg;
 }
 
@@ -903,10 +924,14 @@ int store_get(store_get_t * sg, notify_event_t * nev, int timeout, int size,
 	    if (! nev->from_name)
 		return 0;
 	    if (nev->event_type == notify_add_tree) {
-		if (is_inside(sg->root, nev->from_name))
-		    return 0;
 		if (is_inside(nev->from_name, sg->root))
 		    return 0;
+		if (is_inside(sg->root, nev->from_name)) {
+		    /* adding a parent of root, report it as adding root */
+		    nev->from_name = sg->root;
+		    nev->from_length = strlen(sg->root);
+		    return 0;
+		}
 	    } else if (nev->event_type == notify_rename) {
 		int ok_from = is_inside(nev->from_name, sg->root);
 		int ok_to = is_inside(nev->to_name, sg->root);
@@ -1114,63 +1139,12 @@ const char * store_get(store_get_t * sg, notify_event_t * nev, int wfd) {
 		return NULL;
 	} else {
 	    if (is_inside(nev->from_name, sg->root))
-		goto consider_event;
+		return NULL;
 	}
 	if (nev->to_name)
 	    if (is_inside(nev->to_name, sg->root))
-		goto consider_event;
+		return NULL;
 	/* don't want this, try the next one */
-    ignore_event:
-	continue;
-    consider_event:
-	/* collapse event with up to optimise_count events after it */
-if (0) // XXX doesn't work
-	if (nev->from_name && nev->event_type != notify_rename) {
-	    int i, pos;
-	    for (i = 0, pos = sg->file_pos;
-		 i < optimise_count && pos < sg->file_size;
-		 i++)
-	    {
-		int fl, tl;
-		char * fn, * tn;
-		sev = (void *)(sg->mmap + pos);
-		pos += sizeof(event_t);
-		fl = decode_32(sev->from_length);
-		tl = decode_32(sev->to_length);
-		if (fl > 0) {
-		    fn = (char *)(sg->mmap + pos);
-		    pos += 1 + fl;
-		} else {
-		    fn = NULL;
-		}
-		if (tl > 0) {
-		    tn = (char *)(sg->mmap + pos);
-		    pos += 1 + tl;
-		} else {
-		    tn = NULL;
-		}
-		if (! fn) continue;
-		if (sev->event_type == notify_delete) {
-		    if (strcmp(fn, nev->from_name) == 0) {
-			/* no need to do anything, it'll be deleted immediately */
-			goto ignore_event;
-		    }
-		    continue;
-		}
-		if (sev->event_type == notify_rename) {
-		    if (strcmp(tn, nev->from_name) == 0) {
-			/* another file will be renamed to this one, so this
-			 * event can be ignored */
-			goto ignore_event;
-		    }
-		    /* we don't check if this event will be renamed, to do so
-		     * we would need to reorder events and this means updating
-		     * the logfile; the client will do the reordering */
-		    continue;
-		}
-	    }
-	}
-	return NULL;
     }
     return "Interrupt";
 }
@@ -1192,5 +1166,148 @@ int store_get_pos(const store_get_t * sg) {
 void store_finish(store_get_t * sg) {
     if (sg->mmap) munmap(sg->mmap, sg->mlen);
     myfree(sg);
+}
+#endif /* NOTIFY != NOTIFY_NONE */
+
+void store_printname(const char * name, char next) {
+    const char * ptr;
+    char quote = 0;
+    for (ptr = name; *ptr; ptr++) {
+	if (isgraph((int)*ptr)) continue;
+	quote = '\'';
+	break;
+    }
+    if (quote) putc(quote, stdout);
+    for (ptr = name; *ptr; ptr++) {
+	switch (*ptr) {
+	    case '\n' :
+		putc('\\', stdout);
+		putc('n', stdout);
+		break;
+	    case '\t' :
+		putc('\\', stdout);
+		putc('t', stdout);
+		break;
+	    case '\\' :
+	    case '\''  :
+		putc('\\', stdout);
+		putc(*ptr, stdout);
+		break;
+	    default   :
+		if (isprint((int)*ptr))
+		    putc(*ptr, stdout);
+		else
+		    printf("\\%03o", (unsigned char)*ptr);
+	}
+    }
+    if (quote) putc(quote, stdout);
+    if (next) putc(next, stdout);
+}
+
+void store_printevent(const notify_event_t * ev,
+		      const char * user, const char * group)
+{
+    const char * evtype = "?";
+    switch (ev->event_type) {
+	case notify_change_meta : {
+	    evtype = "CHANGE";
+	    break;
+	}
+	case notify_change_data :
+	    evtype = "WRITE";
+	    break;
+	case notify_create :
+	    evtype = "CREATE";
+	    break;
+	case notify_delete :
+	    evtype = "DELETE";
+	    break;
+	case notify_rename :
+	    evtype = "RENAME";
+	    break;
+	case notify_overflow :
+	    evtype = "OVERFLOW";
+	    break;
+	case notify_nospace :
+	    evtype = "NOSPACE";
+	    break;
+	case notify_add_tree :
+	    evtype = "ADD_TREE";
+	    break;
+    }
+    printf("%-9s", evtype);
+    if (ev->from_name)
+	store_printname(ev->from_name, '\n');
+    else
+	putchar('\n');
+    if (ev->to_name) {
+	printf("%-9s", "TO");
+	store_printname(ev->to_name, '\n');
+    }
+    evtype = NULL;
+    if (ev->stat_valid) {
+	char mode[11];
+	switch (ev->file_type) {
+	    case notify_filetype_regular      : mode[0] = '-'; break;
+	    case notify_filetype_dir          : mode[0] = 'd'; break;
+	    case notify_filetype_device_char  : mode[0] = 'c'; break;
+	    case notify_filetype_device_block : mode[0] = 'b'; break;
+	    case notify_filetype_fifo         : mode[0] = 'p'; break;
+	    case notify_filetype_symlink      : mode[0] = 'l'; break;
+	    case notify_filetype_socket       : mode[0] = '='; break;
+	    case notify_filetype_unknown      : mode[0] = '?'; break;
+	}
+	mode[1] = ev->file_mode & S_IRUSR ? 'r' : '-';
+	mode[2] = ev->file_mode & S_IWUSR ? 'w' : '-';
+	switch (ev->file_mode & (S_IXUSR | S_ISUID)) {
+	    case 0                 : mode[3] = '-'; break;
+	    case S_IXUSR           : mode[3] = 'x'; break;
+	    case S_ISUID           : mode[3] = 'S'; break;
+	    case S_ISUID | S_IXUSR : mode[3] = 's'; break;
+	}
+	mode[4] = ev->file_mode & S_IRGRP ? 'r' : '-';
+	mode[5] = ev->file_mode & S_IWGRP ? 'w' : '-';
+	switch (ev->file_mode & (S_IXGRP | S_ISGID)) {
+	    case 0                 : mode[6] = '-'; break;
+	    case S_IXGRP           : mode[6] = 'x'; break;
+	    case S_ISGID           : mode[6] = 'S'; break;
+	    case S_ISGID | S_IXGRP : mode[6] = 's'; break;
+	}
+	mode[7] = ev->file_mode & S_IROTH ? 'r' : '-';
+	mode[8] = ev->file_mode & S_IWOTH ? 'w' : '-';
+	switch (ev->file_mode & (S_IXOTH | S_ISVTX)) {
+	    case 0                 : mode[9] = '-'; break;
+	    case S_IXOTH           : mode[9] = 'x'; break;
+	    case S_ISVTX           : mode[9] = 'T'; break;
+	    case S_ISVTX | S_IXOTH : mode[9] = 't'; break;
+	}
+	mode[10] = 0;
+	printf("         mode=%04o (%s)\n", ev->file_mode, mode);
+	if (user)
+	    printf("         owner=%d (%s)\n", ev->file_user, user);
+	else
+	    printf("         owner=%d\n", ev->file_user);
+	if (group)
+	    printf("         group=%d (%s)\n", ev->file_group, group);
+	else
+	    printf("         group=%d\n", ev->file_group);
+	if (ev->file_type == notify_filetype_device_block ||
+	    ev->file_type == notify_filetype_device_char) {
+	    printf("         device=%d,%d\n",
+		   major(ev->file_device), minor(ev->file_device));
+	} else {
+	    printf("         size=%lld\n", ev->file_size);
+	}
+	evtype = "mtime";
+    } else if (ev->event_type == notify_add_tree) {
+	evtype = "add_time";
+    }
+    if (evtype) {
+	char when[32];
+	ctime_r(&ev->file_mtime, when);
+	when[strlen(when) - 1] = 0;
+	printf("         %s=%lld (%s)\n",
+	       evtype, (long long)ev->file_mtime, when);
+    }
 }
 

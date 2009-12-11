@@ -1,8 +1,11 @@
-Protocol used by copies of "should" to communicate
+Protocol used by copies of "should" to communicate.
 
 A "should" client will connect to a "should" server using a Unix domain
 socket or a TCP network connection, depending on configuration and
-command-line options.
+command-line options. A client in copy mode behaves as a server and
+can also be controlled this way, however the set of commands is limited.
+Each command will indicate the mode (server, copy, all) in which it is
+available.
 
 The first thing the server will do is authenticate the client and check
 authorisation.
@@ -16,12 +19,26 @@ For TCP connections, the server issues a challenge in the form:
 
     SHOULD [xxxxxxxxxxxxxxxx]
 
-where xxxxxxxxxxxxxxxx is a 16-digit hex random number. The client then
-produces an MD5 hash of (username, xxxxxxxxxxxxxxxx, password) and returns
-the result. The server then searches its configuration for an option of
-the form "allow_tcp=USER:PASSWORD" which produces the same MD5 hash and,
-if found, will allow the client to continue. Note that neither the username
-nor the password is ever transmitted over the network.
+or
+
+    SHOULD [xxxxxxxxxxxxxxxx] checksum_name...
+
+where xxxxxxxxxxxxxxxx is a 16-digit hex random number, and checksum_name
+is a list of checksum algorithms understood by the server (if none is
+specified, the client will assume MD5).
+
+The client then produces a hash of (username, xxxxxxxxxxxxxxxx, password)
+and returns a result of the form:
+
+    username hash
+
+or
+
+    username [checksum_name] hash
+
+the second form can only be used if the server returned a list of checksum
+algorithms (older servers did not send the list and would not understand
+this reply); the first form uses MD5 implicitely.
 
 Before opening a TCP connection, the client checks that it does have a
 username and password. This can be in a configuration file using options
@@ -62,15 +79,43 @@ end of the multiline reply.
 
 The following commands are recognised by the current server code:
 
+EXTENSIONS
+(all)
+    This command is only available in version 1.1 or later of the
+    protocol; a server using an older version will return an error.
+
+    The server sends a multiline reply, terminated with a line containing a
+    single dot. Each line in the reply is the name of a supported protocol
+    extension; the client must ignore any extension it does not know about.
+    Currently, the following extensions can be provided:
+
+    CHECKSUM
+	The server accepts the CHECKSUM command.
+
+    DIRSYNC
+	This server is operating in copy mode and supports the DIRSYNC command.
+
+    ENCRYPT
+	The server supports the ENCRYPT command.
+
+    IGNORE
+	The server supports the IGNORE command.
+
+    UPDATE
+	The server supports the UPDATE command.
+
 STOP
+(all)
     The server will stop as soon as the current client has disconnected.
     This command is always successful.
 
 STATUS
+(all)
     The server sends a multiline reply, terminated with a line containing a
     single dot. Each line in the reply has the format: "KEYWORD: NUMBER",
     and the server currently sends the following:
 
+    server_mode        1
     clients            number of client connections received
     events             number of events recorded since server startup
     file_current       current event log file
@@ -98,24 +143,47 @@ STATUS
     watches            number of directories being watched
     watchmem           number of bytes of memory used for watches
 
+    In copy mode, the following will be sent:
+    server_mode        0
+    clients            number of client connections received
+    pid                the server's Process ID
+    running            the time (seconds.milli) the server has been running
+    shouldbox          the number of "shouldn't happen" errors
+    systime            system CPU time (seconds.milli) used by the server
+    usertime           user CPU time (seconds.milli) used by the server
+    version            server version
+    memory             number of bytes or memory allocated dynamically
+    events_copied      number of events copied since startup
+    read_file_num      event file number being processed
+    read_file_pos      position in event file
+    pending_dirsyncs   number of paths in the current dirsync queue
+
+    Older servers did not send server_mode; however they did not listen
+    for commands in copy mode, so if this keyword is missing the client
+    can assume that the server is operating in server mode.
+
 ADD (watch)
+(server)
     The server prepares to add a watch on the directory specified. Data
     structures are allocated at this point, but the watch is not added yet,
     waiting for the client to provide any further options.
 
 CROSS
+(server)
     Completes a current ADD command. The server will find all subdirectories
     within the path to watch, crossing filesystem boundaries, and add all
     these subdirectories to the current watch list. The "OK" message will
     contain the number of subdirectories added.
 
 NOCROSS
+(server)
     Completes a current ADD command. The server will find all subdirectories
     within the path to watch, but won't cross filesystem boundaries, and add
     all these subdirectories to the current watch list. The "OK" message will
     contain the number of subdirectories added.
 
 EXCL NAME|PATH EXACT|ICASE|GLOB|IGLOB (match)
+(server)
     This command must be between an ADD and its closing CROSS/NOCROSS. It
     indicates that subdirectories must be excluded: NAME or PATH specifies
     whether the "match" applies to a name or a full path; EXACT means that
@@ -126,6 +194,7 @@ EXCL NAME|PATH EXACT|ICASE|GLOB|IGLOB (match)
     exclude more things.
 
 FIND NAME|PATH EXACT|ICASE|GLOB|IGLOB (match)
+(server)
     This command must be between an ADD and its closing CROSS/NOCROSS. It
     modifies the ADD command by first finding all matching subdirectories
     within the "watch" specified by ADD, then executing a separate ADD
@@ -164,19 +233,29 @@ FIND NAME|PATH EXACT|ICASE|GLOB|IGLOB (match)
     /home/user/dir3/f
 
 REMOVE (watch)
+(server)
     The server removes the watch and all its subdirectories from its list of
     current watches. There is no find/exclude mechanism like for ADD, but a
     client can always get the list of watches, select the ones to remove, and
     then issue the corresponding REMOVE commands.
 
 CLOSELOG
+(all)
     The server closes the current log file (it will reopen it next time it
     needs to write to it). This can be used after log rotation.
 
+ENCRYPT
+(all)
+    The server and the client will negotiate a link encryption mechanism.
+    This command is only supported if the server returns LINK_ENCRYPTION
+    in reply to the "EXTENSIONS" command.
+
 PURGE d
+(server)
     The server removes event files older than d days. d must be >= 2.
 
 GETDIR (path) translate?
+(server)
     reads the given directory and returns a multiline reply with one of
     the following formats (depending on whether "translate?" is zero or
     nonzero):
@@ -199,6 +278,7 @@ GETDIR (path) translate?
     A line containing just a "." terminates the list.
 
 STAT (path) translate?
+(server)
     executes lstat on the path, and returns the same information as GETDIR,
     omitting the name:
 
@@ -206,20 +286,24 @@ STAT (path) translate?
     OK type dnum ino mode uname uid gname gid size mtime ctime rmaj rmin (target)
 
 STATFS (path)
+(server)
     returns filesystem status for the filesystem on which path is mounted.
     The result will be like:
 
     OK blocksize blocktotal blockfree blockavail files ffree favail rw?
 
 OPEN (path)
+(server)
     Opens a file for reading on the server. This is used before copying the
     file data. Only one file can be open for reading at any time (for each
     client), so if another one is open it will be closed first.
 
 CLOSEFILE
+(server)
     Closes any file currently open for reading.
 
-DATA start size
+DATA start size [checksum]
+(server)
     Reads a data block of up to "size" bytes starting at position "start".
     This uses the file currently open for reading, and the command must be
     between an OPEN and a CLOSEFILE. The reply will contain a number
@@ -227,35 +311,75 @@ DATA start size
     this may be smaller than requested because an end of file confition is
     reached, or because the server has been configured with a buffer smaller
     than "size".
+
     If compression is requested, and the data block does become smaller as
     a result, two numbers are returned: the first one is the compressed
     data size, the second one the uncompressed.
 
+CHECKSUM start size
+(server)
+    This command is only available if the server lists CHECKSUM in reply to
+    the EXTENSIONS command.
+
+    The server calculates the MD5 checksum of the file section of size
+    (up to) "size", starting at "start", returning a reply of the form
+    "OK realsize checksum", where "realsize" is the size of the data
+    actually checksummed (which can be less than "size" if the file
+    is shorter than "start" + "size" bytes). The checksum is omitted
+    if the size is 0 (end of file).
+
+    This can be used to avoid transferring part of a file if it is already
+    on the client. This option is only available if
+
+SETCHECKSUM name
+(server)
+    This command is only available if the server lists CHECKSUM in reply to
+    the EXTENSIONS command.
+
+    Changes the type of checksum calculated by the CHECKSUM command from the
+    default MD5 to another supported method.
+
+LISTCHECKSUM
+(server)
+    This command is only available if the server lists CHECKSUM in reply to
+    the EXTENSIONS command.
+
+    Returns a multiline result listing the checksum methods supported.
+    The lines in the reply are terminated with a normal newline rather
+    than a carriage return, new line pair. A line containing just "__END__"
+    indicates the end of the list.
+
 BWLIMIT n
+(server)
     Asks the next DATA commands to limit bandwidth to n kilobytes/second.
     The limit is an average, and the data may be produced in small bursts.
     A value of 0 removes any existing limit.
 
 COMPRESS name
+(server)
     Asks the next DATA commands to compress the data using the given
     compression method. For best result, use a large-ish data block in
     the DATA command.
 
 LISTCOMPRESS
+(server)
     Returns a multiline result listing the compression methods supported.
     The lines in the reply are terminated with a normal newline rather
     than a carriage return, new line pair. A line containing just "__END__"
     indicates the end of the list.
 
 WATCHES
+(server)
     Returns a multiline reply, in which each watch in the current list is
     sent as size followed by path. A size 0 indicates the end of the list.
 
 CONFIG
+(all)
     Returns the current server's configuration as a multiline reply.
     A line containing just "__END__" indicates the end of the configuration.
 
 SETROOT file pos (prefix) translate
+(server)
     Prepares to send events from server to client. The "file" and "pos"
     numbers identify the event log file and position at which the server
     will start reading events (presumably this is where the client left
@@ -268,6 +392,7 @@ SETROOT file pos (prefix) translate
     send numeric user and group IDs (0) or names (nonzero).
 
 EVENT timeout max
+(server)
     Requests the next event from the server; the server will wait up to
     "timeout" seconds for an event; a value of 0 means that the server will
     not wait at all for new events, but will still return events if they
@@ -347,4 +472,44 @@ EVENT timeout max
     5           symlink
     6           socket
     7           unknown
+
+IGNORE evtype (file1) (file2)
+(server)
+    This command is only available if the server lists IGNORE in the reply
+    to the EXTENSIONS command.
+
+    The server will ignore the next event with given type on the two specified
+    files (if a rename) or on "file1" (if any other event). This can be used
+    in a multi-master setup to prevent replication loops.
+
+DIRSYNC (path)
+(copy)
+    This command is only available if the server lists DIRSYNC in the reply
+    to the EXTENSIONS command.
+
+    The server will schedule an immediate directory synchronisation on the
+    directory tree with root at "path", which is interpreted relative to
+    the copy directory (use an empty path or "." for a full synchronisation).
+
+UPDATE (arg)
+(all)
+    This command is only available if the server lists UPDATE in the reply
+    to the EXTENSIONS command.
+
+    The first time a client uses this command, the server makes a copy of
+    its current configuration; then the provided argument is parsed as
+    though it had been read from a configuration file (with the exception
+    that comments are not recognised). Returns "OK" or a message explaining
+    why the update failed.
+
+    The special argument "commit" copies back the updated configuration to
+    the live configuration: subsequent operations will use the new
+    configuration. This is only possible if all updates were successful.
+
+    The special argument "rollback" discards updates since the last commit
+    (or all updates if the client has not issued any commit).
+
+    When the client closes connection, all updates which have not been
+    committed will be discarded (so a final "rollback" is not necessary,
+    but a final "commit" is).
 

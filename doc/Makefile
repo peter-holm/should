@@ -1,4 +1,4 @@
-# Local configuration for "should"
+# DOCS Makefile for should
 
 # this file is part of SHOULD
 
@@ -18,19 +18,15 @@
 # along with this program (see the file COPYING in the distribution).
 # If not, see <http://www.gnu.org/licenses/>.
 
-# generic installation prefix
-PREFIX = /usr/local
+include ../Site.make
 
-# directory where we install binaries
-INSTALLBIN = $(PREFIX)/bin
+.PHONY : install
 
-# directory where we install documentation (except manpages)
-INSTALLDOC = $(PREFIX)/share/doc/should-$(VERSION)
-
-# directory where we install manpages
-INSTALLMAN = $(PREFIX)/share/man
-INSTALLMAN1 = $(INSTALLMAN)/man1
-
-# any arguments passed to Makefile.PL
-MAKEFILE_PL =
+install :
+	install -d $(INSTALLDOC)
+	awk '/^doc\// && ! /(Makefile|\.1)$$/ { print substr($$0, 5) }' ../MANIFEST | \
+	while read name; do install $$name $(INSTALLDOC); done
+	install -d $(INSTALLMAN1)
+	awk '/^doc\// && /\.1$$/ { print substr($$0, 5) }' ../MANIFEST | \
+	while read name; do install $$name $(INSTALLMAN1); done
 

@@ -1,6 +1,11 @@
-# Local configuration for "should"
+#!/usr/bin/perl
 
-# this file is part of SHOULD
+eval 'exec perl -S $0 ${1+"$@"}'
+    if 0;
+
+# Create Makefile for Should::Client
+
+# This file is part of SHOULD
 
 # Copyright (c) 2009 Claudio Calvelli <should@shouldbox.co.uk>
 
@@ -18,19 +23,13 @@
 # along with this program (see the file COPYING in the distribution).
 # If not, see <http://www.gnu.org/licenses/>.
 
-# generic installation prefix
-PREFIX = /usr/local
+use vars qw($VERSION);
 
-# directory where we install binaries
-INSTALLBIN = $(PREFIX)/bin
+( $VERSION ) = '$Revision: 1.0 $ ' =~ /\$Revision:\s+([^\s]+)/;
 
-# directory where we install documentation (except manpages)
-INSTALLDOC = $(PREFIX)/share/doc/should-$(VERSION)
+use ExtUtils::MakeMaker;
 
-# directory where we install manpages
-INSTALLMAN = $(PREFIX)/share/man
-INSTALLMAN1 = $(INSTALLMAN)/man1
-
-# any arguments passed to Makefile.PL
-MAKEFILE_PL =
+WriteMakefile(NAME => 'Should',
+	      PMLIBDIRS => [qw(Should)],
+	      VERSION => $VERSION);
 

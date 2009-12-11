@@ -13,6 +13,10 @@ exist, in /etc/should.conf. If neither file exists, the default
 configuration is left unchanged. If a configuration file is read, it
 can override defaults.
 
+The environment variables SHOULD_SYSTEM and SHOULD_USER override the
+default location of the configuration files. Set them to /dev/null
+to avoid reading a file.
+
 Command line options are processed after any default configuration
 file, and override their settings.
 

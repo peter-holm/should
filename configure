@@ -1,0 +1,325 @@
+#!/bin/sh
+
+# Not the GNU configure, just a simple script to do the job...
+
+# this file is part of SHOULD
+
+# Copyright (c) 2008, 2009 Claudio Calvelli <should@shouldbox.co.uk>
+
+# Licenced under the terms of the GPL v3. See file COPYING in the
+# distribution for further details.
+
+echo -n "Checking if the distribution is complete... "
+fail=false
+while read line
+do
+    [ -f "$line" ] && continue
+    $fail || echo
+    echo "Missing: $line"
+    fail=true
+done < MANIFEST || fail=true
+if $fail
+then
+    echo "Try to re-download the distribution"
+    exit 1
+fi
+echo Looks good
+
+# some versions of mktemp require a template, so always provide one here
+TMP="`mktemp -d should_configure.XXXXXXXXX`"
+[ "$TMP" = '' ] && exit 1
+trap "rm -r $TMP" 0 1 2
+> "$TMP/warnings"
+
+echo
+echo "Checking basic configuration"
+echo -n "Checking for gcc... "
+cat > "$TMP/test.c" << EOF
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <time.h>
+int main(int argc, char *argv[]) {
+    printf("%d\n", argc);
+    return 0;
+}
+EOF
+if ! gcc -o "$TMP/test" "$TMP/test.c"
+then
+    echo "Problems running gcc!"
+    exit 1
+fi
+result="`"$TMP/test" a b c d`"
+if [ "$result" != 5 ]
+then
+    echo "Problems running test program!"
+    exit 1
+fi
+echo OK
+
+echo -n "Checking for pthread... "
+cat > "$TMP/test.c" << EOF
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <time.h>
+int main(int argc, char *argv[]) {
+    printf("%d\n", argc);
+    return 0;
+}
+EOF
+if ! gcc -pthread -o "$TMP/test" "$TMP/test.c"
+then
+    echo "Problems running gcc -pthread!"
+    exit 1
+fi
+result="`"$TMP/test" a b c d`"
+if [ "$result" != 5 ]
+then
+    echo "Problems running test program!"
+    exit 1
+fi
+echo OK
+
+check_extra () {
+    what="$1"
+    cflags="$2"
+    ldflags="$3"
+    defines="$4"
+    include="$5"
+    assign="$6"
+    xcflags="$7"
+    rdef=true
+    case "$defines" in
+	*'|'*)
+	    defines="`echo "$defines" | tr '|' '\n'`"
+	    ;;
+	*)
+	    rdef=false
+	    ;;
+    esac
+    echo -n "Checking for $what... "
+    [ "$assign" = '' ] && assign="void * ptr = $fname"
+    cat > "$TMP/test.c" << EOF
+$defines
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <time.h>
+#include <$include.h>
+int main(int argc, char *argv[]) {
+    $assign;
+    printf("%d\n", argc);
+    ptr = ptr;
+    return 0;
+}
+EOF
+    exec 2>"$TMP/stderr"
+    if gcc $CFLAGS $cflags $xcflags -c -o "$TMP/test.o" "$TMP/test.c" && \
+       gcc $LDFLAGS $ldflags -o "$TMP/test" "$TMP/test.o" && \
+       [ "`"$TMP/test" a b c d`" = 5 ]
+    then
+	[ "$defines" != '' ] && DEFINES="$DEFINES
+$defines"
+	[ "$cflags" != '' ] && CFLAGS="$CFLAGS $cflags"
+	[ "$ldflags" != '' ] && LDFLAGS="$LDFLAGS $ldflags"
+	echo Found
+	exec 2>&-
+	return 0
+	cat "$TMP/test.c"
+	echo
+	echo "gcc $CFLAGS $xcflags"
+	echo "gcc $LDFLAGS"
+	echo
+	cat "$TMP/stderr"
+	return 0
+    else
+	echo "Not found"
+	exec 2>&-
+	return 1
+	cat "$TMP/test.c"
+	echo
+	echo "gcc $CFLAGS $cflags $xcflags"
+	echo "gcc $LDFLAGS $ldflags"
+	echo
+	cat "$TMP/stderr"
+	exit 1
+    fi
+}
+
+CFLAGS="-pthread"
+LDFLAGS="-pthread"
+DEFINES=''
+
+echo
+echo "Checking for extra compiler flags"
+check_extra -Wall -Wall '' '' stdlib 'int ptr=1'
+check_extra -O2 -O2 '' '' stdlib 'int ptr=1'
+check_extra -g -g '' '' stdlib 'int ptr=1'
+check_extra -Werror -Werror '' '' stdlib 'int ptr=1'
+
+# see if gcc recognises -R; if it does, it may not work without it
+
+echo -n "Checking if gcc/ld require -R... "
+cat > "$TMP/test.c" << EOF
+#include <stdio.h>
+int main(int argc, char *argv[]) {
+    printf("%d\n", argc);
+    return 0;
+}
+EOF
+if gcc -pthread -R/usr/lib -o "$TMP/test" "$TMP/test.c" 2>"$TMP/stderr" &&
+   [ "`"$TMP/test" a b c d`" = 5 ] &&
+   ! grep -i unrecognized "$TMP/stderr" >/dev/null
+then
+    use_r=true
+    echo Yes
+else
+    use_r=false
+    echo No
+fi
+
+check_include () {
+    [ -d "$1" ] && CFLAGS="$CFLAGS -I$1"
+}
+
+check_include /usr/local/include
+check_include /usr/pkg/include
+
+check_lib () {
+    [ -d "$1" ] || return 1
+    LDFLAGS="$LDFLAGS -L$1"
+    $use_r && LDFLAGS="$LDFLAGS -R$1"
+    return 0
+}
+
+check_lib /usr/local/lib64 || check_lib /usr/local/lib
+check_lib /usr/pkg/lib64   || check_lib /usr/pkg/lib
+
+echo
+echo "Finding dirent.h"
+check_extra '<dirent.h>' '' '' '#define DIRENT_TYPE DIRENT' dirent \
+	    'DIR * ptr = opendir(".")' || \
+check_extra '<sys/dirent.h>' '' '#define DIRENT_TYPE SYS_DIRENT' sys/dirent \
+	    'DIR * ptr = opendir(".")' || \
+{ echo "dirent.h not found, program won't work without it"; exit 1; }
+
+# glibc subscribe to the theory that standards are great, as long as
+# you support something which isn't, and also as long as standard functions
+# disappear whenever you aren't looking; and you can't really test for
+# what it requires because they all go and disable each other too, so
+# they cannot be checked here and they are in the source where they don't
+# belong. NetBSD and other real OSs have no such problem, of course
+echo
+echo "Checking for glibc and its bogus defines"
+check_extra 'strerror_r without _XOPEN_SOURCE' '' '' '' \
+	    string 'char b[16]; int ptr = strerror_r(1, b, sizeof(b))' || \
+check_extra 'strerror_r with _XOPEN_SOURCE' '' '' '#define _XOPEN_SOURCE 700' \
+	    string 'char b[16]; int ptr = strerror_r(1, b, sizeof(b))' || \
+{ echo "strerror_r not found, program won't work without it"; exit 1; }
+check_extra 'strptime without _XOPEN_SOURCE' '' '' '' \
+	    time 'struct tm tm; char * ptr = strptime("2009", "%Y", &tm)' || \
+check_extra 'strptime with _XOPEN_SOURCE' '' '' '#define _XOPEN_SOURCE 700' \
+	    time 'struct tm tm; char * ptr = strptime("2009", "%Y", &tm)' || \
+{ echo "strptime not found, program won't work without it"; exit 1; }
+
+# if we define USE_* macros glibc breaks. Groan. Ok, they don't seem
+# to have THEY_HAVE_*
+echo
+echo "Checking for extra libraries"
+check_extra librt "" -lrt '' pthread 'pthread_t ptr = pthread_self()'
+if check_extra openssl '' -lssl '#define THEY_HAVE_SSL 1' \
+	       openssl/rand 'unsigned char b; int ptr = RAND_bytes(&b, 1)'
+then
+    check_extra md5 '' '' '#define THEY_HAVE_MD5 1' openssl/md5 \
+		'MD5_CTX c; int ptr = MD5_Init(&c)' || \
+    echo 'WARNING: TCP connections require MD5' >> "$TMP/warnings"
+    check_extra sha1 '' '' '#define THEY_HAVE_SHA1 1' openssl/sha \
+		'SHA_CTX c; int ptr = SHA1_Init(&c)'
+    check_extra sha224 '' '' '#define THEY_HAVE_SHA224 1' openssl/sha \
+		'SHA256_CTX c; int ptr = SHA224_Init(&c)'
+    check_extra sha256 '' '' '#define THEY_HAVE_SHA256 1' openssl/sha \
+		'SHA256_CTX c; int ptr = SHA256_Init(&c)'
+    check_extra sha384 '' '' '#define THEY_HAVE_SHA384 1' openssl/sha \
+		'SHA512_CTX c; int ptr = SHA384_Init(&c)'
+    check_extra sha512 '' '' '#define THEY_HAVE_SHA512 1' openssl/sha \
+		'SHA512_CTX c; int ptr = SHA512_Init(&c)'
+    check_extra ripemd160 '' '' '#define THEY_HAVE_RIPEMD160 1' openssl/ripemd \
+		'RIPEMD160_CTX c; int ptr = RIPEMD160_Init(&c)'
+else
+    echo 'WARNING: TCP connections require openssl' >> "$TMP/warnings"
+fi
+check_extra libz '' -lz '#define THEY_HAVE_ZLIB 1' zlib 'void * ptr = deflate'
+check_extra libbz2 '' -lbz2 '#define THEY_HAVE_BZLIB 1' bzlib \
+	    'void * ptr = BZ2_bzCompress'
+
+echo
+echo "Determining notify model to use"
+check_extra inotify '' '' \
+	    '#define NOTIFY NOTIFY_INOTIFY|#define INOTIFY SYS_INOTIFY' \
+	    sys/inotify 'int ptr = inotify_init()' || \
+check_extra 'inotify without sys/inotify.h' '' '' \
+	    '#define NOTIFY NOTIFY_INOTIFY|#define INOTIFY OUR_INOTIFY' \
+	    src/inotify-nosys 'int ptr = inotify_init()' -I. || \
+{ DEFINES="$DEFINES
+#define NOTIFY NOTIFY_NONE"; \
+  echo "WARNING: No notification model found, building client only" >> \
+	"$TMP/warnings"; }
+
+echo
+echo -n 'Creating Configure.make...'
+cat > Configure.make <<EOF || exit 1
+# compiler definitions (this file is automatically generated)
+
+# this file is part of SHOULD
+
+# Copyright (c) 2008, 2009 Claudio Calvelli <should@shouldbox.co.uk>
+
+# Licenced under the terms of the GPL v3. See file COPYING in the
+# distribution for further details.
+
+CC = gcc
+CFLAGS += $CFLAGS
+LDFLAGS += $LDFLAGS
+EOF
+echo Done
+
+echo
+echo -n 'Creating configure.h...'
+cat > src/configure.h <<EOF || exit 1
+/* compiler definitions (this file is automatically generated)
+
+ * this file is part of SHOULD
+
+ * Copyright (c) 2008, 2009 Claudio Calvelli <should@shouldbox.co.uk>
+
+ * Licenced under the terms of the GPL v3. See file COPYING in the
+ * distribution for further details.
+ */
+#ifndef __SHOULD_CONFIGURE_H__
+#define __SHOULD_CONFIGURE_H__ 1
+$DEFINES
+
+#endif /* __SHOULD_CONFIGURE_H__ */
+EOF
+echo Done
+
+echo
+echo "Configuration:"
+echo "CFLAGS = $CFLAGS"
+echo "LDFLAGS = $LDFLAGS"
+echo "DEFINES$DEFINES"
+
+if [ -s "$TMP/warnings" ]
+then
+    echo
+    cat "$TMP/warnings"
+fi
+
+exit 0
+

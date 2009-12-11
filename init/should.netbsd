@@ -1,0 +1,192 @@
+#!/bin/sh
+
+# start/stop should daemon(s)
+
+# this file is part of SHOULD
+
+# Copyright (c) 2009 Claudio Calvelli <should@shouldbox.co.uk>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING in the distribution).
+# If not, see <http://www.gnu.org/licenses/>.
+
+# PROVIDE: should
+# REQUIRE: NETWORKING
+
+$_rc_subr_loaded . /etc/rc.subr
+name=should
+rcvar="$name"
+start_precmd=should_check
+start_cmd=should_start
+stop_precmd=should_check
+stop_cmd=should_stop
+restart_precmd=should_check
+restart_cmd=should_restart
+status_precmd=should_check
+status_cmd=should_status
+extra_commands=status
+
+should_check () {
+    [ -z "$should_bin" ] && err 1 "Should not installed properly"
+    [ -e "$should_bin" ] || err 1 "Should not installed properly"
+    [ -d "/etc/should" ] || err 1 "No configuration defined for should"
+}
+
+stop_daemon () {
+    name="$1"
+    result=0
+    PID="`"$should_bin" name="${name%.conf}" \
+			config="$name" pid 2>/dev/null`"
+    if [ "$PID" != '' ]
+    then
+	"$should_bin" name="${name%.conf}" \
+		      config="$name" stop || result=1
+	retry=''
+	signal=0
+	while kill -$signal "$PID" 2>/dev/null
+	do
+	    sleep 1
+	    retry="x$retry"
+	    if [ "$retry" = xxxxxxxxxx ]
+	    then
+		signal=15
+	    fi
+	    if [ "$retry" = xxxxxxxxxxxxxxx ]
+	    then
+		signal=9
+	    fi
+	done
+    fi
+    return $result
+}
+
+should_start() {
+    title="Starting should daemon:"
+    nl=''
+    val=0
+    for name in *.conf
+    do
+	if [ -r "$name" ]
+	then
+	    PID="`"$should_bin" skip_notice name="${name%.conf}" \
+				config="$name" pid 2>/dev/null`"
+	    if [ "$PID" == '' ]
+	    then
+		echo -n "$title ${name%.conf}"
+		title=''
+		nl='
+'
+		"$should_bin" 'report:detach=none' skip_notice \
+			      name="${name%.conf}" \
+			      config="$name" start detach || val=1
+	    fi
+	fi
+    done
+    echo -n "$nl"
+    exit $val
+}
+
+should_stop () {
+    title="Stopping should daemon:"
+    nl=''
+    val=0
+    for name in *.conf
+    do
+	if [ -r "$name" ]
+	then
+	    echo -n "$title ${name%.conf}"
+	    title=''
+		nl='
+'
+	    stop_daemon "$name" || val=1
+	fi
+    done
+    echo -n "$nl"
+    exit $val
+}
+
+should_restart() {
+    title="Restarting should daemon:"
+    nl=''
+    val=0
+    for name in *.conf
+    do
+	if [ -r "$name" ]
+	then
+	    PID="`"$should_bin" skip_notice name="${name%.conf}" \
+				config="$name" pid 2>/dev/null`"
+	    if [ "$PID" != '' ]
+	    then
+		echo -n "$title ${name%.conf}"
+		title=''
+		nl='
+'
+		stop_daemon "$name" || val=1
+		"$should_bin" 'report:detach=none' skip_notice \
+			      name="${name%.conf}" \
+			      config="$name" start detach || val=1
+	    fi
+	fi
+    done
+    echo -n "$nl"
+    exit $val
+}
+
+status_cmd () {
+    val=0
+    for name in *.conf
+    do
+	if [ -r "$name" ]
+	then
+	    PID="`"$should_bin" skip_notice name="${name%.conf}" \
+				config="$name" pid 2>/dev/null`"
+	    if [ "$PID" != '' ]
+	    then
+		echo "${name%.conf}: running (PID=$PID)"
+	    else
+		echo "${name%.conf}: NOT running"
+		val=1
+	    fi
+	fi
+    done
+    exit $val
+}
+
+load_rc_config "$name"
+
+if [ -z "$should_bin" ]
+then
+    oldIFS="$IFS"
+    IFS=:
+    for path in $PATH:/usr/pkg/bin:/usr/local/bin:/usr/bin
+    do
+	if test -x "$path/should"
+	then
+	    should_bin="$path/should"
+	    break
+	fi
+    done
+    IFS="$oldIFS"
+fi
+
+[ -z "$should_confdir" ] && \
+    should_confdir="`echo "$should_bin" | sed -e 's,s*bin/[^/]*$,etc,'`"
+
+# prevent should from loading the generic configuration files; include them
+# from $ETC/name.conf if required
+SHOULD_USER=/dev/null
+SHOULD_SYSTEM=/dev/null
+export SHOULD_USER SHOULD_SYSTEM
+
+run_rc_command "$1"
+

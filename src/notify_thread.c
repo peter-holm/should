@@ -2,10 +2,21 @@
  *
  * this file is part of SHOULD
  *
- * Copyright (c) 2008, 2009 Claudio Calvelli <should@intercal.org.uk>
+ * Copyright (c) 2008, 2009 Claudio Calvelli <should@shouldbox.co.uk>
  * 
- * Licenced under the terms of the GPL v3. See file COPYING in the
- * distribution for further details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program (see the file COPYING in the distribution).
+ * If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include "site.h"
@@ -13,31 +24,47 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <limits.h>
 #include <sys/types.h>
-#if USE_SYSINOTIFY
-#include <sys/inotify.h>
-#else
-#include "inotify-nosys.h"
-#endif
-#include <sys/poll.h>
 #include <sys/stat.h>
+#include "notify_thread.h"
+#if NOTIFY != NOTIFY_NONE
+
+#if NOTIFY == NOTIFY_INOTIFY
+# if INOTIFY == SYS_INOTIFY
+#  include <sys/inotify.h>
+# else
+#  include <inotify-nosys.h>
+# endif
+# define EVENT struct inotify_event
+# define ADDWATCH(w) inotify_add_watch(inotify_fd, w, i_mask)
+# define RMWATCH(w) inotify_rm_watch(inotify_fd, w)
+#endif
+
+#include <sys/poll.h>
 #include <fcntl.h>
+#if DIRENT_TYPE == DIRENT
 #include <dirent.h>
+#else
+#include <sys/dirent.h>
+#endif
 #include <memory.h>
 #include <string.h>
 #include <errno.h>
 #include <time.h>
 #include <signal.h>
-#include "notify_thread.h"
 #include "main_thread.h"
 #include "config.h"
 #include "error.h"
 #include "mymalloc.h"
 
-#define I_MASK IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | \
-	       IN_DELETE_SELF | /* IN_MOVE_SELF | */ IN_MOVED_FROM | \
-	       IN_MOVED_TO /* | IN_DONT_FOLLOW | IN_ONLYDIR */ | \
-	       IN_UNMOUNT | IN_Q_OVERFLOW | IN_IGNORED
+#if NOTIFY == NOTIFY_INOTIFY
+#define CREATE_EVENT (IN_CREATE | IN_MOVED_TO)
+#define DELETE_EVENT (IN_DELETE | IN_MOVED_FROM)
+#define CHANGE_EVENT (IN_CLOSE_WRITE)
+#define ATTRIB_EVENT (IN_ATTRIB)
+#define RENAME_EVENT (IN_MOVED_FROM | IN_MOVED_TO)
+#endif
 
 #define MAXPATHCOM 256
 #define NAME_LIMIT sizeof(char *)
@@ -115,10 +142,17 @@ struct name_block_s {
 };
 
 static queue_block_t * first_block, * write_block, * read_block;
-static int notify_queue_block, notify_max, overflow, too_big;
+static int notify_queue_block, overflow, too_big;
 static int event_count, watch_count, max_events, max_bytes;
-static int queue_events, queue_bytes, queue_blocks, inotify_fd;
+static int queue_events, queue_bytes, queue_blocks;
 static int notify_initial, watch_memory, watch_active, name_block;
+
+#if NOTIFY == NOTIFY_INOTIFY
+static int inotify_fd = -1;
+static int i_mask = IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE |
+		    IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO |
+		    IN_UNMOUNT | IN_Q_OVERFLOW | IN_IGNORED;
+#endif
 
 static watch_block_t * watches_by_inode;
 static watch_by_id_t * watches_by_id;
@@ -356,12 +390,11 @@ static void deallocate_queue(void) {
 
 /* initialise event queue */
 
-static const char * initialise_queue(const config_t * cfg) {
+static const char * initialise_queue(const config_data_t * cfg) {
     int code;
-    name_block = 1 + cfg->notify_name_block / sizeof(free_name_t);
-    notify_queue_block = cfg->notify_queue_block;
-    notify_max = cfg->notify_max;
-    notify_initial = cfg->notify_initial;
+    name_block = 1 + cfg->intval[cfg_notify_name_block] / sizeof(free_name_t);
+    notify_queue_block = cfg->intval[cfg_notify_queue_block];
+    notify_initial = cfg->intval[cfg_notify_initial];
     code = pthread_mutex_init(&queue_lock, NULL);
     if (code)
 	return error_sys_errno("initialise_queue", "pthread_mutex_init", code);
@@ -378,7 +411,7 @@ static const char * initialise_queue(const config_t * cfg) {
     }
     first_block = NULL;
     queue_blocks = 0;
-    while (queue_blocks < cfg->notify_initial || queue_blocks < 1) {
+    while (queue_blocks < cfg->intval[cfg_notify_initial] || queue_blocks < 1) {
 	const char * err = allocate_block(NULL);
 	if (err) {
 	    deallocate_queue();
@@ -601,9 +634,9 @@ static inline void store_name(notify_watch_t * wp, const char * name,
 
 /* queue event: called with queue lock held */
 
-static void queue_event(notify_event_type_t type, int is_dir,
-			notify_watch_t * wfrom, const char * from,
-			notify_watch_t * wto, const char * to)
+static void queue_event(notify_event_type_t type, int is_dir, int notify_max,
+		        notify_watch_t * wfrom, const char * from,
+		        notify_watch_t * wto, const char * to, int can_wait)
 {
     queue_event_t event;
     int size, flen = from ? strlen(from) : -1, tlen = to ? strlen(to) : -1;
@@ -650,6 +683,7 @@ static void queue_event(notify_event_type_t type, int is_dir,
 	    if (queue_blocks >= notify_max) {
 		/* nope, let's wait for a bit */
 		error_report(error_queue_too_small);
+		if (! can_wait) return;
 		pthread_cond_wait(&queue_write_cond, &queue_lock);
 		continue;
 	    }
@@ -657,6 +691,7 @@ static void queue_event(notify_event_type_t type, int is_dir,
 	    if (err) {
 		/* sigh */
 		error_report(error_extending_queue, err);
+		if (! can_wait) return;
 		pthread_cond_wait(&queue_write_cond, &queue_lock);
 		continue;
 	    }
@@ -735,6 +770,7 @@ static void orphan_watch(notify_watch_t * wp) {
 
 /* gives a watch a parent */
 
+#if NOTIFY == NOTIFY_INOTIFY
 static void adopt_watch(notify_watch_t * parent, notify_watch_t * child) {
     child->next_name = parent->subdir[child->name_hash];
     if (parent->subdir[child->name_hash])
@@ -743,6 +779,7 @@ static void adopt_watch(notify_watch_t * parent, notify_watch_t * child) {
     child->prev_name = NULL;
     child->parent = parent;
 }
+#endif
 
 /* removes watch id and if appropriate deallocate watch block */
 
@@ -813,7 +850,7 @@ static void deallocate_watch(notify_watch_t * wp, int rmroot) {
 	int watch_id = wp->watch_id;
 	watch_active--;
 	remove_watch_id(wp);
-	inotify_rm_watch(inotify_fd, watch_id);
+	RMWATCH(watch_id);
     }
     watch_count--;
 }
@@ -890,75 +927,105 @@ static void deallocate_buffers(void) {
     }
     if (event_buffer)
 	myfree(event_buffer);
-    if (inotify_fd >= 0)
-	close(inotify_fd);
+#if NOTIFY == NOTIFY_INOTIFY
+    if (inotify_fd >= 0) close(inotify_fd);
+    inotify_fd = -1;
+#endif
     deallocate_queue();
 }
 
 /* initialisation required before the notify thread starts;
  * returns NULL if OK, otherwise an error message */
 
-const char * notify_init(const config_t * cfg) {
+const char * notify_init(void) {
+    const config_data_t * cfg = config_get();
     struct stat sbuff;
     const char * err = initialise_queue(cfg);
-    if (err) return err;
-    notify_watch_block = cfg->notify_watch_block;
+    if (err) {
+	config_put(cfg);
+	return err;
+    }
+    notify_watch_block = cfg->intval[cfg_notify_watch_block];
     /* in case we need to undo init midway */
     root_watch = NULL;
     watch_by_id = NULL;
     event_buffer = NULL;
     watches_by_inode = NULL;
     watches_by_id = NULL;
+#if NOTIFY == NOTIFY_INOTIFY
     inotify_fd = -1;
+#endif
     /* allocate event buffer */
-    buffer_size = cfg->notify_buffer;
-    buffer_extra = buffer_size + sizeof(struct inotify_event) + NAME_MAX + 32;
+    buffer_size = cfg->intval[cfg_notify_buffer];
+    buffer_extra = buffer_size + sizeof(EVENT) + NAME_MAX + 32;
     event_buffer = mymalloc(buffer_extra);
     if (! event_buffer) {
 	err = error_sys("notify_init", "malloc");
 	deallocate_buffers();
+	config_put(cfg);
 	return err;
     }
     /* set up inotify */
+#if NOTIFY == NOTIFY_INOTIFY
     inotify_fd = inotify_init();
     if (inotify_fd < 0) {
 	err = error_sys("notify_init", "inotify_init");
 	deallocate_buffers();
+	config_put(cfg);
 	return err;
     }
+    /* might as well mask out events we are going to ignore, if possible;
+     * however, we always watch CREATE and DELETE_SELF because we need
+     * them to update our watch list */
+    i_mask = IN_DELETE_SELF | CREATE_EVENT |
+	     IN_UNMOUNT | IN_Q_OVERFLOW | IN_IGNORED;
+    if (cfg->filter[config_event_meta]) i_mask |= ATTRIB_EVENT;
+    if (cfg->filter[config_event_data]) i_mask |= CHANGE_EVENT;
+    if (cfg->filter[config_event_create]) i_mask |= CREATE_EVENT;
+    if (cfg->filter[config_event_delete]) i_mask |= DELETE_EVENT;
+    if (cfg->filter[config_event_rename]) i_mask |= RENAME_EVENT;
+#endif
+    config_put(cfg);
     /* set up root watch */
     if (stat("/", &sbuff) < 0) {
 	/* OUCH! */
 	err = error_sys("notify_init", "/");
 	deallocate_buffers();
+	return err;
     }
     root_watch =
 	find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, "", NULL);
     if (! root_watch) {
 	err = error_sys("notify_init", "/");
 	deallocate_buffers();
+	return err;
     }
     return NULL;
 }
 
 /* queue a rename event */
 
-static void rename_event(struct inotify_event * evp, notify_watch_t * evw,
-			 struct inotify_event * destp, notify_watch_t * destw,
-			 int is_dir)
+#if NOTIFY == NOTIFY_INOTIFY
+static void rename_event(EVENT * evp, notify_watch_t * evw,
+			 EVENT * destp, notify_watch_t * destw,
+			 int is_dir, int notify_max)
 {
-    int dlen, namelen;
-    char * wname;
     /* make sure the rename is from evp to destp */
+#if NOTIFY == NOTIFY_INOTIFY
     if (evp->mask & IN_MOVED_TO) {
-	struct inotify_event * swp;
+	EVENT * swp;
 	notify_watch_t * sww;
 	swp = destp; destp = evp; evp = swp;
 	sww = destw; destw = evw; evw = sww;
     }
-    queue_event(notify_rename, is_dir, evw, evp->name, destw, destp->name);
+#endif
+    queue_event(notify_rename, is_dir, notify_max,
+		evw, evp->name, destw, destp->name, 1);
     /* do we need to update our watch data? */
+#if NOTIFY == NOTIFY_INOTIFY
     if (evp->mask & IN_ISDIR) {
+	int dlen, namelen;
+	char * wname;
 	int evh = name_hash(evp->name);
 	notify_watch_t * evx;
 #if USE_SHOULDBOX
@@ -1009,7 +1076,9 @@ static void rename_event(struct inotify_event * evp, notify_watch_t * evw,
 	    strncpy(wname, destp->name, dlen);
 	evx->name_length = dlen;
     }
+#endif
 }
+#endif
 
 /* run notify thread; returns NULL on normal termination,
  * or an error message */
@@ -1018,7 +1087,10 @@ const char * notify_thread(void) {
     int ov;
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &ov);
     while (main_running) {
-	int buffer_start = 0, buffer_end = 0, errcode;
+	config_filter_t filter[config_event_COUNT];
+	const config_data_t * cfg;
+	int buffer_start = 0, buffer_end = 0, errcode, i, skip_should;
+#if NOTIFY == NOTIFY_INOTIFY
 	struct pollfd pfd;
 	pfd.fd = inotify_fd;
 	pfd.events = POLLIN;
@@ -1030,28 +1102,41 @@ const char * notify_thread(void) {
 	    return error_sys("notify_thread", "read");
 	if (buffer_end == 0)
 	    return "notify_thread: read: unexpected end of file";
+#endif
+	cfg = config_get();
+	for (i = 0; i < config_event_COUNT; i++)
+	    filter[i] = cfg->filter[i];
+	skip_should = cfg->intval[cfg_flags] & config_flag_skip_should;
+	config_put(cfg);
 	/* lock queue */
 	errcode = pthread_mutex_lock(&queue_lock);
 	if (errcode)
 	    return error_sys_errno("notify_thread", "pthread_mutex_lock",
 				   errcode);
 	/* process all these events */
-	while (buffer_start < buffer_end && main_running) {
-	    struct inotify_event * evp;
+	while (buffer_start < buffer_end /* && main_running */) {
+	    EVENT * evp;
 	    notify_watch_t * evw;
 	    notify_event_type_t evtype;
 	    int is_dir;
+	    config_filter_t filter_mask, filter_data;
 	    /* get next event */
 	    evp = (void *)&event_buffer[buffer_start];
-	    buffer_start += sizeof(struct inotify_event) + evp->len;
+#if NOTIFY == NOTIFY_INOTIFY
+	    buffer_start += sizeof(EVENT) + evp->len;
+#endif
 	    /* handle all nameless events */
+#if NOTIFY == NOTIFY_INOTIFY
 	    if (evp->mask & IN_Q_OVERFLOW) {
-		queue_event(notify_overflow, 0, NULL, NULL, NULL, NULL);
+		queue_event(notify_overflow, 0, cfg->intval[cfg_notify_max],
+			    NULL, NULL, NULL, NULL, 1);
 		overflow++;
 		continue;
 	    }
+#endif
 	    evw = find_watch_by_id(evp->wd);
 	    if (! evw) continue;
+#if NOTIFY == NOTIFY_INOTIFY
 	    is_dir = evp->mask & IN_ISDIR;
 	    if (evp->mask & (IN_UNMOUNT | IN_DELETE_SELF | IN_IGNORED)) {
 		/* kernel automatically removes the watch; we need to free our
@@ -1062,7 +1147,21 @@ const char * notify_thread(void) {
 		}
 		continue;
 	    }
+#endif
+	    /* skip should's temporary files, if required; in the special
+	     * case of the final rename (".should.XXXXXX" -> realname)
+	     * this will skip the MOVED_FROM but not the MOVED_TO, which
+	     * will automatically become a "create" event; such event will
+	     * then be optimised away if the copy was from one of our
+	     * clients */
+	    if (skip_should &&
+		strncmp(evp->name, ".should.", 8) == 0 &&
+		strlen(evp->name) == 14)
+		    continue;
+	    /* prepare the event filter */
+	    filter_mask = is_dir ? config_file_dir : ~config_file_dir;
 	    /* if it is a rename, see if it is followed by the other half */
+#if NOTIFY == NOTIFY_INOTIFY
 	    if (evp->mask & (IN_MOVED_FROM | IN_MOVED_TO)) {
 		if (buffer_start >= buffer_end) {
 		    /* try reading more... */
@@ -1077,40 +1176,48 @@ const char * notify_thread(void) {
 		    }
 		}
 		if (buffer_start < buffer_end) {
-		    struct inotify_event * destp =
-			(void *)&event_buffer[buffer_start];
+		    EVENT * destp = (void *)&event_buffer[buffer_start];
 		    if (destp->mask & (IN_MOVED_FROM | IN_MOVED_TO)) {
 			if (destp->cookie == evp->cookie) {
 			    /* this is a rename event... */
 			    notify_watch_t * destw =
 				find_watch_by_id(destp->wd);
 			    if (destw) {
-				buffer_start +=
-				    sizeof(struct inotify_event) + destp->len;
-				rename_event(evp, evw, destp, destw, is_dir);
+				buffer_start += sizeof(EVENT) + destp->len;
+				if (filter[config_event_rename] & filter_mask)
+				    rename_event(evp, evw, destp, destw, is_dir,
+						 cfg->intval[cfg_notify_max]);
 				continue;
 			    }
 			}
 		    }
 		}
 	    }
+#endif
 	    /* not a rename event, or from/to is not watched */
-	    if (evp->mask & (IN_CREATE | IN_MOVED_TO)) {
+	    if (evp->mask & CREATE_EVENT) {
 		evtype = notify_create;
-		if (evp->mask & IN_ISDIR) {
+		filter_data = config_event_create;
+#if NOTIFY == NOTIFY_INOTIFY
+		if (is_dir) {
 		    notify_watch_t * added = notify_add(evw, evp->name);
 		    if (! added)
 			error_report(error_add_watch, errno, evp->name);
-		    // XXX scan this directory and add synthetic events for all entries
 		}
-	    } else if (evp->mask & (IN_DELETE | IN_MOVED_FROM)) {
+#endif
+	    } else if (evp->mask & DELETE_EVENT) {
 		evtype = notify_delete;
+		filter_data = config_event_delete;
+#if NOTIFY == NOTIFY_INOTIFY
 		if (evp->mask & IN_ISDIR)
 		    notify_remove(evw, evp->name, 1);
-	    } else if (evp->mask & IN_CLOSE_WRITE) {
+#endif
+	    } else if (evp->mask & CHANGE_EVENT) {
 		evtype = notify_change_data;
-	    } else if (evp->mask & IN_ATTRIB) {
+		filter_data = config_event_data;
+	    } else if (evp->mask & ATTRIB_EVENT) {
 		evtype = notify_change_meta;
+		filter_data = config_event_meta;
 	    } else {
 #if USE_SHOULDBOX
 		/* shouldn't happen(TM) */
@@ -1120,9 +1227,11 @@ const char * notify_thread(void) {
 #endif
 		continue;
 	    }
-	    queue_event(evtype, is_dir, evw,
-			evp->len > 0 ? evp->name : NULL,
-			NULL, NULL);
+#if NOTIFY == NOTIFY_INOTIFY
+	    if (filter_data & filter_mask)
+		queue_event(evtype, is_dir, cfg->intval[cfg_notify_max], evw,
+			    evp->len > 0 ? evp->name : NULL, NULL, NULL, 1);
+#endif
 	}
 	/* if reader is waiting for data, let them know */
 	pthread_cond_signal(&queue_read_cond);
@@ -1138,8 +1247,10 @@ const char * notify_thread(void) {
 
 void notify_exit(void) {
     /* destroy inotify */
-    close(inotify_fd);
+#if NOTIFY == NOTIFY_INOTIFY
+    if (inotify_fd >= 0) close(inotify_fd);
     inotify_fd = -1;
+#endif
     /* wait for queue to become empty */
     while (main_running && queue_bytes > 0) {
 	int code = pthread_mutex_lock(&queue_lock);
@@ -1160,12 +1271,14 @@ void notify_exit(void) {
  * try to add it: returns NULL if that is not possible. */
 
 notify_watch_t * notify_find_bypath(const char * path, int addit) {
+    const config_data_t * cfg = config_get();
     struct stat sbuff;
     notify_watch_t * wc;
     int olddir, pathdir, e, p = -1;
+    int notify_max = cfg->intval[cfg_notify_max], com = 0;
     dev_t dev[MAXPATHCOM];
     ino_t ino[MAXPATHCOM];
-    int com = 0;
+    config_put(cfg);
     pathdir = open(path, O_RDONLY);
     if (pathdir < 0)
 	return NULL;
@@ -1189,15 +1302,16 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 		errno = errcode;
 		return NULL;
 	    }
-	    queue_event(notify_add_tree, 1, NULL, path, NULL, NULL);
+	    queue_event(notify_add_tree, 1, notify_max,
+			NULL, path, NULL, NULL, 1);
 	    pthread_cond_signal(&queue_read_cond);
 	    pthread_mutex_unlock(&queue_lock);
-	    wid = inotify_add_watch(inotify_fd, path, I_MASK);
+	    wid = ADDWATCH(path);
 	    if (wid < 0)
 		return NULL;
 	    if (! set_watch_id(wc, wid)) {
 		int e = errno;
-		inotify_rm_watch(inotify_fd, wid);
+		RMWATCH(wid);
 		errno = e;
 		return NULL;
 	    }
@@ -1224,7 +1338,8 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
     if (fchdir(pathdir) < 0) {
 	e = errno;
 	close(pathdir);
-	fchdir(olddir);
+	if (fchdir(olddir) < 0)
+	    perror("WARNING: cannot change back to original dir");
 	close(olddir);
 	errno = e;
 	return NULL;
@@ -1258,6 +1373,10 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 		while ((E = readdir(D)) != NULL) {
 		    int len = strlen(E->d_name);
 		    if (len > NAME_MAX) continue;
+		    if (E->d_name[0] == '.') {
+			if (len == 1) continue;
+			if (len == 2 && E->d_name[1] == '.') continue;
+		    }
 		    strcpy(name + namelen + 1, E->d_name);
 		    if (stat(name, &sbuff) < 0)
 			continue;
@@ -1266,7 +1385,8 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 		    if (sbuff.st_dev != dev[com - 1])
 			continue;
 		    /* found it... */
-		    wc = find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, E->d_name, wc);
+		    wc = find_watch_by_inode(sbuff.st_dev,
+					     sbuff.st_ino, E->d_name, wc);
 		    if (! wc) {
 			e = errno;
 			closedir(D);
@@ -1284,7 +1404,8 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 		com--;
 		if (com > 0)
 		    continue;
-		fchdir(olddir);
+		if (fchdir(olddir) < 0)
+		    perror("WARNING: cannot change back to original dir");
 		close(olddir);
 		close(pathdir);
 		errcode = pthread_mutex_lock(&queue_lock);
@@ -1292,15 +1413,16 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 		    errno = errcode;
 		    goto error;
 		}
-		queue_event(notify_add_tree, 1, NULL, path, NULL, NULL);
+		queue_event(notify_add_tree, 1, notify_max,
+			    NULL, path, NULL, NULL, 1);
 		pthread_cond_signal(&queue_read_cond);
 		pthread_mutex_unlock(&queue_lock);
-		wid = inotify_add_watch(inotify_fd, path, I_MASK);
+		wid = ADDWATCH(path);
 		if (wid < 0)
 		    return NULL;
 		if (! set_watch_id(wc, wid)) {
 		    int e = errno;
-		    inotify_rm_watch(inotify_fd, wid);
+		    RMWATCH(wid);
 		    errno = e;
 		    return NULL;
 		}
@@ -1321,7 +1443,8 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 error:
     e = errno;
     if (p >= 0) close(p);
-    fchdir(olddir);
+    if (fchdir(olddir) < 0)
+	perror("WARNING: cannot change back to original dir");
     close(pathdir);
     close(olddir);
     errno = e;
@@ -1366,12 +1489,12 @@ notify_watch_t * notify_add(notify_watch_t * parent, const char * path) {
 	return NULL;
     if (wc->watch_id >= 0)
 	return wc;
-    wid = inotify_add_watch(inotify_fd, full_path, I_MASK);
+    wid = ADDWATCH(full_path);
     if (wid < 0)
 	return NULL;
     if (! set_watch_id(wc, wid)) {
 	int e = errno;
-	inotify_rm_watch(inotify_fd, wid);
+	RMWATCH(wid);
 	errno = e;
 	return NULL;
     }
@@ -1415,15 +1538,18 @@ static int get_proc(const char * name) {
     int rv = -1;
     proc = fopen(name, "r");
     if (! proc) return -1;
-    fscanf(proc, "%d", &rv);
+    if (fscanf(proc, "%d", &rv) < 1)
+	rv = -1;
     fclose(proc);
     return rv;
 }
 
 void notify_status(notify_status_t * status) {
+    const config_data_t * cfg = config_get();
+    status->queue_max = cfg->intval[cfg_notify_max] * notify_queue_block;
+    config_put(cfg);
     status->queue_bytes = queue_bytes;
     status->queue_min = notify_initial * notify_queue_block;
-    status->queue_max = notify_max * notify_queue_block;
     status->queue_cur = queue_blocks * notify_queue_block;
     status->queue_events = queue_events;
     status->max_bytes = max_bytes;
@@ -1437,26 +1563,6 @@ void notify_status(notify_status_t * status) {
 	get_proc("/proc/sys/fs/inotify/max_user_watches");
     status->kernel_max_events =
 	get_proc("/proc/sys/fs/inotify/max_queued_events");
-}
-
-/* convert a mode_t to a notify_filetype_t */
-
-notify_filetype_t notify_filetype(mode_t mode) {
-    if (S_ISREG(mode))
-	return notify_filetype_regular;
-    if (S_ISDIR(mode))
-	return notify_filetype_dir;
-    if (S_ISCHR(mode))
-	return notify_filetype_device_char;
-    if (S_ISBLK(mode))
-	return notify_filetype_device_block;
-    if (S_ISFIFO(mode))
-	return notify_filetype_fifo;
-    if (S_ISLNK(mode))
-	return notify_filetype_symlink;
-    if (S_ISSOCK(mode))
-	return notify_filetype_socket;
-    return notify_filetype_unknown;
 }
 
 /* returns next pending event; returns:
@@ -1474,7 +1580,7 @@ int notify_get(notify_event_t * nev, int blocking, char * buffer, int * bsz) {
     long long maxwait;
     queue_event_t qev;
     struct stat sbuff;
-    const char * statit;
+    const char * statit = "";
     /* easy case: no longer running and queue empty */
     if (! main_running && queue_bytes < 1)
 	return 0;
@@ -1629,9 +1735,6 @@ int notify_get(notify_event_t * nev, int blocking, char * buffer, int * bsz) {
 		    nev->to_name = buffer;
 		    nev->to_length = used;
 		}
-		if (S_ISDIR(sbuff.st_mode) && qev.event_type == notify_create) {
-		    // XXX scan this directory and generate synthetic events for all contents
-		}
 	    }
 	    break;
 	case notify_rename :
@@ -1656,12 +1759,10 @@ int notify_get(notify_event_t * nev, int blocking, char * buffer, int * bsz) {
 		     (int)(read_block->read_pos - read_block->event),
 		     notify_queue_block);
     }
+out:
 #endif
     /* if the block is empty, and the write pointer is elsewhere, we
      * skip to the next block after resetting this one */
-#if USE_SHOULDBOX
-out:
-#endif
     if (read_block->read_bytes < 1 && read_block != write_block) {
 	read_block->read_pos = read_block->event;
 	read_block->read_bytes = 0;
@@ -1698,5 +1799,26 @@ int notify_forall_watches(int (*cb)(const char *, void *), void * P) {
 	wb = wb->next;
     }
     return 1;
+}
+#endif /* NOTIFY != NOTIFY_NONE */
+
+/* convert a mode_t to a notify_filetype_t */
+
+notify_filetype_t notify_filetype(mode_t mode) {
+    if (S_ISREG(mode))
+	return notify_filetype_regular;
+    if (S_ISDIR(mode))
+	return notify_filetype_dir;
+    if (S_ISCHR(mode))
+	return notify_filetype_device_char;
+    if (S_ISBLK(mode))
+	return notify_filetype_device_block;
+    if (S_ISFIFO(mode))
+	return notify_filetype_fifo;
+    if (S_ISLNK(mode))
+	return notify_filetype_symlink;
+    if (S_ISSOCK(mode))
+	return notify_filetype_socket;
+    return notify_filetype_unknown;
 }
 

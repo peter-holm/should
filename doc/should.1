@@ -1,0 +1,915 @@
+.TH SHOULD "1" "November 2009" "Should" "User Commands"
+\" two definitions borrowed from pod2man
+.de Vb \" Begin verbatim text
+.ft CW
+.nf
+.ne \\$1
+..
+.de Ve \" End verbatim text
+.ft R
+.fi
+..
+.SH NAME
+should \- directory replication daemon
+.SH SYNOPSIS
+.B should
+[config=\fIFILE\fR]
+[\fISERVER_OPTIONS\fR]
+[\fIDIRECTORY\fR]...
+.br
+.B should
+[config=\fIFILE\fR]
+[\fICLIENT_OPTIONS\fR]
+[\fICLIENT_COMMAND\fR]...
+.br
+.B should
+[config=\fIFILE\fR]
+[\fICLIENT_OPTIONS\fR]
+setup=[\fISTATE_FILE\fR]
+from=[\fIPATH\fR]
+to=[\fIPATH\fR]
+.br
+.B should
+[config=\fIFILE\fR]
+copy=[\fISTATE_FILE\fR]
+[\fICLIENT_OPTIONS\fR]
+.SH DESCRIPTION
+.PP
+The first form of the command starts a server watching all the \fIPATH\fRs
+listed; the paths must be absolute and start with a "/" to be recognised on
+the command line. Any file operations happening within these directories will
+be recorded in a log file and can be used to replicate the same changes
+elsewhere. See
+.SM
+.B SERVER MODE
+below.
+.PP
+The second form of the command connects to a running server and issues
+commands to it. Example of commands will be the request to watch some extra
+paths, stop watching paths, get information about the server's internal
+status, get the running server's configuration. See
+.SM
+.B CLIENT MODE
+below.
+.PP
+The third form of the command prepares to copy file modification events:
+it connect to a running server to determine the current state, and then
+stores the state in a file, identified by the \fISTATUS_FILE\fR command
+line argument. The status file also contains the relevant part of the
+configuration, including usernames and passwords used to authenticate
+to the server: it is created with just user access permission, and
+it is recommended that you do not give group or world permission as
+this may compromise security. See
+.SM
+.B COPY SETUP MODE
+below.
+.PP
+The fourth form of the command uses a prepared status file to copy
+file modification events from a server. The status file must be both
+readable and writable, as it will be updated to reflect state changes
+as the copy progresses. The result is that the process can be interrupted
+at any time, and continued from where it stopped. See
+.SM
+.B COPY MODE
+below.
+.PP
+.SH QUICK START GUIDE
+The simplest way to set up replication from directory \fI/from\fR on a
+system to directory \fI/to\fR on another host is to issue the following
+commands on the source host:
+.PP
+.Vb 1
+\&    cat > /etc/should-server.conf <<EOF
+\&    detach
+\&    listen=0.0.0.0:1234
+\&    allow_tcp=\fIuser\fR:\fIpassword\fR
+\&    EOF
+\&    chmod 400 /etc/should-server.conf
+\&    should config=/etc/should-server.conf \fI/from\fR
+.Ve
+.PP
+This starts a server which will listen on port 1234 (adjust to taste)
+and allows TCP connections from the given username and password (also
+adjust to taste!). The use of a configuration file avoids having to
+provide passwords in the command line, and the last command can be
+added to an initscript to automatically restart it at boot.
+.PP
+Once the server is running, log in to the system which will be
+receiving the updates and issue the copy setup command:
+.PP
+.Vb 1
+\&    should setup=/etc/should-copy.conf server=\fIhostname\fR:1234 \\
+\&           from=\fI/from\fR to=\fI/to\fR
+.Ve
+.PP
+This will prompt for a username and password, connect to the server,
+then create a file /etc/should-copy.conf which can be used to start
+the actual copy.
+.PP
+To start the copy, issue the command:
+.PP
+.Vb 1
+\&    should copy=/etc/should-copy.conf
+.Ve
+.PP
+Just one more note, if network connectivity between the two systems
+is not very fast, it may help to enable link compression. To do
+this, add the option \fIcompression=gzip\fR to the copy setup command:
+.PP
+.Vb 1
+\&    should setup=/etc/should-copy.conf compression=gzip
+.Ve
+.PP
+It may also help to use checksums to avoid sending data which can be
+already found on the client, for example:
+.PP
+.Vb 1
+\&    should setup=/etc/should-copy.conf checksum=SHA1
+.Ve
+.SH CONFIGURATION FILES
+All forms of the command accept one (or more) configuration files
+containing common options. These are specified with the
+config=\fIFILE\fR command line option, which can be repeated as
+many times are required: each file is read as soon as the command
+line option is processed, so it can override options appearing before
+it and in turn can be overridden by options appearing after.
+.PP
+In addition to any configuration files listed explicitely, the program
+will look for a user configuration file and, if found, read it
+before processing any command line arguments. This can be used to
+set defaults. If the user configuration file is not found, the program
+looks for a system configuration file. If neither is found, the program
+starts with compiled-in defaults.
+.PP
+Note that the server and the client may have incompatible options, so it is
+best not to include the full configuration in a file which is automatically
+included by the program (such as the system configuration file or the user's
+default configuration file). Some options, such as the text of error messages,
+can be included in all configuration files, and this mechanism can be used
+to translate messages until the program receives full locale support in a future
+release.
+.PP
+The location of the user's configuration file is specified by the
+environment variable "SHOULD_USER". This can contain an absolute path
+or a relative path (which will be interpreted relative to the user's
+home directory). If this variable is not set, the program will use
+a compiled-in default, for example ".should.conf". The actual value
+can be displayed by running:
+.PP
+.Vb 1
+\&    should defaultconfig
+.Ve
+.PP
+The location of the system configuration file is specified by the
+environment variable "SHOULD_SYSTEM". This must contain an absolute path
+(otherwise it is ignored). If this variable is not set, the program will
+use a compiled-in default, for example "/etc/should.conf". The actual value
+can be displayed by running:
+.PP
+.Vb 1
+\&    should defaultconfig
+.Ve
+.PP
+The configuration file consists of lines of the form
+\fIvariable\fR=\fIvalue\fR, where the \fIvariable\fR can be any valid
+command-line option. It follows that a configuration file can include
+another one by having the line "config=\fIpath\fR", which can also be
+written as "include=\fIpath\fR" because it makes more sense.
+.PP
+Blank lines, and lines starting with "#", are ignored in a configuration
+file.
+.PP
+To see the current server's configuration, issue the command:
+.PP
+.Vb 1
+\&    should serverconfig [server=\fIhostname\fR:\fIport\fR]
+.Ve
+.PP
+This will connect to a running server and obtain the current configuration.
+The output can be redirected to a file and used as configuration to start
+the server. Similarly, to see the configuration used by the client, after
+taking into account compiled-in defaults and configuration specified on
+the command line, issue the command:
+.PP
+.Vb 1
+\&    should [config=\fIfile\fR] [\fIOPTIONS\fR] printconfig
+.Ve
+.PP
+again, redirect the standard output to a file to create a configuration file
+for the client.
+.PP
+Full details of configuration files are provided in the
+.BR should.conf(5)
+manpage.
+.SH SERVER MODE
+When the program runs without any client commands, it default to starting
+a server, listening for local Unix domain connections only.
+The following server options can be added to the command line
+(or a configuration file) to control its behaviour:
+.TP
+start
+The default is to start a server, however allowing the option to be
+specified explicitely may make it easier to construct an init script
+for should. It also produces an error if used in combination with a
+client-only option.
+.TP
+name=\fINAME\fR
+Used to construct default values for some of the other options.
+Intended to be used by init scripts which start more than one copy
+of the program, to give distinct sets of path names to each copy.
+The default is "server" when the program is operating in server mode,
+and "copy" when it is operating in copy mode.
+.TP
+logfile=\fI/PATH\fR
+The location of the log file, if the server is running in detach
+mode (if not, it will use the standard error); the default value
+depends on compiled-in defaults, and also whether the user
+has superuser access: the command:
+.Vb 1
+\&    should defaultlogfile
+.Ve
+prints the compiled-in default.
+.TP
+eventdir=\fI/PATH\fR
+The directory where the server will keep its event files, ready
+to send them to clients; the default value
+depends on compiled-in defaults, and also whether the user
+has superuser access: the command:
+.Vb 1
+\&    should defaulteventdir
+.Ve
+prints the compiled-in default.
+.TP
+listen=\fI/PATH\fR
+The server always listens on a Unix domain socket, the location of
+which depends on compiled-in defaults, and also whether the user
+has superuser access; this option allows to specify a path to the
+socket instead of using the default; used more than once, it allows
+to listen on more than one socket. The command:
+.Vb 1
+\&    should defaultsocket [name=\fRNAME\fI]
+.Ve
+prints the compiled-in default path.
+.TP
+listen=\fIHOST\fR:\fIPORT\fR
+Listen (TCP) on interface corresponding to \fIHOST\fR and on port \fIPORT\fR;
+use "listen=0.0.0.0:\fIPORT\fR" or "listen=[::0]:\fIPORT\fR" to listen on
+all IPv4 or IPv6 interfaces respectively; this option can be repeated to
+listen on more than one port and/or more than one local interface. Note that
+there are two forms of this option, with an absolute path or with a
+host and port. If only absolute paths are used, or if this option is
+omitted, the server will only listen on local Unix domain sockets.
+.TP
+allow_unix=\fINAME\fR
+Allow Unix user \fINAME\fR to connect via Unix domain sockets. The
+user has full control (a future version may introduce a mechanism to
+restrict access). This option can be repeated to allow more than one
+user to connect. If it is not specified, only the user who started
+the program (or the superuser) will be allowed to connect.
+.TP
+allow_tcp=\fINAME\fR:\fIPASS\fR
+Allow TCP connections authenticated with \fINAME\fR and \fIPASS\fR.
+It is recommended to put this sort of configuration in a file, rather
+than on the command line. The user will receive full control
+(a future version may introduce a mechanism to restrict access
+and/or to restrict based on the host one is connecting from).
+This option can be repeated to allow more than one user to connect.
+If this option is not specified, nobody will be able to connect
+using TCP.
+.TP
+detach
+Detach from the terminal; this is the default if the program is
+compiled without a shouldbox (aka extra debugging info).
+.TP
+nodetach
+Don't detach from the terminal (this is the default if the program
+is compiled with a shouldbox (aka extra debugging info).
+.TP
+skip_notice
+Skips the copyright notice printed when the program's standard output
+is a terminal. Use of this option does not allow you to claim that
+you aren't aware of the notice, but it may be useful to reduce the
+noise.
+.TP
+filter=\fIevents\fR
+Only consider events which match: see
+.SM
+.B EVENT FILTERING
+below.
+.TP
+\fI/path\fR
+An absolute pathname specifies a directory to watch. Each path can be
+followed by options refining the directory selection, as described in
+.SM
+.B DIRECTORY SELECTION
+below. More than one path can be specified, however note that directory
+selection options only apply to the last path which precedes them.
+.PP
+These are just the commonly used options. The program accepts a far
+too large number of options, which are fully documented in the
+.BR should.conf(5)
+manpage.
+.SH CLIENT MODE
+In client mode, the program connects to a running server and executes
+commands on it. At least one client command must be provided to specify
+client mode.
+.PP
+The following options control how to connect to the server:
+.TP
+server=\fI/PATH\fR
+Connect to the server using Unix domain socket \fI/PATH\fR. If no
+"server" option is specified, the default is to assume "server=\fIdefault\fR",
+where the default depends on whether the user has superuser access;
+the command:
+.Vb 1
+\&    should defaultsocket
+.Ve
+prints the compiled-in default.
+.TP
+server=\fIHOST\fR:\fIPORT\fR
+Use a TCP connection to the \fIHOST\fR and port \fIPORT\fR specified;
+without this option, the program uses a local Unix domain connection.
+.TP
+tunnel="\fIcommand and arguments\fR"
+See
+.SM
+.B TUNNELS
+below.
+.TP
+remote_should="\fIcommand and arguments\fR"
+See
+.SM
+.B TUNNELS
+below.
+.TP
+user=\fINAME\fR
+Identifies the user to the server, if a TCP connection is used (for
+Unix domain connection, the user running the program is always used
+for identification). If this option is not specified, and a TCP
+connection is requested, the program will prompt for the username.
+.TP
+password=\fISECRET\fR
+Provides a password to the server, if a TCP connection is used.
+If this option is not specified, and a TCP connection is requested,
+the program will prompt for the password.
+.TP
+skip_notice
+Skips the copyright notice printed when the program's standard output
+is a terminal. Use of this option does not allow you to claim that
+you aren't aware of the notice, but it may be useful to reduce the
+noise.
+.PP
+These are just the commonly used options. The program accepts a far
+too large number of options, which are fully documented in the
+.BR should.conf(5)
+manpage.
+.PP
+The following commands can be issued to the running server (if more
+than one is specified, they are executed in the order listed in this
+documentation, not in the order they are specified on the command line):
+.TP
+remove=\fI/path\fR
+Asks the server to stop watching a directory to watch. This option can
+be repeated as many times as necessary.
+.TP
+add=\fI/path\fR
+Asks the server to add a directory to watch; this command can be
+followed by options refining the directory selection, as described in
+.SM
+.B DIRECTORY SELECTION
+below. This command can be repeated to add more than one watch, however
+note that directory selection options only apply to the last "add"
+command which precedes them.
+.TP
+closelog
+Asks the server to close and reopen its log file; this can be used
+from a log rotation program.
+.TP
+purge=\fIDAYS\fR
+Asks the server to remove any event log files older than the specified
+number of days. Replication which requires older events will need to be
+set up again manually, presumably after making the data consistent to
+the server's.
+.TP
+status
+Asks the server's status and prints a summary.
+.TP
+serverversion
+Print the software version of the server.
+.TP
+pid
+Print the server's process ID.
+.TP
+box
+Print the contents of the server's shouldbox (which counts the number
+of times a bit of code labelled "this shouldn't happen" is executed).
+This only works if the server has been compiled with shouldbox support.
+.TP
+watches
+Asks the server for the list of directories currently watched. This can
+be a long list, including any directories specified when starting the
+server or using "add", as well as their subdirectories. The list is
+printed to the client's standard output.
+.TP
+servercompress
+Asks the server which compression methods it supports, and prints them
+to standard output.
+.TP
+update=\fIoption\fR[=\fIvalue\fR]
+Updates the server's configuration. This has the same effect as restarting
+the server and adding the option at the end of the command line, however
+there is no downtime: on the other hand, not all options can be changed this
+way. Operations in progress will use the old configuration, and operations
+started after the update will use the new one. The server makes sure no parts
+of it will use inconsistent configuration. This option can be repeated, in
+which case the updates are all applied at the same time, and are all rejected
+if one fails. See the
+.BR should.conf(5)
+manpage for a complete list of server configuration options.
+.TP
+serverconfig
+Asks the server for its current configuration (if appropriate, as modified
+while the server was running), and prints the result to standard output.
+.TP
+ls=\fI/path\fR
+Asks the server for a directory listing and prints the result to standard
+output. The main reason this exists is because "should" has been used
+for remote backups on systems where no other access worked. This command
+can be repeated to list more than one directory.
+.TP
+cp=\fI/path\fR
+Copies a file from the server. This command must be repeated at least
+twice (source, destination), and can be repeated more times (list
+of sources, destination), in which case the last one must be a directory
+on the client's host.
+.TP
+df=\fI/path\fR
+Determines the disk free and used on the filesystem containing
+\fI/path\fR on the server. This command can be repeated.
+.TP
+stop
+Asks the server to close all files and all network connections and
+exit. This could be used in initscripts etc.
+.SH COPY SETUP MODE
+In copy setup mode, the client creates a "status file" to be used
+for subsequent copy operations. The file contains information on
+how to connect to the server as well as the current event file
+number and the position within that file.
+.PP
+The following options must always be specified:
+.TP
+setup=\fIPATH\fR
+The status file to create. The \fIPATH\fR can be absolute or relative
+(to the current directory), but the file must not already exist, as
+the program will refuse to overwrite.
+.TP
+from=\fI/PATH\fR
+The directory tree, on the server's side, which contains the files
+to be copied. The server must be watching this directory.
+.TP
+to=\fI/PATH\fR
+The directory tree, on the client's side, to which the files will be
+copied. If it does not exist, it will be created.
+.TP
+server=\fIHOST\fR:\fIPORT\fR
+Specifies the \fIHOST\fR and port \fIPORT\fR to use to connect to the
+server. This is not strictly speaking necessary as one could use a
+local Unix domain connection; however it would be pointless except
+for testing.
+.PP
+The following options can be optionally specified:
+.TP
+user=\fINAME\fR
+Identifies the user to the server. If this option is not specified, and a
+TCP connection is requested, the program will prompt for the username.
+.TP
+password=\fISECRET\fR
+Provides a password to the server. If this option is not specified,
+the program will prompt for the password.
+.TP
+bwlimit=\fINUMBER\fR
+Asks the server to send at most the specified \fINUMBER\fR of kilobytes
+per second when providing file data. Setting "bwlimit=0" disables this
+function.
+.TP
+compression=\fIMETHOD\fR[,\fIMETHOD\fR]
+Asks the server to compress the file data before sending it. Multiple
+methods can be specified, separating them with commas, in which case the
+client will prefer the first one, but if that is not supported by the
+server it will try the next one, and so on. If the server does not support
+any of the methods, no compression will be used.
+Use the commands:
+.Vb 1
+\&    should clientcompress
+\&    should \fI[CLIENT_OPTIONS]\fR servercompress
+.Ve
+to see the methods supported by the client and the server, respectively.
+.TP
+checksum=\fIMETHOD\fR[,\fIMETHOD\fR]
+If the client already has a file, but the data needs to be copied again,
+it asks the server to perform checksums on portions of the file to avoid
+copying data unnecessarily. Multiple methods can be specified by separating
+them with commas, in which case the client will prefer the first one, but if
+that is not supported by the server it will try the next one, and so on.
+If the server does not support any of the methods, this optimisation
+is disabled. Use the commands:
+.Vb 1
+\&    should clientchecksum
+\&    should \fI[CLIENT_OPTIONS]\fR serverchecksum
+.Ve
+to see the methods supported by the client and the server, respectively.
+.TP
+translate_ids
+Asks the server to translate user IDs to user names when sending
+file information; these will then be translated back by the client.
+This is the default, and preserves file ownership information.
+.TP
+keep_ids
+Assumes that user IDs are identical on the server and the client,
+and therefore does not translate them to user names.
+.TP
+skip_matching
+Assumes that a file with identical size and modification time has
+not changed, and avoids copying it even if a file change event is
+sent by the server to the client. This is the default, as normally
+any file modification will result in the modification time to change.
+.TP
+copy_matching
+The nondefault opposite of skip_matching: if a file change event
+arrives, the client will always copy the file, even if it looks
+like it already has it.
+.TP
+tunnel="\fIcommand and arguments\fR"
+See
+.SM
+.B TUNNELS
+below.
+.TP
+remote_should="\fIcommand and arguments\fR"
+See
+.SM
+.B TUNNELS
+below.
+.TP
+filter=\fIevents\fR
+Only consider events which match: see
+.SM
+.B EVENT FILTERING
+below. If the server also has an event filter, onlyn events which match
+both filters will be considered.
+.SH COPY MODE
+In copy mode, the client reads configuration information from the
+status file, therefore it is only necessary to provide one option:
+.TP
+copy=\fIPATH\fR
+The status file to use. The \fIPATH\fR can be absolute or relative
+(to the current directory).
+.PP
+Some options can be provided here, overriding the ones stored in the copy
+setup file, provided they follow the "copy" argument in the command line:
+.TP
+bwlimit=\fINUMBER\fR
+Asks the server to send at most the specified \fINUMBER\fR of kilobytes
+per second when providing file data. Setting "bwlimit=0" disables this
+function.
+.TP
+compression=\fIMETHOD\fR[,\fIMETHOD\fR]
+Asks the server to compress the file data before sending it. At least one of
+the \fIMETHOD\fRs must be supported by both the server and the client,
+otherwise no compression will be used.
+.TP
+checksum=\fIMETHOD\fR[,\fIMETHOD\fR]
+Asks the server to use checksums to avoid resending data the client already
+has. At least one of the \fIMETHOD\fRs must be supported by both the server
+and the client, otherwise this mechanism will be disabled.
+.TP
+translate_ids
+Asks the server to translate user IDs to user names when sending
+file information; these will then be translated back by the client.
+This is the default, and preserves file ownership information.
+.TP
+keep_ids
+Assumes that user IDs are identical on the server and the client,
+and therefore does not translate them to user names.
+.TP
+skip_matching
+Assumes that a file with identical size and modification time has
+not changed, and avoids copying it even if a file change event is
+sent by the server to the client. This is the default, as normally
+any file modification will result in the modification time to change.
+.TP
+copy_matching
+The nondefault opposite of skip_matching: if a file change event
+arrives, the client will always copy the file, even if it looks
+like it already has it.
+.TP
+filter=\fIevents\fR
+Only consider events which match: see
+.SM
+.B EVENT FILTERING
+below. If the server also has an event filter, onlyn events which match
+both filters will be considered.
+.PP
+It currently not possible to change the options stored in the copy
+setup file (without editing it manually, which is not recommended).
+A future version of the program will provide this option.
+.SH TUNNELS
+It is possible to use ssh, or a program with an equivalent interface,
+to create tunnels between a should client and a server; this does not
+replace, but generalise, the connection specified using "server".
+.PP
+This option is available in client, copy setup and copy mode, and
+has syntax:
+.PP
+.Vb 1
+\&    \fItunnel\fR="\fIprogram and arguments\fR"
+.Ve
+.PP
+for example:
+.PP
+.Vb 1
+\&    should server=/var/run/should.socket tunnel='ssh user@host'
+.Ve
+.PP
+Note that the host name must be specified in the "tunnel" option: it is not
+derived from the "server" option. Instead, the remote end of the tunnel is
+asked to interpret "server". For example the above will result
+in the execution of the command:
+.PP
+.Vb 1
+\&    ssh user@host should server=/var/run/should.socket
+.Ve
+.PP
+which will connect to a running should on the remote server, using a local
+socket. It is also possible to use this as a connection proxy:
+.PP
+.Vb 1
+\&    should server=other_host tunnel='ssh user@remote_host'
+.Ve
+.PP
+This results in the remote host connecting via TCP to another remote host
+by running:
+.PP
+.Vb 1
+\&    ssh user@host should server=other_host
+.Ve
+.PP
+The remote command defaults to "should" but can be changed with the
+\fIremote_should\fR option. This can be used when should is not in the
+path on the remote host, or the command name is different. It can also
+be used to form more complicated chains of connection proxies, if one
+really must, for example:
+.PP
+.Vb 1
+\&    should server=final_host tunnel='ssh user@remote_host' \\
+\&           remote_should='ssh another_user@another_host should'
+\&
+\&    should server=final_host tunnel='ssh user@remote_host' \\
+\&           remote_should='ssh another_user@another_host should \\
+\&                          remote_should="ssh third_host should"'
+.Ve
+.PP
+This can get very silly very quickly, and you'll go insane trying to quote
+it correctly. But we won't try to stop anybody (and you can always use a
+configuration file stored in each intermediate host).
+.SH DIRECTORY SELECTION
+Following a directory path (on the server's command line) or an "add"
+command (from the client), it is possible to add options to select
+which subdirectories will be watched. These options come in three
+groups: find, exclude, and mount
+.PP
+The "find" options modify the procedure by first finding all subdirectories
+of the original directory which match any of the patterns provided,
+and them adding them separately; the original directory is not added; for
+example, after "add=/tmp" and "find=data", the server may watch directories
+like "/tmp/data" or "/tmp/subdir/data" but not "/tmp/other" or "/tmp".
+The following "find" options are supported:
+.TP
+find=\fINAME\fR
+Matches a subdirectory if the last part of the pathname is exactly
+\fINAME\fR, with the same case.
+.TP
+ifind=\fINAME\fR
+Matches a subdirectory if the last part of the pathname is exactly
+\fINAME\fR, ignoring case.
+.TP
+find_glob=\fIPATTERN\fR
+Matches a subdirectory if the last part of the pathname matches the
+given shell-style glob. Letter case is significant.
+.TP
+ifind_glob=\fIPATTERN\fR
+Matches a subdirectory if the last part of the pathname matches the
+given shell-style glob, ignoring case.
+.TP
+find_path=\fIPATH/NAME\fR
+Matches a subdirectory if the full pathname is exactly \fIPATH/NAME\fR.
+Letter case is significant.
+This may not seem very useful, but is provided as a side-effect of
+the matching mechanism. Moreover, it may be used to include a directory
+if exists, without producing an error if it doesn't.
+.TP
+ifind_path=\fIPATH/NAME\fR
+Matches a subdirectory if the full pathname is exactly \fIPATH/NAME\fR,
+ignoring case.
+.TP
+find_path_glob=\fIPATTERN\fR
+Matches a subdirectory if the full pathname matches the given
+shell-style glob. Letter case is significant.
+.TP
+ifind_path_glob=\fIPATTERN\fR
+Matches a subdirectory if the full pathname matches the given
+shell-style glob, ignoring case.
+.PP
+The "exclude" options determine which subdirectories are actually
+watched: if any subdirectory matches, it won't be watched. For
+example, after "add=/tmp" and "exclude=data", the server may watch
+directories like "/tmp/other" or "/tmp/subdir/blah" but not
+"/tmp/data", "/tmp/other/data" or "/tmp/data/other".
+The following "exclude" options are supported:
+.TP
+exclude=\fINAME\fR
+Excludes a subdirectory if any part of the pathname, between the root
+of the watch and the subdirectory, is exactly \fINAME\fR. Letter
+case is significant.
+.TP
+iexclude=\fINAME\fR
+Excludes a subdirectory if any part of the pathname, between the root
+of the watch and the subdirectory, is exactly \fINAME\fR, ignoring case.
+.TP
+exclude_glob=\fIPATTERN\fR
+Excludes a subdirectory if any part of the pathname, between the root
+of the watch and the subdirectory, matches the given shell-style glob.
+Letter case is significant.
+.TP
+iexclude_glob=\fIPATTERN\fR
+Excludes a subdirectory if any part of the pathname, between the root
+of the watch and the subdirectory, matches the given shell-style glob,
+ignoring case.
+.TP
+exclude_path=\fIPATH/NAME\fR
+Excludes a subdirectory if the full pathname is exactly \fIPATH/NAME\fR.
+Letter case is significant.
+.TP
+iexclude_path=\fIPATH/NAME\fR
+Excludes a subdirectory if the full pathname is exactly \fIPATH/NAME\fR,
+ignoring case.
+.TP
+exclude_path_glob=\fIPATTERN\fR
+Excludes a subdirectory if the full pathname matches the given
+shell-style glob. Letter case is significant.
+.TP
+iexclude_path_glob=\fIPATTERN\fR
+Excludes a subdirectory if the full pathname matches the given
+shell-style glob, ignoring case.
+.PP
+Finally, the "mount" option specifies that only subdirectories in
+in the same filesystem as the directory specified will be considered
+for watching. Without this option, the program recurses down the
+directory tree, without checking that it remains in the same filesystem.
+.SH EVENT FILTERING
+The program works by collecting information about changes in the filesystem
+("events"), storing them, and re-executing the events in a different place
+to replicate the changes. Sometimes, it is desirable to consider only
+a subset of these events, for example one might use non-realtime replication
+by running the "rsync" program evern night, but replicate directory renames
+in realtime (because they can cause "rsync" to spend several days copying the
+new directory, and deleting the old one, when a simple rename would achieve
+the same effect in microseconds).
+.PP
+The "filter" option allows to select events by type. The argument is a
+comma-separate list of event specifications, each of which has the general
+form: [!]\fIobject\fR:\fItype\fR, where \fIobject\fR is the object the event
+is applied to (file, dir, etc) and \fItype\fR is the type of the event itself.
+If the specification is preceded by an exclamation point, it is negated,
+so that events matched are rejected and any other events are accepted. The
+specifications are applied from left to right, so for example the filter:
+.PP
+.Vb
+\&    filter=file:all,dir:all,!delete
+.Ve
+.PP
+will match any event on files or directories, as long as the event is not
+a delete.
+.PP
+The following \fIobject\fR types are recognised:
+.TP
+all
+Any event. This can be omitted, so "rename" is equivalent to "all:rename"
+.TP
+file
+Events applied to regular files.
+.TP
+dir
+Events applied to directories.
+.TP
+char
+Events applied to character device files.
+.TP
+block
+Events applied to block device files.
+.TP
+fifo
+Events applied to named pipes (fifos).
+.TP
+symlink
+Events applied to symbolic links.
+.TP
+socket
+Events applied to sockets.
+.TP
+unknown
+Events applied to anything else (something which does appear in the
+filesystem but is not a regular file, a directory, etc). Mostly used
+to exclude such events, e.g. "filter=all,!unknown".
+.PP
+The following event \fItype\fRs are recognised:
+.TP
+all
+Any event. This can be omitted, so "file" is equivalent to "file:all";
+also "all" is equivalent to "all:all".
+.TP
+meta
+Changes in the metadata (access permissions, etc).
+.TP
+data
+Changes in the contents (normally this corresponds to a write to a regular
+file). Such changes are collected and processed after the file is closed.
+.TP
+create
+A new object is being created inside the directory tree being watched
+(or an object has been renamed from outside the directory tree being
+watched).
+.TP
+delete
+An object has been removed from the filesystem (or renamed outside the
+directory tree being watched).
+.TP
+rename
+An object has been renamed. This event can be automatically changed to
+a delete if the destination is outside the directory tree being watched;
+or to a create if the source is outside the directory tree being watched).
+.PP
+A "rename" event can become a create or a delete at various points during
+the processing. If the server notices that the source or destination of
+a rename is not being watched, the rename becomes a create or a delete at
+that point. The rename can also change into a create or delete at the
+client's end, if the source or destination is watched by the server but
+is outside the client's replication. Therefore, to replicate renames
+only and leave any other changes to a different system, one would start
+the server with:
+.PP
+.Vb
+\&    should [\fIother options\fR] filter=rename
+.Ve
+.PP
+and set up the copy with:
+.PP
+.Vb
+\&    should [\fIother options\fR] filter=rename setup=\fIfilename\fR
+.Ve
+.PP
+A future version of should will also allow to filter events by name
+as well as by type.
+.SH ENVIRONMENT VARIABLES
+The following environment variable may modify the program's operation:
+.IP SHOULD_USER
+The path to the user's configuration file. This is normally specified
+as a relative path (which will be interpreted relative to the user's
+home directory) but it can also be an absolute path, for example
+one can set this variable to "/dev/null" and have no configuration file.
+If this variable is not set, the default is set at compile time, and
+can be determined by running the command:
+.Vb 1
+\&    should defaultconfig
+.Ve
+.IP SHOULD_SYSTEM
+The path to the system-wide configuration file, which must be an absolute
+path. The file is only used if there is no user's configuration file.
+If this variable is not set, the default is set at compile time, and
+can be determined by running the command:
+.Vb 1
+\&    should defaultconfig
+.Ve
+.IP LC_MONETARY
+.IP LC_ALL
+.IP LANG
+Determine which currency symbol is used to print the current value of
+the shouldbox. See your system documentation for valid values and
+precedence amongst these variables.
+If none of these variable is set, or if the selected locale is unknown
+to the system, no currency symbol will be printed.
+.SH AUTHOR
+Written by Claudio Calvelli.
+.SH "REPORTING BUGS"
+Report bugs to <should@shouldbox.co.uk>. If possible include "SHOULD BUG" in
+the subject so we can give it the appropriate attention.
+.SH COPYRIGHT
+Copyright \(co 2009 Claudio Calvelli
+.br
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+.br
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+.SH "SEE ALSO"
+.BR Should::Client(3),
+.BR should.conf(5)

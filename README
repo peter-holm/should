@@ -1,0 +1,36 @@
+Should 1.0.-5
+
+Before installing "should", it is strongly recommended to install
+the openssl library together with the corresponding development
+package, if required.
+
+To check if openssl is installed and usable, run ./configure --
+and check that the following line is NOT produced:
+
+    WARNING: TCP connections require openssl
+
+Also, check that a notify model could be found by making sure the
+following line is NOT produced:
+
+    WARNING: No notification model found, building client only
+
+These are warnings only because it may be useful to build the program
+without the corresponding functionality. But usually you do want it.
+
+Other libraries are recommended. Check for the following lines in
+the output of ./configure:
+
+    Checking for libz... Found
+    Checking for libbz2... Found
+
+If either says "Not found", you may want to install them and re-run
+./configure -- they are not necessary, however compression of network
+traffic requires at least one of these.
+
+Once you are happy with the result of ./configure, look at the Site.make
+file for any additional configuration (if you want to install into /usr/local
+and your system looks "normal" you don't need to do this). Then type:
+
+    make
+    make instal
+

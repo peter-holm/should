@@ -1,21 +1,30 @@
-#ifndef __SHOULD_ERROR_H__
-#define __SHOULD_ERROR_H__ 1
-
 /* used to report errors
  *
  * this file is part of SHOULD
  *
- * Copyright (c) 2008, 2009 Claudio Calvelli <should@intercal.org.uk>
+ * Copyright (c) 2008, 2009 Claudio Calvelli <should@shouldbox.co.uk>
  * 
- * Licenced under the terms of the GPL v3. See file COPYING in the
- * distribution for further details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program (see the file COPYING in the distribution).
+ * If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "config.h"
+#ifndef __SHOULD_ERROR_H__
+#define __SHOULD_ERROR_H__ 1
 
 /* prepares for error reports */
 
-void error_init(const config_t * cfg);
+void error_init(void);
 
 /* prepares an error message after a failed system call; the message is
  * stored in a static area; this is only used during initialisation when
@@ -59,9 +68,12 @@ typedef enum {
     error_allocation,         /* const char * file, int line */
     error_fork,               /* int errno */
     error_badevent,           /* const char * data */
+    error_baddirent,          /* const char * data */
     error_bad_id,             /* const char * type, const char * data */
     error_event,              /* int errno */
+    error_getdir,             /* const char * path, int errno */
     /* error */
+    error_accept,             /* int errno */
     error_add_watch,          /* int errno, const char * name */
     error_rename_watch,       /* const char * from, const char * to */
     error_rename_unknown,     /* const char * from */
@@ -72,7 +84,7 @@ typedef enum {
     error_queue_too_small,    /* void */
     error_connect,            /* const char * called, int errno */
     error_server,             /* peer, const char * called, int errno */
-    error_server_msg,         /* peer, const char * called, const char * problem */
+    error_server_msg,         /* peer, const char * called, const char * what */
     error_start,              /* const char * thread, const char * message */
     error_create,             /* const char * thread, int errno */
     error_run,                /* const char * thread, int errno */
@@ -95,7 +107,10 @@ typedef enum {
     error_copy_socket,        /* const char * file */
     error_copy_uncompress,    /* const char * file, const char * error */
     error_copy_unknown,       /* const char * file */
+    error_copy_sched_dirsync, /* const char * path, int errno */
     error_unimplemented,      /* const char * what */
+    error_notserver,          /* void */
+    error_nonotify,           /* void */
     /* informational */
     info_adding_watch,        /* const char * */
     info_removing_watch,      /* const char * */
@@ -110,6 +125,10 @@ typedef enum {
     info_stop_thread,         /* const char * */
     info_detach,              /* int */
     info_changelog,           /* const char *, const char *, const char * */
+    info_replication_meta,    /* const char *, int */
+    info_replication_copy,    /* const char *, const char *, long long */
+    info_replication_delete,  /* const char * */
+    info_replication_rename,  /* const char *, const char * */
     error_MAX
 } error_message_t;
 

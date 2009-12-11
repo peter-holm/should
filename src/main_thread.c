@@ -2,26 +2,39 @@
  *
  * this file is part of SHOULD
  *
- * Copyright (c) 2008, 2009 Claudio Calvelli <should@intercal.org.uk>
+ * Copyright (c) 2008, 2009 Claudio Calvelli <should@shouldbox.co.uk>
  * 
- * Licenced under the terms of the GPL v3. See file COPYING in the
- * distribution for further details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program (see the file COPYING in the distribution).
+ * If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define _GNU_SOURCE
 #include "site.h"
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/poll.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <locale.h>
 #include "main_thread.h"
 #include "notify_thread.h"
 #include "control_thread.h"
 #include "store_thread.h"
+#include "copy_thread.h"
 #include "client.h"
 #include "config.h"
 #include "error.h"
@@ -62,6 +75,12 @@ static void * run_control(void * _p) {
     return NULL;
 }
 
+static void * run_copy(void * _p) {
+    copy_thread();
+    return NULL;
+}
+
+#if NOTIFY != NOTIFY_NONE
 static void * run_notify(void * _p) {
     const char * err = notify_thread();
     if (err)
@@ -75,15 +94,18 @@ static void * run_store(void * _p) {
 	error_report(error_run, "store", err);
     return NULL;
 }
+#endif /* NOTIFY != NOTIFY_NONE */
 
 static void * run_initial(void * _p) {
     control_initial_thread();
     return NULL;
 }
 
-static void wait_thread(pthread_t t, const char * name) {
+static void wait_thread(pthread_t t, const char * name, int force) {
     void * result;
     error_report(info_stop_thread, name);
+    if (force)
+	pthread_kill(t, SIGINT);
     if (! pthread_kill(t, 0)) {
 	int patience = POLL_TIME * 2 / WAIT_TIME;
 	poll(NULL, 0, WAIT_TIME);
@@ -112,14 +134,18 @@ void main_setup_signals(void) {
 /* do something */
 
 int main(int argc, char *argv[]) {
+    const config_data_t * cfg;
     const char * err;
-    config_t cfg;
-    pthread_t notify, control, store, initial;
+#if NOTIFY != NOTIFY_NONE
+    pthread_t notify, store;
+#endif /* NOTIFY != NOTIFY_NONE */
+    pthread_t control, initial, copy;
     int errcode, status = 1;
     void * result;
+    setlocale(LC_ALL, "");
     err = mymalloc_init();
     if (err) {
-	fprintf(stderr, err);
+	fprintf(stderr, "%s\n", err);
 	return 2;
     }
 #if USE_SHOULDBOX
@@ -129,16 +155,20 @@ int main(int argc, char *argv[]) {
     umask(0077);
     /* initialise system */
     clock_gettime(CLOCK_REALTIME, &main_started);
-    if (! config_init(&cfg, argc, argv))
+    if (! config_init(argc, argv))
 	return 2;
-    error_init(&cfg);
+    error_init();
     /* local client mode? */
-    if (cfg.client_mode) {
-	status = client_run(&cfg);
+    cfg = config_get();
+    if (cfg->intval[cfg_client_mode] &&
+        ! (cfg->intval[cfg_client_mode] &
+	   (config_client_copy|config_client_peek)))
+    {
+	status = client_run();
 	goto out_nothreads;
     }
     /* do they want to detach? */
-    if (cfg.server_mode & config_server_detach) {
+    if (cfg->intval[cfg_server_mode] & config_server_detach) {
 	int fd;
 	pid_t pid = fork();
 	if (pid < 0) {
@@ -156,20 +186,35 @@ int main(int argc, char *argv[]) {
 	}
     }
     /* initialise threads */
-    err = notify_init(&cfg);
-    if (err) {
-	error_report(error_start, "notify", err);
-	goto out_nothreads;
+#if NOTIFY != NOTIFY_NONE
+    if (! cfg->intval[cfg_client_mode]) {
+	err = notify_init();
+	if (err) {
+	    error_report(error_start, "notify", err);
+	    goto out_nothreads;
+	}
     }
-    err = control_init(&cfg);
+#endif /* NOTIFY != NOTIFY_NONE */
+    err = control_init();
     if (err) {
 	error_report(error_start, "control", err);
 	goto out_notify;
     }
-    err = store_init(&cfg);
-    if (err) {
-	error_report(error_start, "store", err);
-	goto out_control_notify;
+#if NOTIFY != NOTIFY_NONE
+    if (! cfg->intval[cfg_client_mode]) {
+	err = store_init();
+	if (err) {
+	    error_report(error_start, "store", err);
+	    goto out_control_notify;
+	}
+    }
+#endif /* NOTIFY != NOTIFY_NONE */
+    if (cfg->intval[cfg_client_mode]) {
+	err = copy_init();
+	if (err) {
+	    error_report(error_start, "copy", err);
+	    goto out_store_control_notify;
+	}
     }
     /* start threads */
     main_running = 1;
@@ -177,60 +222,94 @@ int main(int argc, char *argv[]) {
     if (errcode) {
 	error_report(error_create, "control", errcode);
 	main_running = 0;
-	goto out_store_control_notify;
+	goto out_copy_store_control_notify;
     }
-    errcode = pthread_create(&store, NULL, run_store, NULL);
-    if (errcode) {
-	error_report(error_create, "store", errcode);
-	main_running = 0;
-	wait_thread(control, "control");
-	goto out_store_control_notify;
+#if NOTIFY != NOTIFY_NONE
+    if (! cfg->intval[cfg_client_mode]) {
+	errcode = pthread_create(&store, NULL, run_store, NULL);
+	if (errcode) {
+	    error_report(error_create, "store", errcode);
+	    main_running = 0;
+	    wait_thread(control, "control", 0);
+	    goto out_copy_store_control_notify;
+	}
+	errcode = pthread_create(&notify, NULL, run_notify, NULL);
+	if (errcode) {
+	    error_report(error_create, "notify", errcode);
+	    main_running = 0;
+	    wait_thread(control, "control", 0);
+	    wait_thread(store, "store", 0);
+	    goto out_copy_store_control_notify;
+	}
     }
-    errcode = pthread_create(&notify, NULL, run_notify, NULL);
-    if (errcode) {
-	error_report(error_create, "notify", errcode);
-	main_running = 0;
-	wait_thread(control, "control");
-	wait_thread(store, "store");
-	goto out_store_control_notify;
+#endif /* NOTIFY != NOTIFY_NONE */
+    if (! cfg->intval[cfg_client_mode]) {
+	errcode = pthread_create(&initial, NULL, run_initial, NULL);
+	if (errcode) {
+	    error_report(error_create, "initial", errcode);
+	    main_running = 0;
+#if NOTIFY != NOTIFY_NONE
+	    wait_thread(notify, "notify", 0);
+#endif /* NOTIFY != NOTIFY_NONE */
+	    wait_thread(control, "control", 0);
+#if NOTIFY != NOTIFY_NONE
+	    wait_thread(store, "store", 0);
+#endif /* NOTIFY != NOTIFY_NONE */
+	    goto out_copy_store_control_notify;
+	}
     }
-    errcode = pthread_create(&initial, NULL, run_initial, NULL);
-    if (errcode) {
-	error_report(error_create, "initial", errcode);
-	main_running = 0;
-	wait_thread(notify, "notify");
-	wait_thread(control, "control");
-	wait_thread(store, "store");
-	goto out_store_control_notify;
+    if (cfg->intval[cfg_client_mode]) {
+	errcode = pthread_create(&copy, NULL, run_copy, NULL);
+	if (errcode) {
+	    error_report(error_create, "copy", errcode);
+	    main_running = 0;
+	    wait_thread(control, "control", 0);
+	    goto out_copy_store_control_notify;
+	}
     }
     status = 0;
     error_report(info_normal_operation);
     /* just in case */
     main_setup_signals();
     /* wait for the initial thread to finish */
-    pthread_join(initial, &result);
+    if (! cfg->intval[cfg_client_mode])
+	pthread_join(initial, &result);
     /* wait for the threads */
     while (main_running)
 	poll(NULL, 0, WAIT_TIME);
     if (main_signal_seen)
 	error_report(info_signal_received, main_signal_seen);
     main_running = 0;
-    wait_thread(notify, "notify");
-    wait_thread(store, "store");
-    wait_thread(control, "control");
+    if (cfg->intval[cfg_client_mode])
+	wait_thread(copy, "copy", 0);
+#if NOTIFY != NOTIFY_NONE
+    if (! cfg->intval[cfg_client_mode]) {
+	wait_thread(notify, "notify", 0);
+	wait_thread(store, "store", 0);
+    }
+#endif /* NOTIFY != NOTIFY_NONE */
+    wait_thread(control, "control", 0);
+out_copy_store_control_notify:
+    if (cfg->intval[cfg_client_mode])
+	copy_exit();
 out_store_control_notify:
+#if NOTIFY != NOTIFY_NONE
     store_exit();
 out_control_notify:
+#endif /* NOTIFY != NOTIFY_NONE */
     control_exit();
 out_notify:
+#if NOTIFY != NOTIFY_NONE
     notify_exit();
+#endif /* NOTIFY != NOTIFY_NONE */
 out_nothreads:
 #if USE_SHOULDBOX
     if (main_shouldbox)
 	error_report(error_shouldbox_int, "main",
 		     "shouldbox", main_shouldbox);
 #endif
-    config_free(&cfg);
+    config_put(cfg);
+    config_free();
     error_closelog();
     error_free();
     mymalloc_exit();
