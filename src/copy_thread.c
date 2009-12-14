@@ -41,6 +41,7 @@
 #else
 #include <sys/dirent.h>
 #endif
+#include <sys/wait.h>
 #include "config.h"
 #include "socket.h"
 #include "protocol.h"
@@ -80,6 +81,8 @@ static int fnum, fpos, event_count, num_dirsyncs;
 static protocol_status_t status;
 static dirsync_queue_t * dirsyncs;
 static pthread_mutex_t dirsyncs_lock;
+static time_t last_dirsync = (time_t)0;
+static long long tbytes, xbytes;
 
 static const char * read_copy_state(const config_data_t * cfg) {
     char linebuff[REPLSIZE];
@@ -154,7 +157,7 @@ const char * copy_init(void) {
 	config_put(cfg);
 	return error_sys_errno("copy_init", "pthread_mutex_init", code);
     }
-    if (cfg->intval[cfg_client_mode] & config_client_copy) {
+    if (config_intval(cfg, cfg_client_mode) & config_client_copy) {
 	err = read_copy_state(cfg);
 	if (err) {
 	    pthread_mutex_destroy(&dirsyncs_lock);
@@ -176,12 +179,12 @@ const char * copy_init(void) {
 	error_report(error_notserver);
 	goto out;
     }
-    if (cfg->intval[cfg_client_mode] & config_client_cleardebug) {
+    if (config_intval(cfg, cfg_client_mode) & config_client_cleardebug) {
 	err = send_command_noreport("NODEBUG");
 	if (err)
 	    goto out;
     }
-    if (cfg->intval[cfg_client_mode] & config_client_setdebug) {
+    if (config_intval(cfg, cfg_client_mode) & config_client_setdebug) {
 	err = send_command_noreport("DEBUG");
 	if (err)
 	    goto out;
@@ -190,6 +193,7 @@ const char * copy_init(void) {
     event_count = 0;
     num_dirsyncs = 0;
     dirsyncs = NULL;
+    tbytes = xbytes = 0;
     config_put(cfg);
     return NULL;
 out:
@@ -254,223 +258,251 @@ static int rmtree(const char * dname) {
 static int copy_file_data(socket_t * p, int flen, const char * fname,
 			  const char * sname, const notify_event_t * ev,
 			  struct stat * exists, notify_filetype_t filetype,
-			  int compression, int checksum)
+			  int compression, int checksum, int extcopy)
 {
     switch (ev->file_type) {
-	case notify_filetype_regular : {
-	    int ffd, must_close = 0, digest_size = 0, rv;
-	    const char * sl;
-	    long long done, esize = 0;
-	    int pagesize = sysconf(_SC_PAGESIZE), efd = -1;
-	    off_t emapsize = 0;
-	    char * epagemap = NULL;
-	    char tempname[flen + 16], * dp = tempname, cmdbuff[64];
-	    if (ev->file_size > 0) {
-		sprintf(cmdbuff, "OPEN %d", (int)strlen(sname));
-		if (! client_send_command(p, cmdbuff, sname, NULL))
+	case notify_filetype_regular :
+	    if (extcopy >= 0) {
+		size_t todo = strlen(sname), skip;
+		const config_data_t * cfg = config_get();
+		skip = config_strlen(cfg, cfg_to_prefix);
+		config_put(cfg);
+		if (todo < skip)
 		    return 1;
-		must_close = 1;
-		/* if and the server supports checksums, and the file already
-		 * exists, is a regular file, and is readable, open it */
-		if (checksum >= 0 &&
-		    (digest_size = checksum_size(checksum)) > 0)
-		{
-		    struct stat sbuff;
-		    if (lstat(fname, &sbuff) >= 0 && S_ISREG(sbuff.st_mode)) {
-			/* in case somebody replaced it with a pipe or
-			 * some such thing between the lstat() and the open() */
-			efd = open(fname, O_RDONLY|O_NONBLOCK);
-			epagemap = NULL;
-			if (efd >= 0 &&
-			    fstat(efd, &sbuff) >= 0 &&
-			    S_ISREG(sbuff.st_mode))
-			{
-			    fcntl(efd, F_SETFL, 0L);
-			    esize = sbuff.st_size;
-			    emapsize = (esize + pagesize - 1) / pagesize;
-			    emapsize *= pagesize;
-			    epagemap = mmap(NULL, emapsize, PROT_READ,
-					    MAP_PRIVATE, efd, (off_t)0);
-			}
-			if (! epagemap || epagemap == MAP_FAILED) {
-			    close(efd);
-			    epagemap = NULL;
-			    efd = -1;
-			}
+		sname += skip;
+		todo = 1 + strlen(sname);
+		while (todo > 0) {
+		    ssize_t nw = write(extcopy, sname, todo);
+		    if (nw <= 0) {
+			error_report(error_copy_sys, "external_copy", errno);
+			return 1;
 		    }
+		    todo -= nw;
 		}
-	    }
-	    sl = strrchr(fname, '/');
-	    if (sl) {
-		int len = sl - fname;
-		strncpy(dp, fname, len);
-		dp += len;
-		*dp = 0;
-	    } else {
-		strcpy(dp, fname);
-	    }
-	    if (! mkpath(tempname)) {
-		error_report(error_copy_sys, tempname, errno);
-		if (must_close)
-		    client_send_command(p, "CLOSEFILE", NULL, NULL);
 		return 1;
-	    }
-	    *dp++ = '/';
-	    /* use .should.XXXXXX as temporary name, so that we can ask
-	     * a server running on the same host to ignore these: this
-	     * will be useful for multi-master replication setups */
-	    strcpy(dp, ".should.XXXXXX");
-	    ffd = mkstemp(tempname);
-	    if (ffd < 0)
-		goto error_tempname;
-	    rv = fchmod(ffd, ev->file_mode); /* just in case */
-	    rv = fchown(ffd, ev->file_user, ev->file_group);
-	    done = 0L;
-	    /* do the actual file data copy to ffd */
-	    while (done < ev->file_size) {
-		long long block = ev->file_size - done, realsize;
-		char repl[REPLSIZE], data[DATA_BLOCKSIZE], ud[DATA_BLOCKSIZE];
-		const char * dp;
-		int nf;
-		if (block > DATA_BLOCKSIZE) block = DATA_BLOCKSIZE;
-		/* check if we already have this data */
-		if (epagemap && done + block <= esize) {
-		    long long eblock;
-		    int rptr, i;
-		    unsigned char lhash[digest_size];
-		    unsigned char rhash[digest_size];
-		    sprintf(cmdbuff, "CHECKSUM %lld %lld", done, block);
-		    if (! client_send_command(p, cmdbuff, NULL, repl)) {
-			if (errno == EINTR)
-			    goto error_tempname_noreport;
-			goto no_data;
+	    } else {
+		int ffd, must_close = 0, digest_size = 0, rv;
+		const char * sl;
+		long long done, esize = 0;
+		int pagesize = sysconf(_SC_PAGESIZE), efd = -1;
+		off_t emapsize = 0;
+		char * epagemap = NULL;
+		char tempname[flen + 16], * dp = tempname, cmdbuff[64];
+		if (ev->file_size > 0) {
+		    if (! client_send_command(p, "OPEN %", sname, NULL))
+			return 1;
+		    must_close = 1;
+		    /* if the server supports checksums, and the file already
+		     * exists, is a regular file, and is readable, open it */
+		    if (checksum >= 0 &&
+			(digest_size = checksum_size(checksum)) > 0)
+		    {
+			struct stat sbuff;
+			if (lstat(fname, &sbuff) >= 0 && S_ISREG(sbuff.st_mode))
+			{
+			    /* in case somebody replaced it with a pipe or
+			     * some such thing between the lstat() and the
+			     * open() */
+			    efd = open(fname, O_RDONLY|O_NONBLOCK);
+			    epagemap = NULL;
+			    if (efd >= 0 &&
+				fstat(efd, &sbuff) >= 0 &&
+				S_ISREG(sbuff.st_mode))
+			    {
+				fcntl(efd, F_SETFL, 0L);
+				esize = sbuff.st_size;
+				emapsize = (esize + pagesize - 1) / pagesize;
+				emapsize *= pagesize;
+				epagemap = mmap(NULL, emapsize, PROT_READ,
+						MAP_PRIVATE, efd, (off_t)0);
+			    }
+			    if (! epagemap || epagemap == MAP_FAILED) {
+				close(efd);
+				epagemap = NULL;
+				efd = -1;
+			    }
+			}
 		    }
-		    if (sscanf(repl + 2, "%lld %n", &eblock, &rptr) < 1)
-			goto no_data;
-		    if (rptr < 1 || eblock < 1)
-			goto no_data;
-		    rptr += 2;
-		    for (i = 0; i < digest_size; i++) {
-			char val[3];
-			val[0] = repl[rptr++];
-			if (! isxdigit((int)val[0]))
-			    goto no_data;
-			val[1] = repl[rptr++];
-			if (! isxdigit((int)val[1]))
-			    goto no_data;
-			val[2] = 0;
-			rhash[i] = strtol(val, NULL, 16);
-		    }
-		    if (! checksum_data(checksum, epagemap + done,
-					block, lhash))
-			goto no_data;
-		    for (i = 0; i < digest_size; i++)
-			if (lhash[i] != rhash[i])
-			    goto no_data;
-		    /* OK, we have some data, copy it from the original
-		     * file, then go and try another block */
-		    dp = epagemap + done;
-		    while (eblock > 0) {
-			ssize_t nw = write(ffd, dp, eblock);
-			if (nw < 0)
-			    goto error_tempname;
-			eblock -= nw;
-			dp += nw;
-			done += nw;
-		    }
-		    continue;
 		}
-	    no_data:
-		sprintf(cmdbuff, "DATA %lld %lld", done, block);
-		if (! client_send_command(p, cmdbuff, NULL, repl))
-		    goto error_tempname_noreport;
-		if (errno == EINTR)
-		    goto error_tempname_noreport;
-		nf = sscanf(repl + 2, "%lld %lld", &block, &realsize);
-		if (nf < 1 || block < 0 || block > DATA_BLOCKSIZE) {
-		    error_report(error_copy_invalid, fname, repl);
-		    goto error_tempname_noreport;
+		sl = strrchr(fname, '/');
+		if (sl) {
+		    int len = sl - fname;
+		    strncpy(dp, fname, len);
+		    dp += len;
+		    *dp = 0;
+		} else {
+		    strcpy(dp, fname);
 		}
-		if (nf >= 2) {
-		    if (realsize < 0 || realsize <= block) {
+		if (! mkpath(tempname)) {
+		    error_report(error_copy_sys, tempname, errno);
+		    if (must_close)
+			client_send_command(p, "CLOSEFILE", NULL, NULL);
+		    if (epagemap)
+			munmap(epagemap, emapsize);
+		    if (efd >= 0)
+			close(efd);
+		    return 1;
+		}
+		*dp++ = '/';
+		/* use .should.XXXXXX as temporary name, so that we can ask
+		 * a server running on the same host to ignore these: this
+		 * will be useful for multi-master replication setups */
+		strcpy(dp, ".should.XXXXXX");
+		ffd = mkstemp(tempname);
+		if (ffd < 0)
+		    goto error_tempname;
+		rv = fchmod(ffd, ev->file_mode); /* just in case */
+		rv = fchown(ffd, ev->file_user, ev->file_group);
+		done = 0L;
+		/* do the actual file data copy to ffd */
+		while (done < ev->file_size) {
+		    long long block = ev->file_size - done, realsize;
+		    char repl[REPLSIZE], data[DATA_BLOCKSIZE];
+		    char ud[DATA_BLOCKSIZE];
+		    const char * dp;
+		    int nf;
+		    if (block > DATA_BLOCKSIZE) block = DATA_BLOCKSIZE;
+		    /* check if we already have this data */
+		    if (epagemap && done + block <= esize) {
+			long long eblock;
+			int rptr, i;
+			unsigned char lhash[digest_size];
+			unsigned char rhash[digest_size];
+			sprintf(cmdbuff, "CHECKSUM %lld %lld", done, block);
+			if (! client_send_command(p, cmdbuff, NULL, repl)) {
+			    if (errno == EINTR)
+				goto error_tempname_noreport;
+			    goto no_data;
+			}
+			if (sscanf(repl + 2, "%lld %n", &eblock, &rptr) < 1)
+			    goto no_data;
+			if (rptr < 1 || eblock < 1)
+			    goto no_data;
+			rptr += 2;
+			for (i = 0; i < digest_size; i++) {
+			    char val[3];
+			    val[0] = repl[rptr++];
+			    if (! isxdigit((int)val[0]))
+				goto no_data;
+			    val[1] = repl[rptr++];
+			    if (! isxdigit((int)val[1]))
+				goto no_data;
+			    val[2] = 0;
+			    rhash[i] = strtol(val, NULL, 16);
+			}
+			if (! checksum_data(checksum, epagemap + done,
+					    block, lhash))
+			    goto no_data;
+			for (i = 0; i < digest_size; i++)
+			    if (lhash[i] != rhash[i])
+				goto no_data;
+			/* OK, we have some data, copy it from the original
+			 * file, then go and try another block */
+			dp = epagemap + done;
+			while (eblock > 0) {
+			    ssize_t nw = write(ffd, dp, eblock);
+			    if (nw < 0)
+				goto error_tempname;
+			    eblock -= nw;
+			    dp += nw;
+			    done += nw;
+			    tbytes += nw;
+			}
+			continue;
+		    }
+		no_data:
+		    sprintf(cmdbuff, "DATA %lld %lld", done, block);
+		    if (! client_send_command(p, cmdbuff, NULL, repl))
+			goto error_tempname_noreport;
+		    if (errno == EINTR)
+			goto error_tempname_noreport;
+		    nf = sscanf(repl + 2, "%lld %lld", &block, &realsize);
+		    if (nf < 1 || block < 0 || block > DATA_BLOCKSIZE) {
 			error_report(error_copy_invalid, fname, repl);
 			goto error_tempname_noreport;
 		    }
-		} else {
-		    realsize = block;
-		}
-		if (realsize == 0) {
-		    error_report(error_copy_short, fname);
-		    goto error_tempname_noreport;
-		}
-		if (! socket_get(p, data, block)) {
-		    error_report(error_client, "socket_get", errno);
-		    goto error_tempname_noreport;
-		}
-		if (nf >= 2) {
-		    int bs = DATA_BLOCKSIZE;
-		    const char * err =
-			uncompress_data(compression, data, block, ud, &bs);
-		    if (err) {
-			error_report(error_copy_uncompress, err);
+		    if (nf >= 2) {
+			if (realsize < 0 || realsize <= block) {
+			    error_report(error_copy_invalid, fname, repl);
+			    goto error_tempname_noreport;
+			}
+		    } else {
+			realsize = block;
+		    }
+		    if (realsize == 0) {
+			error_report(error_copy_short, fname);
 			goto error_tempname_noreport;
 		    }
-		    if (bs != realsize) {
-			error_report(error_copy_uncompress, "Data size differ");
+		    tbytes += realsize;
+		    xbytes += block;
+		    if (! socket_get(p, data, block)) {
+			error_report(error_client, "socket_get", errno);
 			goto error_tempname_noreport;
 		    }
-		    dp = ud;
-		} else {
-		    dp = data;
+		    if (nf >= 2) {
+			int bs = DATA_BLOCKSIZE;
+			const char * err =
+			    uncompress_data(compression, data, block, ud, &bs);
+			if (err) {
+			    error_report(error_copy_uncompress, err);
+			    goto error_tempname_noreport;
+			}
+			if (bs != realsize) {
+			    error_report(error_copy_uncompress,
+					 "Data size differ");
+			    goto error_tempname_noreport;
+			}
+			dp = ud;
+		    } else {
+			dp = data;
+		    }
+		    done += realsize;
+		    while (realsize > 0) {
+			ssize_t nw = write(ffd, dp, realsize);
+			if (nw < 0)
+			    goto error_tempname;
+			realsize -= nw;
+			dp += nw;
+		    }
 		}
-		done += realsize;
-		while (realsize > 0) {
-		    ssize_t nw = write(ffd, dp, realsize);
-		    if (nw < 0)
-			goto error_tempname;
-		    realsize -= nw;
-		    dp += nw;
+		if (epagemap)
+		    munmap(epagemap, emapsize);
+		epagemap = NULL;
+		if (efd >= 0)
+		    close(efd);
+		efd = -1;
+		if (close(ffd) < 0) {
+		    error_report(error_copy_sys, tempname, errno);
+		    unlink(tempname);
+		    if (must_close)
+			client_send_command(p, "CLOSEFILE", NULL, NULL);
+		    return 1;
 		}
-	    }
-	    if (epagemap)
-		munmap(epagemap, emapsize);
-	    epagemap = NULL;
-	    if (efd >= 0)
-		close(efd);
-	    efd = -1;
-	    if (close(ffd) < 0) {
+		ffd = -1;
+		if (exists && filetype != notify_filetype_regular)
+		    filetype == notify_filetype_dir ? rmtree(fname)
+						    : unlink(fname);
+		if (rename(tempname, fname) < 0)
+		    goto error_tempname;
+		if (ev->file_size > 0)
+		    if (! client_send_command(p, "CLOSEFILE", NULL, NULL))
+			return 1;
+		return 2;
+	    error_tempname:
 		error_report(error_copy_sys, tempname, errno);
-		unlink(tempname);
+	    error_tempname_noreport:
+		if (epagemap)
+		    munmap(epagemap, emapsize);
+		if (efd >= 0)
+		    close(efd);
+		if (ffd >= 0) {
+		    close(ffd);
+		    unlink(tempname);
+		}
 		if (must_close)
 		    client_send_command(p, "CLOSEFILE", NULL, NULL);
 		return 1;
 	    }
-	    ffd = -1;
-	    if (exists && filetype != notify_filetype_regular)
-		filetype == notify_filetype_dir ? rmtree(fname) : unlink(fname);
-	    if (rename(tempname, fname) < 0)
-		goto error_tempname;
-	    if (ev->file_size > 0)
-		if (! client_send_command(p, "CLOSEFILE", NULL, NULL))
-		    return 1;
-	    return 2;
-	error_tempname:
-	    error_report(error_copy_sys, tempname, errno);
-	error_tempname_noreport:
-	    if (epagemap)
-		munmap(epagemap, emapsize);
-	    epagemap = NULL;
-	    if (efd >= 0)
-		close(efd);
-	    if (ffd >= 0) {
-		close(ffd);
-		unlink(tempname);
-	    }
-	    if (must_close)
-		if (! client_send_command(p, "CLOSEFILE", NULL, NULL))
-		    return 1;
-	    return 1;
-	}
 	case notify_filetype_dir :
 	    if (exists) {
 		if (filetype == ev->file_type)
@@ -542,10 +574,12 @@ error_fname:
  * if compression is nonnegative it identifies a compression method to
  * use to copy the file data; if checksum is nonnegative it identifies a
  * checksum method to use to avoid copying data already present in the client;
- * both compression and checksum must have already been set up on the server */
+ * both compression and checksum must have already been set up on the server;
+ * extcopy is an open file descriptor to the external copy program, or -1
+ * to use the internal copy */
 
 void copy_file(socket_t * p, const char * from, const char * to, int tr_ids,
-	       int compression, int checksum)
+	       int compression, int checksum, int extcopy)
 {
     char command[REPLSIZE], target[DATA_BLOCKSIZE + 1];
     long long size;
@@ -557,7 +591,7 @@ void copy_file(socket_t * p, const char * from, const char * to, int tr_ids,
     notify_filetype_t ot = notify_filetype_unknown;
     notify_event_t ev;
     const config_data_t * cfg = config_get();
-    sprintf(command, "STAT %d %d", (int)strlen(from), tr_ids);
+    sprintf(command, "STAT %% %d", tr_ids);
     if (! client_send_command(p, command, from, command)) {
 	config_put(cfg);
 	return;
@@ -581,16 +615,16 @@ void copy_file(socket_t * p, const char * from, const char * to, int tr_ids,
     if (tl > DATA_BLOCKSIZE) {
 	fprintf(stderr, "Link target too big\n");
 	while (tl > DATA_BLOCKSIZE) {
-	    socket_gets(p, target, DATA_BLOCKSIZE);
+	    socket_get(p, target, DATA_BLOCKSIZE);
 	    tl -= DATA_BLOCKSIZE;
 	}
 	if (tl > 0)
-	    socket_gets(p, target, tl);
+	    socket_get(p, target, tl);
 	config_put(cfg);
 	return;
     }
     if (tl > 0)
-	if (! socket_gets(p, target, tl))
+	if (! socket_get(p, target, tl))
 	    goto invalid;
     config_put(cfg);
     strptime(mtime, "%Y-%m-%d:%H:%M:%S", &tm);
@@ -615,7 +649,7 @@ void copy_file(socket_t * p, const char * from, const char * to, int tr_ids,
     ev.file_size = size;
     ev.file_mtime = ut.modtime;
     if (! copy_file_data(p, strlen(to), to, ev.from_name, &ev,
-			 oldsbuff, ot, compression, checksum))
+			 oldsbuff, ot, compression, checksum, extcopy))
 	return;
     rv = chown(to, uid, gid);
     rv = chmod(to, mode);
@@ -628,39 +662,43 @@ invalid:
 }
 
 static int cp(const config_data_t * cfg, const notify_event_t * ev,
-	      int compression, int checksum)
+	      int compression, int checksum, int extcopy)
 {
     int do_lstat = 1, fstat_valid, ok, clen;
-    int do_debug = cfg->intval[cfg_flags] & config_flag_debug_server;
+    int do_debug = config_intval(cfg, cfg_flags) & config_flag_debug_server;
     struct stat sbuff;
     config_filter_t filter = config_file_all;
     /* translate server's names to local names */
-    int flen = ev->from_name && ev->from_length >= cfg->intval[cfg_from_length]
+    int flen = ev->from_name &&
+		ev->from_length >= config_strlen(cfg, cfg_from_prefix)
 	     ? ev->from_length + 1 +
-		cfg->intval[cfg_to_length] - cfg->intval[cfg_from_length]
+		config_strlen(cfg, cfg_to_prefix) -
+		config_strlen(cfg, cfg_from_prefix)
 	     : 1;
-    int tlen = ev->to_name && ev->to_length >= cfg->intval[cfg_to_length]
+    int tlen = ev->to_name && ev->to_length >= config_strlen(cfg, cfg_to_prefix)
 	     ? ev->to_length + 1 +
-		cfg->intval[cfg_to_length] - cfg->intval[cfg_from_length]
+		config_strlen(cfg, cfg_to_prefix) -
+		config_strlen(cfg, cfg_from_prefix)
 	     : 1;
     char fname[flen], tname[tlen];
     const char * cptr, * sptr;
-    if (ev->from_name && ev->from_length >= cfg->intval[cfg_from_length]) {
-	if (ev->from_length >= cfg->intval[cfg_from_length]) {
-	    strncpy(fname, cfg->strval[cfg_to_prefix],
-		    cfg->intval[cfg_to_length]);
-	    strcpy(fname + cfg->intval[cfg_to_length],
-		   ev->from_name + cfg->intval[cfg_from_length]);
+    if (ev->from_name && ev->from_length >= config_strlen(cfg, cfg_from_prefix))
+    {
+	if (ev->from_length >= config_strlen(cfg, cfg_from_prefix)) {
+	    strncpy(fname, config_strval(cfg, cfg_to_prefix),
+		    config_strlen(cfg, cfg_to_prefix));
+	    strcpy(fname + config_strlen(cfg, cfg_to_prefix),
+		   ev->from_name + config_strlen(cfg, cfg_from_prefix));
 	} else {
 	    fname[0] = 0;
 	}
     }
-    if (ev->to_name && ev->to_length >= cfg->intval[cfg_to_length]) {
-	if (ev->to_length >= cfg->intval[cfg_to_length]) {
-	    strncpy(tname, cfg->strval[cfg_to_prefix],
-		    cfg->intval[cfg_to_length]);
-	    strcpy(tname + cfg->intval[cfg_to_length],
-		   ev->to_name + cfg->intval[cfg_from_length]);
+    if (ev->to_name && ev->to_length >= config_strlen(cfg, cfg_to_prefix)) {
+	if (ev->to_length >= config_strlen(cfg, cfg_to_prefix)) {
+	    strncpy(tname, config_strval(cfg, cfg_to_prefix),
+		    config_strlen(cfg, cfg_to_prefix));
+	    strcpy(tname + config_strlen(cfg, cfg_to_prefix),
+		   ev->to_name + config_strlen(cfg, cfg_from_prefix));
 	} else {
 	    tname[0] = 0;
 	}
@@ -701,7 +739,7 @@ static int cp(const config_data_t * cfg, const notify_event_t * ev,
 		/* means file was deleted before we got to it */
 		return 1;
 	adjust_meta:
-	    if (! (cfg->filter[config_event_meta] & filter))
+	    if (! (config_intval(cfg, cfg_event_meta) & filter))
 		return 1;
 	    if (do_lstat && lstat(fname, &sbuff) < 0)
 		goto error_fname;
@@ -722,11 +760,11 @@ static int cp(const config_data_t * cfg, const notify_event_t * ev,
 	    }
 	    return 1;
 	case notify_change_data :
-	    if (! (cfg->filter[config_event_data] & filter))
+	    if (! (config_intval(cfg, cfg_event_data) & filter))
 		return 1;
 	    goto data_or_create;
 	case notify_create :
-	    if (! (cfg->filter[config_event_create] & filter))
+	    if (! (config_intval(cfg, cfg_event_create) & filter))
 		return 1;
 	data_or_create:
 	    cptr = fname;
@@ -741,7 +779,7 @@ static int cp(const config_data_t * cfg, const notify_event_t * ev,
 	    /* if file exists, mtime & size are identical, and the user want
 	     * to skip matching files, skip them */
 	    if (fstat_valid &&
-		(cfg->intval[cfg_flags] & config_flag_skip_matching) &&
+		(config_intval(cfg, cfg_flags) & config_flag_skip_matching) &&
 		sbuff.st_mtime == ev->file_mtime &&
 		sbuff.st_size == ev->file_size &&
 		notify_filetype(sbuff.st_mode) == ev->file_type)
@@ -757,8 +795,8 @@ static int cp(const config_data_t * cfg, const notify_event_t * ev,
 		return 1;
 	    }
 	    /* must copy file data */
-	    if (! (cfg->filter[config_event_data] & filter) &&
-	        ! (cfg->filter[config_event_create] & filter))
+	    if (! (config_intval(cfg, cfg_event_data) & filter) &&
+	        ! (config_intval(cfg, cfg_event_create) & filter))
 		    return 1;
 	    if (do_debug)
 		error_report(info_replication_copy, sptr, cptr, ev->file_size);
@@ -766,14 +804,14 @@ static int cp(const config_data_t * cfg, const notify_event_t * ev,
 				fstat_valid ? &sbuff : NULL,
 				fstat_valid ? notify_filetype(sbuff.st_mode)
 					    : notify_filetype_unknown,
-				compression, checksum);
+				compression, checksum, extcopy);
 	    if (! ok)
 		return 0;
 	    if (ok == 1)
 		return 1;
 	    goto adjust_meta;
 	case notify_delete :
-	    if (! (cfg->filter[config_event_delete] & filter))
+	    if (! (config_intval(cfg, cfg_event_delete) & filter))
 		return 1;
 	    if (do_debug)
 		error_report(info_replication_delete, fname);
@@ -786,7 +824,7 @@ static int cp(const config_data_t * cfg, const notify_event_t * ev,
 	    }
 	    return 1;
 	case notify_rename :
-	    if (! (cfg->filter[config_event_rename] & filter))
+	    if (! (config_intval(cfg, cfg_event_rename) & filter))
 		return 1;
 	    if (do_debug)
 		error_report(info_replication_rename, fname, tname);
@@ -795,7 +833,7 @@ static int cp(const config_data_t * cfg, const notify_event_t * ev,
 		    int se = errno;
 		    if (lstat(fname, &sbuff) < 0) {
 			/* try executing it as a copy */
-			if (cfg->filter[config_event_delete] & filter)
+			if (config_intval(cfg, cfg_event_delete) & filter)
 			    unlink(fname);
 			cptr = tname;
 			clen = tlen;
@@ -810,19 +848,19 @@ static int cp(const config_data_t * cfg, const notify_event_t * ev,
 	case notify_overflow :
 	case notify_nospace :
 	    /* if configured, schedule a full dirsync */
-	    if (cfg->intval[cfg_flags] & config_flag_overflow_dirsync)
-		copy_dirsync("");
+	    if (config_intval(cfg, cfg_flags) & config_flag_overflow_dirsync)
+		copy_dirsync("overflow", "");
 	    return 1;
 	case notify_add_tree :
 	    /* if configured, do an initial dirsync */
-	    if (cfg->intval[cfg_flags] & config_flag_initial_dirsync) {
+	    if (config_intval(cfg, cfg_flags) & config_flag_initial_dirsync) {
 		const char * path;
-		if (strlen(fname) >= cfg->intval[cfg_to_length])
-		    path = fname + cfg->intval[cfg_to_length];
+		if (strlen(fname) >= config_strlen(cfg, cfg_to_prefix))
+		    path = fname + config_strlen(cfg, cfg_to_prefix);
 		else
 		    path = "";
 		while (*path && *path == '/') path++;
-		copy_dirsync(path);
+		copy_dirsync("initial", path);
 	    }
 	    return 1;
     }
@@ -1138,15 +1176,17 @@ static inline void skip_name(char buffer[], int bufsize, int len) {
 static dirscan_t ** get_server_dir(const config_data_t * cfg,
 				   int pathlen, const char * path)
 {
-    char buffer[REPLSIZE], fname[pathlen + cfg->intval[cfg_from_length] + 1];
+    char buffer[REPLSIZE];
+    char fname[pathlen + config_strlen(cfg, cfg_from_prefix) + 1];
     dirscan_t * entries = NULL;
-    int tr_ids = cfg->intval[cfg_flags] & config_flag_translate_ids ? 1 : 0;
+    int tr_ids =
+	config_intval(cfg, cfg_flags) & config_flag_translate_ids ? 1 : 0;
     int ok = 1, entcount = 0;
-    strncpy(fname, cfg->strval[cfg_from_prefix], cfg->intval[cfg_from_length]);
-    strncpy(fname + cfg->intval[cfg_from_length], path, pathlen);
-    fname[cfg->intval[cfg_from_length] + pathlen] = 0;
-    sprintf(buffer, "GETDIR %d %d",
-	    pathlen + cfg->intval[cfg_from_length], tr_ids);
+    strncpy(fname, config_strval(cfg, cfg_from_prefix),
+	    config_strlen(cfg, cfg_from_prefix));
+    strncpy(fname + config_strlen(cfg, cfg_from_prefix), path, pathlen);
+    fname[config_strlen(cfg, cfg_from_prefix) + pathlen] = 0;
+    sprintf(buffer, "GETDIR %% %d", tr_ids);
     if (! client_send_command(p, buffer, fname, NULL))
 	return NULL;
     while (1) {
@@ -1291,19 +1331,21 @@ static dirscan_t ** get_server_dir(const config_data_t * cfg,
 static dirscan_t ** get_local_dir(const config_data_t * cfg,
 				  int pathlen, const char * path)
 {
-    char dname[pathlen + cfg->intval[cfg_to_length] + 1];
-    char ename[pathlen + cfg->intval[cfg_to_length] + NAME_MAX + 2], * eptr;
+    char dname[pathlen + config_strlen(cfg, cfg_to_prefix) + 1];
+    char ename[pathlen + config_strlen(cfg, cfg_to_prefix) + NAME_MAX + 2];
+    char * eptr;
     dirscan_t * entries = NULL, ** result;
     int entcount = 0;
     DIR * D;
     struct dirent * E;
-    strncpy(dname, cfg->strval[cfg_to_prefix], cfg->intval[cfg_to_length]);
-    strncpy(dname + cfg->intval[cfg_to_length], path, pathlen);
-    dname[cfg->intval[cfg_to_length] + pathlen] = 0;
+    strncpy(dname, config_strval(cfg, cfg_to_prefix),
+	    config_strlen(cfg, cfg_to_prefix));
+    strncpy(dname + config_strlen(cfg, cfg_to_prefix), path, pathlen);
+    dname[config_strlen(cfg, cfg_to_prefix) + pathlen] = 0;
     D = opendir(dname);
     if (! D) return NULL;
     strcpy(ename, dname);
-    eptr = ename + cfg->intval[cfg_to_length] + pathlen;
+    eptr = ename + config_strlen(cfg, cfg_to_prefix) + pathlen;
     *eptr++ = '/';
     while ((E = readdir(D)) != NULL) {
 	dirscan_t * entry;
@@ -1394,7 +1436,7 @@ static dirscan_t ** get_local_dir(const config_data_t * cfg,
 /* synchronise just one directory, but schedule synchronisation for any
  * subdirectories it finds, so recursion will happen at some point */
 
-static void do_dirsync(int compression, int checksum) {
+static void do_dirsync(int compression, int checksum, int extcopy) {
     dirsync_queue_t * dq;
     dirscan_t ** server_dir;
     int errcode = pthread_mutex_lock(&dirsyncs_lock), i;
@@ -1419,7 +1461,8 @@ static void do_dirsync(int compression, int checksum) {
 	if (local_dir) {
 	    /* determine differences and do copy/deletes as appropriate */
 	    int sp, lp, maxname = 0;
-	    int delete = cfg->intval[cfg_flags] & config_flag_dirsync_delete;
+	    int delete =
+		config_intval(cfg, cfg_flags) & config_flag_dirsync_delete;
 	    for (sp = 0; server_dir[sp]; sp++) {
 		int l = strlen(server_dir[sp]->ev.from_name);
 		if (l > maxname) maxname = l;
@@ -1430,7 +1473,7 @@ static void do_dirsync(int compression, int checksum) {
 	    }
 	    sp = lp = 0;
 	    while (server_dir[sp] || local_dir[lp]) {
-		char lname[dq->pathlen + cfg->intval[cfg_to_length] +
+		char lname[dq->pathlen + config_strlen(cfg, cfg_to_prefix) +
 			   maxname + 2];
 		int c;
 		if (server_dir[sp] && local_dir[lp])
@@ -1444,7 +1487,7 @@ static void do_dirsync(int compression, int checksum) {
 		    /* file exists locally but not on server */
 		    if (delete) {
 			sprintf(lname, "%s%s/%s",
-				cfg->strval[cfg_to_prefix],
+				config_strval(cfg, cfg_to_prefix),
 				dq->path, local_dir[lp]->ev.from_name);
 			if (local_dir[lp]->ev.file_type == notify_filetype_dir)
 			    unlink(lname);
@@ -1459,7 +1502,8 @@ static void do_dirsync(int compression, int checksum) {
 			    dq->path, server_dir[lp]->ev.from_name);
 		    server_dir[sp]->ev.from_name = lname;
 		    server_dir[sp]->ev.from_length = strlen(lname);
-		    cp(cfg, &server_dir[sp]->ev, compression, checksum);
+		    cp(cfg, &server_dir[sp]->ev,
+		       compression, checksum, extcopy);
 		    sp++;
 		}
 		if (c == 0) {
@@ -1469,7 +1513,8 @@ static void do_dirsync(int compression, int checksum) {
 			    dq->path, server_dir[lp]->ev.from_name);
 		    server_dir[sp]->ev.from_name = lname;
 		    server_dir[sp]->ev.from_length = strlen(lname);
-		    cp(cfg, &server_dir[sp]->ev, compression, checksum);
+		    cp(cfg, &server_dir[sp]->ev,
+		       compression, checksum, extcopy);
 		    sp++;
 		    lp++;
 		}
@@ -1480,18 +1525,19 @@ static void do_dirsync(int compression, int checksum) {
 	}
 	for (i = 0; server_dir[i]; i++) {
 	    if (server_dir[i]->ev.file_type == notify_filetype_dir) {
-		int len =
-		    server_dir[i]->ev.from_length + cfg->intval[cfg_to_length];
+		int len = server_dir[i]->ev.from_length +
+			  config_strlen(cfg, cfg_to_prefix);
 		char fname[len + 1];
-		strcpy(fname, cfg->strval[cfg_to_prefix]);
-		strcpy(fname + cfg->intval[cfg_to_length],
+		strcpy(fname, config_strval(cfg, cfg_to_prefix));
+		strcpy(fname + config_strlen(cfg, cfg_to_prefix),
 		       server_dir[i]->ev.from_name);
-		copy_dirsync(fname);
+		copy_dirsync(NULL, fname);
 	    }
 	    myfree(server_dir[i]);
 	}
 	myfree(server_dir);
     }
+    if (dq->pathlen == 0) last_dirsync = time(NULL);
     myfree(dq);
     config_put(cfg);
 }
@@ -1500,23 +1546,29 @@ static void do_dirsync(int compression, int checksum) {
 
 void copy_thread(void) {
     const config_data_t * cfg = config_get();
-    int checksum = -1, compression = -1;
-    int check_events = cfg->intval[cfg_checkpoint_events];
-    time_t check_time = cfg->intval[cfg_checkpoint_time] + time(NULL);
+    int checksum = -1, compression = -1, extcopy = -1;
+    int check_events = config_intval(cfg, cfg_checkpoint_events);
+    pid_t pid = -1;
+    time_t check_time = config_intval(cfg, cfg_checkpoint_time) + time(NULL);
     char command[REPLSIZE];
-    const char * fp =
-	cfg->strval[cfg_from_prefix] ? cfg->strval[cfg_from_prefix] : "/";
+    const char * fp = config_strval(cfg, cfg_from_prefix)
+		    ? config_strval(cfg, cfg_from_prefix)
+		    : "/";
     int fnum_cp = fnum, fpos_cp = fpos;
-    int evmax = cfg->intval[cfg_optimise_client] < 1
-	? 1 : cfg->intval[cfg_optimise_client];
-    int evbuff = cfg->intval[cfg_optimise_buffer] < 256
-	? 256 : cfg->intval[cfg_optimise_buffer];
-    int tr_ids = (cfg->intval[cfg_flags] & config_flag_translate_ids) ||
+    int evmax = config_intval(cfg, cfg_optimise_client) < 1
+	? 1 : config_intval(cfg, cfg_optimise_client);
+    int evbuff = config_intval(cfg, cfg_optimise_buffer) < 256
+	? 256 : config_intval(cfg, cfg_optimise_buffer);
+    int tr_ids = (config_intval(cfg, cfg_flags) & config_flag_translate_ids) ||
 		  config_copy_file == NULL;
-    int oneshot = cfg->intval[cfg_flags] & config_flag_copy_oneshot;
-    if (cfg->intval[cfg_client_mode] & config_client_copy) {
+    int oneshot = config_intval(cfg, cfg_flags) & config_flag_copy_oneshot;
+    if (config_intval(cfg, cfg_client_mode) & config_client_copy) {
 	checksum = client_find_checksum(p, extensions);
 	compression = client_find_compress(p);
+	if (! client_setup_extcopy(&extcopy, &pid)) {
+	    perror("external_copy");
+	    goto out;
+	}
     } else {
 	fnum = status.store.file_current;
 	fpos = status.store.file_pos;
@@ -1524,8 +1576,8 @@ void copy_thread(void) {
     config_put(cfg);
     if (! client_set_parameters(p))
 	goto out;
-    sprintf(command, "SETROOT %d %d %d %d",
-	    fnum, fpos, (int)strlen(fp), tr_ids);
+    sprintf(command, "SETROOT %d %d %% %d",
+	    fnum, fpos, tr_ids);
     if (! client_send_command(p, command, fp, NULL))
 	goto out;
     main_running = 1;
@@ -1536,7 +1588,7 @@ void copy_thread(void) {
 	int evspace = evbuff, evcount = 1, evnum, valid[evmax], cmdok;
 	int fnum_l[evmax], fpos_l[evmax];
 	cfg = config_get();
-	check_events = cfg->intval[cfg_checkpoint_events];
+	check_events = config_intval(cfg, cfg_checkpoint_events);
 	/* read first event */
 	cmdok = get_next_event(&evstart, &evspace, &freeit,
 			       num_dirsyncs || oneshot ? 0 : -1,
@@ -1544,7 +1596,7 @@ void copy_thread(void) {
 	if (cmdok == 2) {
 	    config_put(cfg);
 	    if (oneshot) break;
-	    do_dirsync(compression, checksum);
+	    do_dirsync(compression, checksum, extcopy);
 	    continue;
 	}
 	if (cmdok == 1) {
@@ -1578,7 +1630,7 @@ void copy_thread(void) {
 	    check_events--;
 	    if (! valid[evnum]) continue;
 	    if (config_copy_file) {
-		if (! cp(cfg, &evlist[evnum], compression, checksum))
+		if (! cp(cfg, &evlist[evnum], compression, checksum, extcopy))
 		    goto out;
 	    } else {
 		store_printevent(&evlist[evnum], NULL, NULL);
@@ -1587,8 +1639,8 @@ void copy_thread(void) {
 	    if (check_events > 0) continue;
 	    now = time(NULL);
 	    if (now < check_time) continue;
-	    check_events = cfg->intval[cfg_checkpoint_events];
-	    check_time = now + cfg->intval[cfg_checkpoint_time];
+	    check_events = config_intval(cfg, cfg_checkpoint_events);
+	    check_time = now + config_intval(cfg, cfg_checkpoint_time);
 	    if (fnum_l[evnum] == fnum_cp && fpos_l[evnum] == fpos_cp) continue;
 	    fprintf(config_copy_file, "%d %d\n", fnum_l[evnum], fpos_l[evnum]);
 	    fflush(config_copy_file);
@@ -1613,6 +1665,10 @@ void copy_thread(void) {
 out:
     if (config_copy_file && (fnum != fnum_cp || fpos != fpos_cp))
 	fprintf(config_copy_file, "%d %d\n", fnum, fpos);
+    if (extcopy >= 0)
+	close(extcopy);
+    if (pid >= 0)
+	waitpid(pid, &extcopy, 0);
 }
 
 /* cleanup required after the copy thread terminates */
@@ -1640,18 +1696,25 @@ void copy_status(copy_status_t * status) {
 	status->file_pos = -1;
 	status->events = -1;
 	status->dirsyncs = -1;
+	status->rbytes = -1;
+	status->wbytes = -1;
+	status->tbytes = -1;
+	status->xbytes = -1;
     } else {
 	status->file_current = fnum;
 	status->file_pos = fpos;
 	status->events = event_count;
 	status->dirsyncs = num_dirsyncs;
+	socket_stats(p, &status->rbytes, &status->wbytes);
+	status->tbytes = tbytes;
+	status->xbytes = xbytes;
 	pthread_mutex_unlock(&dirsyncs_lock);
     }
 }
 
 /* schedules an immediate dirsync of server:from/path to client:to/path */
 
-int copy_dirsync(const char * path) {
+int copy_dirsync(const char * reason, const char * path) {
     int len, errcode, do_it;
     dirsync_queue_t * dq, * check, * prev, * to_free;
     if (! path) path = "";
@@ -1717,6 +1780,8 @@ int copy_dirsync(const char * path) {
 	to_free = dq;
     }
     pthread_mutex_unlock(&dirsyncs_lock);
+    if (reason)
+	error_report(info_sched_dirsync, reason, dq->path);
     /* free the elements outside the lock, in case the locking done by the
      * free function results in a deadlock. You never know */
     while (to_free) {
@@ -1728,5 +1793,11 @@ int copy_dirsync(const char * path) {
 fail:
     error_report(error_copy_sched_dirsync, path, errno);
     return 0;
+}
+
+/* time of the last full dirsync */
+
+time_t copy_last_dirsync(void) {
+    return last_dirsync;
 }
 

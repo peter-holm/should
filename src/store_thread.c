@@ -64,6 +64,7 @@ struct store_get_s {
     int file_size;
     int page_size;
     unsigned char * mmap;
+    int fd;
     size_t mlen;
     char * name;
     char * suffix;
@@ -200,8 +201,8 @@ static const char * open_file(const config_data_t * cfg) {
     save_pos = pos;
     pthread_mutex_unlock(&save_lock);
     save_count++;
-    if (cfg->intval[cfg_autopurge_days] > 0)
-	store_purge(cfg->intval[cfg_autopurge_days]);
+    if (config_intval(cfg, cfg_autopurge_days) > 0)
+	store_purge(config_intval(cfg, cfg_autopurge_days));
     return NULL;
 }
 
@@ -235,14 +236,14 @@ static int count_files(const char * eventdir, int * earliest, int * newest) {
 }
 
 static const char * save_init(const config_data_t * cfg, const char * cmd) {
-    int len = strlen(cfg->strval[cfg_eventdir]);
+    int len = strlen(config_strval(cfg, cfg_eventdir));
     const char * err;
     struct stat sbuff;
     int code = pthread_mutex_init(&save_lock, NULL);
     if (code)
 	return error_sys_errno("save_init", "pthread_mutex_init", code);
-    if (stat(cfg->strval[cfg_eventdir], &sbuff) < 0) {
-	if (mkdir(cfg->strval[cfg_eventdir], 0700) < 0) {
+    if (stat(config_strval(cfg, cfg_eventdir), &sbuff) < 0) {
+	if (mkdir(config_strval(cfg, cfg_eventdir), 0700) < 0) {
 	    int e = errno;
 	    pthread_mutex_destroy(&save_lock);
 	    return error_sys_errno("save_init", "mkdir", e);
@@ -258,14 +259,17 @@ static const char * save_init(const config_data_t * cfg, const char * cmd) {
 	pthread_mutex_destroy(&save_lock);
 	return error_sys_errno("save_init", "malloc", e);
     }
-    strcpy(save_name, cfg->strval[cfg_eventdir]);
+    strcpy(save_name, config_strval(cfg, cfg_eventdir));
     save_suffix = save_name + len;
     *save_suffix++ = '/';
-    if (! count_files(cfg->strval[cfg_eventdir], &save_earliest, &save_count)) {
+    if (! count_files(config_strval(cfg, cfg_eventdir),
+	&save_earliest, &save_count))
+    {
 	int e = errno;
 	myfree(save_name);
 	pthread_mutex_destroy(&save_lock);
-	return error_sys_errno("save_init", cfg->strval[cfg_eventdir], e);
+	return
+	    error_sys_errno("save_init", config_strval(cfg, cfg_eventdir), e);
     }
     if (save_count <= 0)
 	save_count = 1;
@@ -279,7 +283,9 @@ static const char * save_init(const config_data_t * cfg, const char * cmd) {
 	return err;
     }
     /* see if we are going to rotate the file */
-    if (save_pos > (long)INT_MAX || save_pos >= cfg->intval[cfg_eventsize]) {
+    if (save_pos > (long)INT_MAX ||
+	save_pos >= config_intval(cfg, cfg_eventsize))
+    {
 	err = open_file(cfg);
 	if (err) {
 	    myfree(save_name);
@@ -337,7 +343,7 @@ static const char * save_process(const notify_event_t * ev) {
     if (pos < 0)
 	return error_sys("save_process", save_name);
     cfg = config_get();
-    if (pos > INT_MAX || pos >= cfg->intval[cfg_eventsize])
+    if (pos > INT_MAX || pos >= config_intval(cfg, cfg_eventsize))
 	open_file(cfg);
     else
 	save_pos = pos;
@@ -447,14 +453,10 @@ static void logfile_exit(void) {
 }
 
 static const char * syslog_init(const config_data_t * cfg, const char * cmd) {
-    int fac = LOG_LOCAL7 | LOG_INFO;
-    if (cmd && cmd[0] && cmd[1]) {
-	const char * err = config_getfacility(cmd + 1, &fac);
-	if (err)
-	    return err;
-    }
-    error_change_dest(info_changelog, error_dest_syslog, fac);
-    return NULL;
+    return
+	config_change_error_dest(info_changelog,
+				 cmd && cmd[0] && cmd[1] ? cmd + 1
+							 : "local7:info");
 }
 
 static void syslog_sendname(const char * pre, notify_filetype_t type,
@@ -528,16 +530,18 @@ static store_t store_data;
 const char * store_init(void) {
     const config_data_t * cfg = config_get();
     int i, len;
-    const char * colon = strchr(cfg->strval[cfg_store], ':');
+    const char * colon = strchr(config_strval(cfg, cfg_store), ':');
     if (colon)
-	len = colon - cfg->strval[cfg_store];
+	len = colon - config_strval(cfg, cfg_store);
     else
-	len = strlen(cfg->strval[cfg_store]);
+	len = strlen(config_strval(cfg, cfg_store));
     save_current = save_earliest = save_pos = -1;
     save_name = NULL;
     /* search for a predefined store method */
     for (i = 0; store_methods[i].name; i++) {
-	if (strncmp(store_methods[i].name, cfg->strval[cfg_store], len) == 0) {
+	if (strncmp(store_methods[i].name,
+		    config_strval(cfg, cfg_store), len) == 0)
+	{
 	    if (! store_methods[i].name[len]) {
 		store_data = store_methods[i];
 		if (store_data.init) {
@@ -625,19 +629,19 @@ const char * store_thread(void) {
 	if (! cfg) cfg = config_get();
 	switch (ev.event_type) {
 	    case notify_change_meta :
-		filter = cfg->filter[config_event_meta];
+		filter = config_intval(cfg, cfg_event_meta);
 		break;
 	    case notify_change_data :
-		filter = cfg->filter[config_event_data];
+		filter = config_intval(cfg, cfg_event_data);
 		break;
 	    case notify_create :
-		filter = cfg->filter[config_event_create];
+		filter = config_intval(cfg, cfg_event_create);
 		break;
 	    case notify_delete :
-		filter = cfg->filter[config_event_delete];
+		filter = config_intval(cfg, cfg_event_delete);
 		break;
 	    case notify_rename :
-		filter = cfg->filter[config_event_rename];
+		filter = config_intval(cfg, cfg_event_rename);
 		break;
 	    case notify_overflow :
 	    case notify_nospace :
@@ -654,63 +658,6 @@ const char * store_thread(void) {
 		return err;
 	    }
 	    do_flush = 1;
-	    /* have they just created a directory? */
-	    if (ev.stat_valid &&
-		ev.file_type == notify_filetype_dir &&
-		ev.event_type == notify_create)
-	    {
-		/* scan this directory and generate synthetic events for
-		 * everything already in it */
-		DIR * D;
-		D = opendir(ev.from_name);
-		if (D) {
-		    int slen = strlen(ev.from_name);
-		    char sname[slen + NAME_MAX + 2];
-		    notify_event_t sev;
-		    struct dirent * E;
-		    strcpy(sname, ev.from_name);
-		    sname[slen++] = '/';
-		    sev.event_type = notify_create;
-		    sev.to_length = 0;
-		    sev.to_name = NULL;
-		    sev.stat_valid = 1;
-		    if (! cfg) cfg = config_get();
-		    filter = cfg->filter[config_event_create];
-		    while ((E = readdir(D)) != NULL) {
-			int len = strlen(E->d_name);
-			struct stat ebuff;
-			if (E->d_name[0] == '.') {
-			    if (len == 1) continue;
-			    if (len == 2 && E->d_name[1] == '.') continue;
-			}
-			if (len > NAME_MAX) continue;
-			strcpy(sname + slen, E->d_name);
-			if (lstat(sname, &ebuff) < 0) continue;
-			sev.file_type = notify_filetype(ebuff.st_mode);
-			check = filter_type(sev.file_type);
-			/* check event filter */
-			if (! (filter & check)) continue;
-			/* store this event too */
-			sev.from_length = slen + len;
-			sev.from_name = sname;
-			sev.file_mode = ebuff.st_mode;
-			sev.file_user = ebuff.st_uid;
-			sev.file_group = ebuff.st_gid;
-			sev.file_device = ebuff.st_rdev;
-			sev.file_size = ebuff.st_size;
-			sev.file_mtime = ebuff.st_mtime;
-			err = store_data.process(&sev);
-			if (err) {
-			    if (buffer) myfree(buffer);
-			    closedir(D);
-			    if (cfg) config_put(cfg);
-			    return err;
-			}
-			do_flush = 1;
-		    }
-		    closedir(D);
-		}
-	    }
 	}
     }
     if (buffer) myfree(buffer);
@@ -745,13 +692,13 @@ void store_status(store_status_t * status) {
 
 int store_purge(int days) {
     const config_data_t * cfg = config_get();
-    int len = strlen(cfg->strval[cfg_eventdir]), earliest, count;
+    int len = strlen(config_strval(cfg, cfg_eventdir)), earliest, count;
     char name[len + SUFFIX_SIZE + 2], * suffix;
     time_t limit = time(NULL) - days * 86400;
-    strcpy(name, cfg->strval[cfg_eventdir]);
+    strcpy(name, config_strval(cfg, cfg_eventdir));
     suffix = name + len;
     *suffix++ = '/';
-    if (! count_files(cfg->strval[cfg_eventdir], &earliest, &count)) {
+    if (! count_files(config_strval(cfg, cfg_eventdir), &earliest, &count)) {
 	int e = errno;
 	config_put(cfg);
 	errno = e;
@@ -774,11 +721,13 @@ int store_purge(int days) {
 
 store_get_t * store_prepare(int filenum, int filepos, const char * root) {
     const config_data_t * cfg = config_get();
-    int len = strlen(cfg->strval[cfg_eventdir]);
+    int len = strlen(config_strval(cfg, cfg_eventdir));
     int size = sizeof(store_get_t) + strlen(root) + len + SUFFIX_SIZE + 3;
     char * rptr;
     store_get_t * sg;
-    if (! count_files(cfg->strval[cfg_eventdir], &save_earliest, &save_count)) {
+    if (! count_files(config_strval(cfg, cfg_eventdir),
+	&save_earliest, &save_count))
+    {
 	int e = errno;
 	config_put(cfg);
 	errno = e;
@@ -792,13 +741,14 @@ store_get_t * store_prepare(int filenum, int filepos, const char * root) {
 	return NULL;
     }
     sg->name = (void *)&sg[1];
-    strcpy(sg->name, cfg->strval[cfg_eventdir]);
+    strcpy(sg->name, config_strval(cfg, cfg_eventdir));
     sg->suffix = sg->name + len;
     *sg->suffix++ = '/';
     rptr = sg->suffix + SUFFIX_SIZE + 1;
     sg->root = rptr;
     strcpy(rptr, root);
     sg->mmap = NULL;
+    sg->fd = -1;
     sg->mlen = 0;
     sg->file_num = filenum;
     sg->file_pos = filepos;
@@ -832,11 +782,13 @@ int store_get(store_get_t * sg, notify_event_t * nev, int timeout, int size,
 	      int wfd, char * errmsg, int errsize)
 {
     while (main_running) {
-	struct pollfd pfd;
+	struct pollfd pfd[2];
 	/* if using the current file and it has grown, reopen it */
 	if (sg->file_num == save_current && sg->file_size < save_pos) {
 	    munmap(sg->mmap, sg->mlen);
 	    sg->mmap = NULL;
+	    close(sg->fd);
+	    sg->fd = -1;
 	}
 	/* check if we need to mmap the file */
 	if (! sg->mmap) {
@@ -868,7 +820,7 @@ int store_get(store_get_t * sg, notify_event_t * nev, int timeout, int size,
 		close(rfd);
 		return -2;
 	    }
-	    close(rfd);
+	    sg->fd = rfd;
 	}
 	/* see if we have reached the end of file */
 	if (sg->file_pos < sg->file_size) {
@@ -964,6 +916,8 @@ int store_get(store_get_t * sg, notify_event_t * nev, int timeout, int size,
 	if (sg->file_num < save_current) {
 	    munmap(sg->mmap, sg->mlen);
 	    sg->mmap = NULL;
+	    close(sg->fd);
+	    sg->fd = -1;
 	    sg->file_num++;
 	    sg->file_pos = 0;
 	    /* try next file */
@@ -973,10 +927,16 @@ int store_get(store_get_t * sg, notify_event_t * nev, int timeout, int size,
 	if (timeout == 0)
 	    return -1;
 	/* wait for an event */
-	pfd.fd = wfd;
-	pfd.events = POLLIN | POLLPRI | POLLHUP;
-	poll(&pfd, 1, 1000);
-	if (pfd.revents) {
+	lseek(sg->fd, (off_t)sg->file_pos, SEEK_SET);
+	pfd[0].fd = wfd;
+	pfd[0].events = POLLIN | POLLPRI | POLLHUP;
+	pfd[1].fd = sg->fd;
+	pfd[1].events = POLLIN;
+	if (poll(pfd, 2, POLL_TIME) < 0) {
+	    snprintf(errmsg, errsize, "Interrupt");
+	    return -2;
+	}
+	if (pfd[0].revents) {
 	    snprintf(errmsg, errsize, "Client closed connection");
 	    return -2;
 	}
@@ -986,170 +946,6 @@ int store_get(store_get_t * sg, notify_event_t * nev, int timeout, int size,
     snprintf(errmsg, errsize, "Interrupt");
     return -2;
 }
-
-#if 0
-
-/* are there any events ready? */
-
-typedef const event_t * event_pt;
-
-static const char * check_events(store_get_t * sg,
-				 event_pt * avail, int reopen)
-{
-    while (1) {
-	/* if using the current file and it has grown, reopen it */
-	if (reopen && sg->file_num == save_current && sg->file_size < save_pos)
-	{
-	    munmap(sg->mmap, sg->mlen);
-	    sg->mmap = NULL;
-	}
-	/* check if we need to mmap the file */
-	if (! sg->mmap) {
-	    struct stat sbuff;
-	    int rfd;
-	    snprintf(sg->suffix, SUFFIX_SIZE, "ev%06d.log", sg->file_num);
-	    rfd = open(sg->name, O_RDONLY);
-	    if (rfd < 0)
-		return error_sys("store_get", sg->name);
-	    if (fstat(rfd, &sbuff) < 0) {
-		const char * err = error_sys("store_get", sg->name);
-		close(rfd);
-		return err;
-	    }
-	    if (! S_ISREG(sbuff.st_mode)) {
-		close(rfd);
-		return "Event log is not a regular file?";
-	    }
-	    sg->file_size = sbuff.st_size;
-	    sg->mlen = sg->file_size + sg->page_size - 1;
-	    sg->mlen /= sg->page_size;
-	    sg->mlen *= sg->page_size;
-	    sg->mmap = mmap(NULL, sg->mlen, PROT_READ, MAP_SHARED, rfd, 0);
-	    if (! sg->mmap) {
-		const char * err = error_sys("store_get", sg->name);
-		close(rfd);
-		return err;
-	    }
-	    close(rfd);
-	}
-	/* see if we have reached the end of file */
-	if (sg->file_pos < sg->file_size) {
-	    *avail = (const void *)(sg->mmap + sg->file_pos);
-	    return NULL;
-	}
-	/* end of file: do we have another? */
-	if (sg->file_num < save_current) {
-	    munmap(sg->mmap, sg->mlen);
-	    sg->mmap = NULL;
-	    sg->file_num++;
-	    sg->file_pos = 0;
-	    /* try next file */
-	    continue;
-	}
-	/* no events available right now */
-	*avail = NULL;
-	return NULL;
-    }
-}
-
-const char * store_poll(store_get_t * sg, int * avail) {
-    const event_t * sev = NULL;
-    const char * ret = check_events(sg, &sev, 0);
-    if (ret) return ret;
-    if (sev) {
-	int fl = decode_32(sev->from_length);
-	int tl = decode_32(sev->to_length);
-	if (fl < 0) fl = 0;
-	if (tl < 0) tl = 0;
-	*avail = fl + tl + 2;
-    } else {
-	*avail = -1;
-    }
-    return NULL;
-}
-
-/* get next event from file; if there are no more events, waits for more
- * but will return with a timeout if there is activity on the file
- * descriptor fd before there are new events */
-
-const char * store_get(store_get_t * sg, notify_event_t * nev, int wfd) {
-    while (main_running) {
-	const char * err;
-	const event_t * sev;
-	/* check for available events */
-	err = check_events(sg, &sev, 1);
-	if (err)
-	    return err;
-	if (! sev) {
-	    /* wait for an event */
-	    struct pollfd pfd;
-	    pfd.fd = wfd;
-	    pfd.events = POLLIN | POLLPRI | POLLHUP;
-	    poll(&pfd, 1, 1000);
-	    if (pfd.revents)
-		return "Client closed connection";
-	    continue;
-	}
-	/* get this event */
-	sg->file_pos += sizeof(event_t);
-	nev->event_type = sev->event_type;
-	nev->file_type = sev->file_type;
-	nev->stat_valid = sev->has_stat;
-	nev->from_length = decode_32(sev->from_length);
-	nev->to_length = decode_32(sev->to_length);
-	if (nev->stat_valid) {
-	    const stat_t * stat = (void *)(sg->mmap + sg->file_pos);
-	    sg->file_pos += sizeof(stat_t);
-	    nev->file_mode = decode_16(stat->file_mode);
-	    nev->file_user = decode_32(stat->file_user);
-	    nev->file_group = decode_32(stat->file_group);
-	    if (nev->file_type == notify_filetype_device_block ||
-		nev->file_type == notify_filetype_device_char) {
-		int major = decode_32(stat->file_size);
-		int minor = decode_32(stat->file_size + 4);
-		nev->file_size = 0;
-		nev->file_device = makedev(major, minor);
-	    } else {
-		nev->file_size = decode_64(stat->file_size);
-	    }
-	    nev->file_mtime = decode_64(stat->file_mtime);
-	} else if (nev->event_type == notify_add_tree) {
-	    nev->file_mtime = decode_64(sg->mmap + sg->file_pos);
-	    sg->file_pos += 8;
-	}
-	if (nev->from_length > 0) {
-	    nev->from_name = (char *)(sg->mmap + sg->file_pos);
-	    sg->file_pos += 1 + nev->from_length;
-	} else {
-	    nev->from_name = NULL;
-	}
-	if (nev->to_length > 0) {
-	    nev->to_name = (char *)(sg->mmap + sg->file_pos);
-	    sg->file_pos += 1 + nev->to_length;
-	} else {
-	    nev->to_name = NULL;
-	}
-	/* check if we want to return this event */
-	if (! nev->from_name)
-	    return NULL;
-	if (nev->event_type == notify_add_tree) {
-	    if (is_inside(sg->root, nev->from_name))
-		return NULL;
-	    if (is_inside(nev->from_name, sg->root))
-		return NULL;
-	} else {
-	    if (is_inside(nev->from_name, sg->root))
-		return NULL;
-	}
-	if (nev->to_name)
-	    if (is_inside(nev->to_name, sg->root))
-		return NULL;
-	/* don't want this, try the next one */
-    }
-    return "Interrupt";
-}
-
-#endif
 
 /* get file number and position */
 
@@ -1165,6 +961,7 @@ int store_get_pos(const store_get_t * sg) {
 
 void store_finish(store_get_t * sg) {
     if (sg->mmap) munmap(sg->mmap, sg->mlen);
+    if (sg->fd >= 0) close(sg->fd);
     myfree(sg);
 }
 #endif /* NOTIFY != NOTIFY_NONE */

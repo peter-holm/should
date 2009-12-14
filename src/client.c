@@ -40,6 +40,7 @@
 #else
 #include <sys/dirent.h>
 #endif
+#include <sys/wait.h>
 #include "config.h"
 #include "error.h"
 #include "socket.h"
@@ -63,7 +64,9 @@ static inline void print_line(const char * a, const char * b) {
     printf("    %s%*c%s\n", a, dist, ' ', b);
 }
 
-static void print_time(const char * d, const struct timespec * t, int frac) {
+static void print_time(const char * d, const struct timespec * t,
+		       const char * point)
+{
     char buffer[128];
     if (t->tv_sec < 60)
 	sprintf(buffer, "%d", (int)t->tv_sec);
@@ -82,45 +85,64 @@ static void print_time(const char * d, const struct timespec * t, int frac) {
 		((int)t->tv_sec / 3600) % 24,
 		((int)t->tv_sec / 60) % 60,
 		(int)t->tv_sec % 60);
-    if (frac)
-	sprintf(buffer + strlen(buffer), ".%02d",
-	       (int)t->tv_nsec / 10000000);
+    if (point)
+	sprintf(buffer + strlen(buffer), "%s%02d",
+	       point, (int)t->tv_nsec / 10000000);
     print_line(d, buffer);
 }
 
-static inline void print_numbers(const char * t, char * d, int len) {
-    int add = (len - 1) / 3, dig = 0;
+static inline void print_numbers(const char * t, char * d, int len,
+				 const char * comma, const char * grouping)
+{
+    int cl = strlen(comma), sd, dig, add = 0;
+    /* figure out how many "commas" we need to add */
+    sd = dig = 0;
+    while (sd < len) {
+	if (grouping[dig] == CHAR_MAX) break;
+	if (sd) add += cl;
+	sd += (unsigned char)grouping[dig];
+	if (grouping[dig + 1]) dig++;
+    }
     d[len + add + 1] = 0;
+    dig = sd = 0;
     while (add > 0) {
 	d[len + add] = d[len];
 	len--;
-	dig++;
-	if (dig > 3) {
-	    dig -= 3;
-	    d[len + add] = ',';
-	    add --;
+	sd++;
+	if (sd > (unsigned char)grouping[dig]) {
+	    int i = cl;
+	    sd -= (unsigned char)grouping[dig];
+	    while (i > 0) {
+		i--;
+		d[len + add] = comma[i];
+		add--;
+	    }
 	}
     }
     print_line(t, d);
 }
 
-static void print_long_long(const char * t, long long n) {
-    char d[128];
+static void print_long_long(const char * t, long long n,
+			    const char * comma, const char * grouping)
+{
+    char d[(1 + strlen(comma)) * 32];
     int len = sprintf(d, "%lld", n);
-    print_numbers(t, d, len);
+    print_numbers(t, d, len, comma, grouping);
 }
 
-static void print_int(const char * t, int n) {
-    char d[128];
+static void print_int(const char * t, int n,
+		      const char * comma, const char * grouping)
+{
+    char d[(1 + strlen(comma)) * 16];
     int len = sprintf(d, "%d", n);
-    print_numbers(t, d, len);
+    print_numbers(t, d, len, comma, grouping);
 }
 
-static void print_list(const char * t, const int * l, int n) {
+static void print_list(const char * t, const int * l, int n, const char * p) {
     char d[24 * n];
     int len = 0, i;
     for (i = 0; i < n; i++)
-	len += sprintf(d + len, "%s%d", i ? "." : "", l[i]);
+	len += sprintf(d + len, "%s%d", i ? p : "", l[i]);
     print_line(t, d);
 }
 
@@ -130,16 +152,41 @@ static void print_list(const char * t, const int * l, int n) {
  * CRLF; if the last argument is not NULL, the OK reply from the server
  * is copied there */
 
-int client_send_command(socket_t * p, const char * command,
+int client_send_command(socket_t * p, const char * _command,
 		 	const char * data, char * replbuff)
 {
-    char repl[REPLSIZE], * rptr;
+    int datalen = data ? strlen(data) : 0, df = -1, cmdlen = strlen(_command);
+    char cbuff[cmdlen + 32], repl[REPLSIZE], * rptr;
+    char ebuff[cmdlen + 256];
+    const char * command, * cmderr;
+    if (data && (rptr = strchr(_command, '%')) != NULL) {
+	df = rptr - _command;
+	command = cbuff;
+	strncpy(cbuff, _command, df);
+	sprintf(cbuff + df, "%d", datalen);
+	strcat(cbuff + df, _command + df + 1);
+	cmderr = ebuff;
+	strncpy(ebuff, _command, df);
+	if (datalen < 255) {
+	    strcpy(ebuff + df, data);
+	    rptr = ebuff + df + datalen;
+	} else {
+	    strncpy(ebuff + df, data, 252);
+	    ebuff[df + 252] = '.';
+	    ebuff[df + 253] = '.';
+	    ebuff[df + 254] = '.';
+	    rptr = ebuff + df + 255;
+	}
+	strcpy(rptr, _command + df + 1);
+    } else {
+	cmderr = command = _command;
+    }
     if (! socket_puts(p, command)) {
-	error_report(error_client, command, errno);
+	error_report(error_client, cmderr, errno);
 	return 0;
     }
-    if (data && ! socket_put(p, data, strlen(data))) {
-	error_report(error_client, command, errno);
+    if (data && ! socket_put(p, data, datalen)) {
+	error_report(error_client, cmderr, errno);
 	return 0;
     }
     rptr = replbuff ? replbuff : repl;
@@ -161,7 +208,7 @@ int client_send_command(socket_t * p, const char * command,
 	errno = EINTR;
 	return 1;
     }
-    error_report(error_client_msg, command, rptr);
+    error_report(error_client_msg, cmderr, rptr);
     return 0;
 }
 
@@ -224,17 +271,27 @@ static inline int get_status(socket_t * p, protocol_status_t * status) {
 
 static int print_status(socket_t * p, config_client_t mode) {
     protocol_status_t status;
+    struct lconv * lc = localeconv();
+    /* locales don't seem to define non-monetary values; probably
+     * because this would break just about every program */
+    const char * comma = lc && lc->mon_thousands_sep && *lc->mon_thousands_sep
+		       ? lc->mon_thousands_sep : ",";
+    const char * grouping = lc && lc->mon_grouping && *lc->mon_grouping
+			  ? lc->mon_grouping : "\003";
+    const char * point = lc && lc->mon_decimal_point && *lc->mon_decimal_point
+		       ? lc->mon_decimal_point : ".";
     if (! get_status(p, &status))
 	return 0;
     if (mode & config_client_status) {
 	printf("SHOULD server status:\n");
     }
     if (mode & config_client_status) {
-	print_list("Server version:", status.version, 3);
+	print_list("Server version:", status.version, 3, point);
 	print_line("Server mode:", status.server_mode ? "Server" : "Copy");
     } else if (mode & config_client_version) {
-	printf("Server: should %d.%d.%d\n",
-	       status.version[0], status.version[1], status.version[2]);
+	printf("Server: should %d%s%d%s%d\n",
+	       status.version[0], point, status.version[1],
+	       point, status.version[2]);
     }
     if (mode & config_client_status) {
 	char buffer[32];
@@ -244,36 +301,36 @@ static int print_status(socket_t * p, config_client_t mode) {
 	printf("%d\n", status.server_pid);
     }
     if (mode & config_client_status) {
-	print_time("Running time:", &status.running, 1);
-	print_time("User CPU time:", &status.usertime, 1);
-	print_time("System CPU time:", &status.systime, 1);
-	print_int("Client requests:", status.clients);
-	print_long_long("Memory usage:", status.memory);
+	print_time("Running time:", &status.running, point);
+	print_time("User CPU time:", &status.usertime, point);
+	print_time("System CPU time:", &status.systime, point);
+	print_int("Client requests:", status.clients, comma, grouping);
+	print_long_long("Memory usage:", status.memory, comma, grouping);
     }
     if (mode & (config_client_status | config_client_box)) {
 	if (status.shouldbox >= 0) {
 	    char buffer[32];
-	    const char * curr, * dp;
-	    struct lconv * lc = localeconv();
+	    const char * curr;
 	    if (lc) {
 		if (lc->currency_symbol && *lc->currency_symbol) {
 		    curr =  lc->currency_symbol;
 		} else {
 		    curr = "";
 		}
-		if (lc->mon_decimal_point && *lc->mon_decimal_point) {
-		    dp =  lc->mon_decimal_point;
-		} else if (lc->decimal_point && *lc->decimal_point) {
-		    dp =  lc->decimal_point;
-		} else {
-		    dp = ".";
-		}
 	    } else {
 		curr = "£";
-		dp = ".";
 	    }
-	    sprintf(buffer, "%s%d%s%d0",
-		    curr, status.shouldbox / 10, dp, status.shouldbox % 10);
+	    if (lc->frac_digits > 0) {
+		int d = lc->frac_digits < 10 ? lc->frac_digits - 1 : 1;
+		int l = sprintf(buffer, "%s%d%s%d",
+				curr, status.shouldbox / 10, point,
+				status.shouldbox % 10);
+		while (d-- > 0)
+		    buffer[l++] = '0';
+		buffer[l] = 0;
+	    } else {
+		sprintf(buffer, "%s%d", curr, status.shouldbox);
+	    }
 	    if (mode & config_client_status)
 		print_line("Should Box", buffer);
 	    else
@@ -283,30 +340,62 @@ static int print_status(socket_t * p, config_client_t mode) {
 	}
     }
     if (status.has_status && (mode & config_client_status)) {
-	print_int("Events in queue:", status.notify.queue_events);
-	print_int("Queue size:", status.notify.queue_bytes);
-	print_int("Minimum queue size:", status.notify.queue_min);
-	print_int("Allocated queue space:", status.notify.queue_min);
-	print_int("Maximum queue size:", status.notify.queue_max);
-	print_int("Max events in queue:", status.notify.max_events);
-	print_int("Max queue size:", status.notify.max_bytes);
-	print_int("Kernel event queue size:", status.notify.kernel_max_events);
-	print_int("Overflow events:", status.notify.overflow);
-	print_int("Events too large for buffer:", status.notify.too_big);
-	print_int("Active watches:", status.notify.watches);
-	print_int("Kernel max watches:", status.notify.kernel_max_watches);
-	print_int("Allocated watch space:", status.notify.watchmem);
-	print_int("Events since startup:", status.notify.events);
-	print_int("Earliest event file:", status.store.file_earliest);
-	print_int("Current event file:", status.store.file_current);
-	print_int("Event file position:", status.store.file_pos);
+	print_int("Events in queue:", status.notify.queue_events,
+		  comma, grouping);
+	print_int("Queue size:", status.notify.queue_bytes,
+		  comma, grouping);
+	print_int("Minimum queue size:", status.notify.queue_min,
+		  comma, grouping);
+	print_int("Allocated queue space:", status.notify.queue_min,
+		  comma, grouping);
+	print_int("Maximum queue size:", status.notify.queue_max,
+		  comma, grouping);
+	print_int("Max events in queue:", status.notify.max_events,
+		  comma, grouping);
+	print_int("Max queue size:", status.notify.max_bytes,
+		  comma, grouping);
+	if (status.notify.kernel_max_events >= 0)
+	    print_int("Kernel event queue size:",
+		      status.notify.kernel_max_events,
+		      comma, grouping);
+	print_int("Overflow events:", status.notify.overflow,
+		  comma, grouping);
+	print_int("Events too large for buffer:", status.notify.too_big,
+		  comma, grouping);
+	print_int("Active watches:", status.notify.watches,
+		  comma, grouping);
+	if (status.notify.kernel_max_watches >= 0)
+	    print_int("Kernel max watches:", status.notify.kernel_max_watches,
+		      comma, grouping);
+	print_int("Allocated watch space:", status.notify.watchmem,
+		  comma, grouping);
+	print_int("Events since startup:", status.notify.events,
+		  comma, grouping);
+	print_int("Earliest event file:", status.store.file_earliest,
+		  comma, grouping);
+	print_int("Current event file:", status.store.file_current,
+		  comma, grouping);
+	print_int("Event file position:", status.store.file_pos,
+		  comma, grouping);
 	putchar('\n');
     }
     if (! status.server_mode && (mode & config_client_status)) {
-	print_int("Event file procesed:", status.copy.file_current);
-	print_int("Event file position:", status.copy.file_pos);
-	print_int("Events since startup:", status.copy.events);
-	print_int("Pending dir syncs:", status.copy.dirsyncs);
+	print_int("Event file procesed:", status.copy.file_current,
+		  comma, grouping);
+	print_int("Event file position:", status.copy.file_pos,
+		  comma, grouping);
+	print_int("Events since startup:", status.copy.events,
+		  comma, grouping);
+	print_int("Pending dir syncs:", status.copy.dirsyncs,
+		  comma, grouping);
+	print_long_long("Bytes received from server:", status.copy.rbytes,
+			comma, grouping);
+	print_long_long("Bytes sent to server:", status.copy.wbytes,
+			comma, grouping);
+	print_long_long("Total size of files copied:", status.copy.tbytes,
+			comma, grouping);
+	print_long_long("File data actually copied:", status.copy.xbytes,
+			comma, grouping);
 	putchar('\n');
     }
     return 1;
@@ -398,32 +487,29 @@ static int print_checksum(socket_t * p) {
 }
 
 static int send_list(socket_t * p, const char * name,
-		     const config_match_t * data)
+		     const config_acl_cond_t * data)
 {
     while (data) {
-	int len = strlen(data->pattern);
 	const char * match = NULL;
 	const char * how = NULL;
 	char buffer[256];
-	switch (data->match) {
-	    case config_match_name  : match = "NAME"; break;
-	    case config_match_path  : match = "PATH"; break;
-	}
-	if (! match) {
-	    error_report(error_internal, "send_list", "invalid match");
-	    return 0;
+	switch (data->data_index) {
+	    case cfg_dacl_name  : match = "NAME"; break;
+	    case cfg_dacl_path  : match = "PATH"; break;
+	    default :
+		error_report(error_internal, "send_list", "invalid match");
+		return 0;
 	}
 	switch (data->how) {
-	    case config_match_exact : how = "EXACT"; break;
-	    case config_match_icase : how = "ICASE"; break;
-	    case config_match_glob  : how = "GLOB";  break;
-	    case config_match_iglob : how = "IGLOB"; break;
+	    case cfg_acl_exact : how = "EXACT"; break;
+	    case cfg_acl_icase : how = "ICASE"; break;
+	    case cfg_acl_glob  : how = "GLOB";  break;
+	    case cfg_acl_iglob : how = "IGLOB"; break;
+	    default :
+		error_report(error_internal, "send_list", "invalid how");
+		return 0;
 	}
-	if (! how) {
-	    error_report(error_internal, "send_list", "invalid how");
-	    return 0;
-	}
-	sprintf(buffer, "%s %d %s %s", name, len, match, how);
+	sprintf(buffer, "%s %% %s %s", name, match, how);
 	if (! client_send_command(p, buffer, data->pattern, NULL))
 	    return 0;
 	data = data->next;
@@ -455,8 +541,8 @@ static int setup_client(socket_t * p) {
 int client_set_parameters(socket_t * p) {
     const config_data_t * cfg = config_get();
     char command[REPLSIZE];
-    if (cfg->intval[cfg_bwlimit]) {
-	sprintf(command, "BWLIMIT %d", cfg->intval[cfg_bwlimit]);
+    if (config_intval(cfg, cfg_bwlimit)) {
+	sprintf(command, "BWLIMIT %d", config_intval(cfg, cfg_bwlimit));
 	config_put(cfg);
 	if (! client_send_command(p, command, NULL, NULL))
 	    return 0;
@@ -477,30 +563,38 @@ static void copy_name(socket_t * p, int len) {
 }
 
 static int do_update(socket_t * p, const config_data_t * cfg) {
-    config_strlist_t * P = cfg->strlist[cfg_update];
-    char command[REPLSIZE];
+    const config_strlist_t * P = config_strlist(cfg, cfg_update);
     if (! P) return 1;
     while (P) {
-	sprintf(command, "UPDATE %d", (int)strlen(P->data));
-	if (! client_send_command(p, command, P->data, NULL)) {
-	    client_send_command(p, "UPDATE 8", "rollback", NULL);
+	if (! client_send_command(p, "UPDATE %", P->data, NULL)) {
+	    client_send_command(p, "UPDATE %", "rollback", NULL);
 	    return 0;
 	}
 	P = P->next;
     }
-    return client_send_command(p, "UPDATE 6", "commit", NULL);
+    return client_send_command(p, "UPDATE %", "commit", NULL);
+}
+
+static int do_dirsync(socket_t * p, const config_data_t * cfg) {
+    const config_strlist_t * P = config_strlist(cfg, cfg_dirsync_path);
+    if (! P) return 1;
+    while (P) {
+	if (! client_send_command(p, "DIRSYNC %", P->data, NULL))
+	    return 0;
+	P = P->next;
+    }
+    return 1;
 }
 
 static int do_df(socket_t * p, const config_data_t * cfg) {
-    config_strlist_t * P = cfg->strlist[cfg_df_path];
+    const config_strlist_t * P = config_strlist(cfg, cfg_df_path);
     char command[REPLSIZE];
     printf("          disk space, megabytes              files, x 1000\n");
     printf("Mode  Total    Free    Used   Avail    Total   Used   Free  Avail  Path\n");
     while (P) {
 	unsigned long bsize, btotal, bfree, bused, bavail, itotal, ifree, iused, iavail;
 	int mode;
-	sprintf(command, "STATFS %d", (int)strlen(P->data));
-	if (! client_send_command(p, command, P->data, command))
+	if (! client_send_command(p, "STATFS %", P->data, command))
 	    return 0;
 	if (sscanf(command + 2,
 		   "%lu %lu %lu %lu %lu %lu %lu %d",
@@ -539,12 +633,12 @@ static int do_df(socket_t * p, const config_data_t * cfg) {
 }
 
 static int do_ls(socket_t * p, const config_data_t * cfg) {
-    config_strlist_t * P = cfg->strlist[cfg_ls_path];
+    const config_strlist_t * P = config_strlist(cfg, cfg_ls_path);
     char command[REPLSIZE];
-    int tr_ids = cfg->intval[cfg_flags] & config_flag_translate_ids;
+    int tr_ids = config_intval(cfg, cfg_flags) & config_flag_translate_ids;
     static const char * ftype = "-dcbpls?";
     while (P) {
-	sprintf(command, "GETDIR %d %d", (int)strlen(P->data), tr_ids);
+	sprintf(command, "GETDIR %% %d", tr_ids);
 	if (! client_send_command(p, command, P->data, NULL))
 	    return 0;
 	printf("ls(%s):\n", P->data);
@@ -606,13 +700,13 @@ static int do_ls(socket_t * p, const config_data_t * cfg) {
 }
 
 static int do_cp(socket_t * p, const config_data_t * cfg,
-		 int compression, int checksum)
+		 int compression, int checksum, int extcopy)
 {
-    config_strlist_t * P = cfg->strlist[cfg_cp_path];
+    const config_strlist_t * P = config_strlist(cfg, cfg_cp_path);
     struct stat sbuff;
     int is_dir;
     const char * dest;
-    int tr_ids = cfg->intval[cfg_flags] & config_flag_translate_ids;
+    int tr_ids = config_intval(cfg, cfg_flags) & config_flag_translate_ids;
     if (! P || ! P->next) {
 	fprintf(stderr, "Please specify at least two names for \"cp\"\n");
 	return 0;
@@ -634,20 +728,20 @@ static int do_cp(socket_t * p, const config_data_t * cfg,
     }
     if (is_dir) {
 	int len = strlen(dest);
-	char dname[len + NAME_MAX + 3];
-	strcpy(dname, dest);
-	dname[len++] = '/';
+	char dfn[len + NAME_MAX + 3];
+	strcpy(dfn, dest);
+	dfn[len++] = '/';
 	while (P) {
 	    const char * slash = strrchr(P->data, '/');
 	    if (slash) slash++;
-	    strncpy(dname + len, slash, NAME_MAX);
-	    dname[len + NAME_MAX] = 0;
-	    copy_file(p, P->data, dname, tr_ids, compression, checksum);
+	    strncpy(dfn + len, slash, NAME_MAX);
+	    dfn[len + NAME_MAX] = 0;
+	    copy_file(p, P->data, dfn, tr_ids, compression, checksum, extcopy);
 	    P = P->next;
 	}
     } else {
 	while (P) {
-	    copy_file(p, P->data, dest, tr_ids, compression, checksum);
+	    copy_file(p, P->data, dest, tr_ids, compression, checksum, extcopy);
 	    P = P->next;
 	}
     }
@@ -715,7 +809,7 @@ static int set_checksum(socket_t * p, int nchecksum) {
  * and returns the ID for the preferred one (or -1 if none found) */
 
 int client_find_checksum(socket_t * p, client_extensions_t extensions) {
-    int max = checksum_count(), chk[max], i;
+    int max = checksum_count(), chk[max], i, nv;
     char list[REPLSIZE];
     const config_data_t * cfg;
     /* if server has no checksum support, we won't use it */
@@ -742,11 +836,14 @@ int client_find_checksum(socket_t * p, client_extensions_t extensions) {
     /* if we have a preference list, and it lists a method known to the
      * server, use it */
     cfg = config_get();
-    for (i = 0; i < cfg->intval[cfg_nchecksums]; i++) {
-	if (chk[cfg->checksums[i]]) {
-	    int nc = cfg->checksums[i];
-	    config_put(cfg);
-	    return set_checksum(p, nc);
+    nv = config_intarr_len(cfg, cfg_checksums);
+    if (nv > 0) {
+	const int * vals = config_intarr_data(cfg, cfg_checksums);
+	for (i = 0; i < nv; i++) {
+	    if (vals[i] >= 0 && vals[i] < max && chk[vals[i]]) {
+		config_put(cfg);
+		return set_checksum(p, vals[i]);
+	    }
 	}
     }
     config_put(cfg);
@@ -774,7 +871,7 @@ static int set_compress(socket_t * p, int ncompress) {
  * and returns the ID for the preferred one (or -1 if none found) */
 
 int client_find_compress(socket_t * p) {
-    int max = compress_count(), com[max], i;
+    int max = compress_count(), com[max], i, nv;
     char list[REPLSIZE];
     const config_data_t * cfg;
     /* ask the server for a list of compression methods, and see if
@@ -798,11 +895,14 @@ int client_find_compress(socket_t * p) {
     /* if we have a preference list, and it lists a method known to the
      * server, use it */
     cfg = config_get();
-    for (i = 0; i < cfg->intval[cfg_ncompressions]; i++) {
-	if (com[cfg->compressions[i]]) {
-	    int nc = cfg->compressions[i];
-	    config_put(cfg);
-	    return set_compress(p, nc);
+    nv = config_intarr_len(cfg, cfg_compressions);
+    if (nv > 0) {
+	const int * vals = config_intarr_data(cfg, cfg_compressions);
+	for (i = 0; i < nv; i++) {
+	    if (vals[i] >= 0 && vals[i] < max && com[vals[i]]) {
+		config_put(cfg);
+		return set_compress(p, vals[i]);
+	    }
 	}
     }
     config_put(cfg);
@@ -819,36 +919,34 @@ int client_run(void) {
     client_extensions_t extensions;
     const config_data_t * cfg = config_get();
     socket_t * p = socket_connect();
+    config_client_t cm;
+    char repl[REPLSIZE];
     if (! p) {
 	error_report(error_client, "connect", errno);
 	config_put(cfg);
 	return 1;
     }
-    if (cfg->intval[cfg_client_mode] & config_client_cleardebug) {
+    cm = config_intval(cfg, cfg_client_mode);
+    if (cm & config_client_cleardebug)
 	if (! client_send_command(p, "NODEBUG", NULL, NULL))
 	    goto out;
-    }
-    if (cfg->intval[cfg_client_mode] & config_client_setdebug) {
+    if (cm & config_client_setdebug) 
 	if (! client_send_command(p, "DEBUG", NULL, NULL))
 	    goto out;
-    }
     extensions = client_get_extensions(p);
-    if (cfg->intval[cfg_client_mode] & config_client_remove) {
-	config_dir_t * d = cfg->remove;
+    if (cm & config_client_remove) {
+	const config_dir_t * d = config_treeval(cfg, cfg_tree_remove);
 	while (d) {
-	    char buffer[256];
-	    sprintf(buffer, "REMOVE %d", (int)strlen(d->path));
-	    if (! client_send_command(p, buffer, d->path, NULL))
+	    if (! client_send_command(p, "REMOVE %", d->path, NULL))
 		goto out;
 	    d = d->next;
 	}
     }
-    if (cfg->intval[cfg_client_mode] & config_client_add) {
-	config_dir_t * d = cfg->dirs;
+    if (cm & config_client_add) {
+	const config_dir_t * d = config_treeval(cfg, cfg_tree_add);
 	while (d) {
-	    char buffer[256], repl[REPLSIZE];
-	    sprintf(buffer, "ADD %d", (int)strlen(d->path));
-	    if (! client_send_command(p, buffer, d->path, NULL))
+	    char repl[REPLSIZE];
+	    if (! client_send_command(p, "ADD %", d->path, NULL))
 		goto out;
 	    if (! send_list(p, "EXCL", d->exclude))
 		goto out;
@@ -861,71 +959,128 @@ int client_run(void) {
 	    d = d->next;
 	}
     }
-    if (cfg->intval[cfg_client_mode] & config_client_closelog) {
+    if (cm & config_client_closelog)
 	if (! client_send_command(p, "CLOSELOG", NULL, NULL))
 	    goto out;
-    }
-    if (cfg->intval[cfg_client_mode] & config_client_purge) {
-	char purge[32];
-	sprintf(purge, "PURGE %d", cfg->intval[cfg_purge_days]);
-	if (! client_send_command(p, purge, NULL, NULL))
+    if (cm & config_client_purge)
+	if (! client_send_command(p, "PURGE %", NULL, NULL))
 	    goto out;
-    }
-    if (cfg->intval[cfg_client_mode] & config_client_setup) {
+    if (cm & config_client_setup)
 	if (! setup_client(p))
 	    goto out;
-    }
-    if (cfg->intval[cfg_client_mode] &
+    if (cm &
 	(config_client_status |
 	 config_client_box |
 	 config_client_version |
 	 config_client_getpid))
     {
-	if (! print_status(p, cfg->intval[cfg_client_mode]))
+	if (! print_status(p, cm))
 	    goto out;
     }
-    if (cfg->intval[cfg_client_mode] & config_client_watches)
+    if (cm & config_client_watches)
 	if (! print_watches(p))
 	    goto out;
-    if (cfg->intval[cfg_client_mode] & config_client_listcompress)
+    if (cm & config_client_listcompress)
 	if (! print_compress(p))
 	    goto out;
-    if (cfg->intval[cfg_client_mode] & config_client_listchecksum)
+    if (cm & config_client_listchecksum)
 	if (! print_checksum(p))
 	    goto out;
-    if (cfg->intval[cfg_client_mode] & config_client_update)
+    if (cm & config_client_dirsync)
+	if (! do_dirsync(p, cfg))
+	    goto out;
+    if (cm & config_client_update)
 	if (! do_update(p, cfg))
 	    goto out;
-    if (cfg->intval[cfg_client_mode] & config_client_config)
+    if (cm & config_client_config)
 	if (! print_config(p))
 	    goto out;
-    if (cfg->intval[cfg_client_mode] & config_client_ls)
+    if (cm & config_client_ls)
 	if (! do_ls(p, cfg))
 	    goto out;
-    if (cfg->intval[cfg_client_mode] & config_client_cp) {
+    if (cm & config_client_cp) {
 	int checksum = client_find_checksum(p, extensions);
 	int compress = client_find_compress(p);
-	if (! do_cp(p, cfg, compress, checksum))
+	int extcopy, ok, ws;
+	pid_t pid;
+	if (! client_setup_extcopy(&extcopy, &pid)) {
+	    perror("external_copy");
+	    goto out;
+	}
+	ok = do_cp(p, cfg, compress, checksum, extcopy);
+	if (extcopy >= 0)
+	    close(extcopy);
+	if (pid >= 0)
+	    waitpid(pid, &ws, 0);
+	if (! ok)
 	    goto out;
     }
-    if (cfg->intval[cfg_client_mode] & config_client_df)
+    if (cm & config_client_df)
 	if (! do_df(p, cfg))
 	    goto out;
-    if (cfg->intval[cfg_client_mode] & config_client_telnet) {
+    if (cm & config_client_telnet) {
 	do_telnet(p);
 	status = 0;
 	goto out_noquit;
     }
-    if (cfg->intval[cfg_client_mode] & config_client_stop) {
-	client_send_command(p, "STOP", NULL, NULL);
+    if (cm & config_client_stop) {
+	socket_puts(p, "STOP");
 	goto out_noquit;
     }
     status = 0;
 out:
-    client_send_command(p, "QUIT", NULL, NULL);
+    socket_puts(p, "QUIT");
 out_noquit:
+    socket_gets(p, repl, REPLSIZE);
     socket_disconnect(p);
     config_put(cfg);
     return status;
+}
+
+/* set up an external copy program, if configured; returns 1 if OK, 0
+ * if an error occurred (errno will be set accordingly) */
+
+int client_setup_extcopy(int * extcopy, pid_t * pid) {
+    const config_data_t * cfg = config_get();
+    char * const * ecprog = config_strarr(cfg, cfg_strarr_extcopy);
+    *extcopy = -1;
+    *pid = -1;
+    if (ecprog && ecprog[0]) {
+	int tochild[2];
+	if (pipe(tochild) < 0) {
+	    int e = errno;
+	    config_put(cfg);
+	    errno = e;
+	    return 0;
+	}
+	fflush(NULL);
+	*pid = fork();
+	if (*pid < 0) {
+	    int e = errno;
+	    close(tochild[0]);
+	    close(tochild[1]);
+	    config_put(cfg);
+	    errno = e;
+	    return 0;
+	}
+	if (*pid == 0) {
+	    /* child process - the thing doing the copy */
+	    close(tochild[1]);
+	    fclose(stdin);
+	    if (dup2(tochild[0], 0) < 0) {
+		perror("dup2");
+		close(tochild[0]);
+		exit(1);
+	    }
+	    execvp(ecprog[0], ecprog);
+	    perror(ecprog[0]);
+	    exit(2);
+	}
+	/* parent process */
+	close(tochild[0]);
+	*extcopy = tochild[1];
+    }
+    config_put(cfg);
+    return 1;
 }
 

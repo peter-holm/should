@@ -50,6 +50,11 @@ int client_find_checksum(socket_t *, client_extensions_t);
 
 int client_find_compress(socket_t *);
 
+/* set up an external copy program, if configured; returns 1 if OK, 0
+ * if an error occurred (errno will be set accordingly) */
+
+int client_setup_extcopy(int * extcopy, pid_t * pid);
+
 /* set connection parameters for file copy etc. */
 
 int client_set_parameters(socket_t *);

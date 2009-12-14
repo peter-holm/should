@@ -27,6 +27,7 @@
 #include <signal.h>
 #include <sys/poll.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <locale.h>
@@ -141,8 +142,10 @@ int main(int argc, char *argv[]) {
 #endif /* NOTIFY != NOTIFY_NONE */
     pthread_t control, initial, copy;
     int errcode, status = 1;
+    pid_t pid;
     void * result;
     setlocale(LC_ALL, "");
+    tzset(); /* localtime_r may want us to call it */
     err = mymalloc_init();
     if (err) {
 	fprintf(stderr, "%s\n", err);
@@ -151,7 +154,7 @@ int main(int argc, char *argv[]) {
 #if USE_SHOULDBOX
     main_shouldbox = 0;
 #endif
-    main_running = 0;
+    main_running = 1;
     umask(0077);
     /* initialise system */
     clock_gettime(CLOCK_REALTIME, &main_started);
@@ -160,17 +163,17 @@ int main(int argc, char *argv[]) {
     error_init();
     /* local client mode? */
     cfg = config_get();
-    if (cfg->intval[cfg_client_mode] &&
-        ! (cfg->intval[cfg_client_mode] &
+    if (config_intval(cfg, cfg_client_mode) &&
+        ! (config_intval(cfg, cfg_client_mode) &
 	   (config_client_copy|config_client_peek)))
     {
 	status = client_run();
 	goto out_nothreads;
     }
     /* do they want to detach? */
-    if (cfg->intval[cfg_server_mode] & config_server_detach) {
+    if (config_intval(cfg, cfg_server_mode) & config_server_detach) {
 	int fd;
-	pid_t pid = fork();
+	pid = fork();
 	if (pid < 0) {
 	    error_report(error_fork, errno);
 	    goto out_nothreads;
@@ -185,9 +188,50 @@ int main(int argc, char *argv[]) {
 	    close(fd);
 	}
     }
+    /* wrapper process (not thread) to clean up in case of crash */
+#if USE_EXTRA_FORK
+    // XXX create a channel to receive socket create/delete notifications
+    pid = fork();
+    if (pid < 0) {
+	error_report(error_fork, errno);
+	goto out_nothreads;
+    }
+    if (pid > 0) {
+	/* wrapper process: wait for the child to finish, then clean up */
+	// XXX read socket notification pipe and store results
+	if (waitpid(pid, &status, 0) < 0) {
+	    error_report(error_wait, errno);
+	    status = 10;
+	    goto out_cleanup;
+	}
+	if (WIFEXITED(status)) {
+	    if (WEXITSTATUS(status)) {
+		error_report(error_child_status, WEXITSTATUS(status));
+		status = 11;
+	    } else {
+		status = 0;
+	    }
+	    goto out_cleanup;
+	}
+	if (WIFSIGNALED(status)) {
+#ifdef WCOREDUMP
+	    error_report(WCOREDUMP(status) ? error_child_coredump
+					   : error_child_signal,
+			 WTERMSIG(status));
+#else
+	    error_report(error_child_signal, WTERMSIG(status));
+#endif
+	    status = 12;
+	    goto out_cleanup;
+	}
+	error_report(error_child_unknown, status);
+	status = 13;
+	goto out_cleanup;
+    }
+#endif
     /* initialise threads */
 #if NOTIFY != NOTIFY_NONE
-    if (! cfg->intval[cfg_client_mode]) {
+    if (! config_intval(cfg, cfg_client_mode)) {
 	err = notify_init();
 	if (err) {
 	    error_report(error_start, "notify", err);
@@ -201,7 +245,7 @@ int main(int argc, char *argv[]) {
 	goto out_notify;
     }
 #if NOTIFY != NOTIFY_NONE
-    if (! cfg->intval[cfg_client_mode]) {
+    if (! config_intval(cfg, cfg_client_mode)) {
 	err = store_init();
 	if (err) {
 	    error_report(error_start, "store", err);
@@ -209,15 +253,14 @@ int main(int argc, char *argv[]) {
 	}
     }
 #endif /* NOTIFY != NOTIFY_NONE */
-    if (cfg->intval[cfg_client_mode]) {
+    /* start threads */
+    if (config_intval(cfg, cfg_client_mode)) {
 	err = copy_init();
 	if (err) {
 	    error_report(error_start, "copy", err);
 	    goto out_store_control_notify;
 	}
     }
-    /* start threads */
-    main_running = 1;
     errcode = pthread_create(&control, NULL, run_control, NULL);
     if (errcode) {
 	error_report(error_create, "control", errcode);
@@ -225,7 +268,7 @@ int main(int argc, char *argv[]) {
 	goto out_copy_store_control_notify;
     }
 #if NOTIFY != NOTIFY_NONE
-    if (! cfg->intval[cfg_client_mode]) {
+    if (! config_intval(cfg, cfg_client_mode)) {
 	errcode = pthread_create(&store, NULL, run_store, NULL);
 	if (errcode) {
 	    error_report(error_create, "store", errcode);
@@ -243,7 +286,7 @@ int main(int argc, char *argv[]) {
 	}
     }
 #endif /* NOTIFY != NOTIFY_NONE */
-    if (! cfg->intval[cfg_client_mode]) {
+    if (! config_intval(cfg, cfg_client_mode)) {
 	errcode = pthread_create(&initial, NULL, run_initial, NULL);
 	if (errcode) {
 	    error_report(error_create, "initial", errcode);
@@ -258,7 +301,7 @@ int main(int argc, char *argv[]) {
 	    goto out_copy_store_control_notify;
 	}
     }
-    if (cfg->intval[cfg_client_mode]) {
+    if (config_intval(cfg, cfg_client_mode)) {
 	errcode = pthread_create(&copy, NULL, run_copy, NULL);
 	if (errcode) {
 	    error_report(error_create, "copy", errcode);
@@ -272,7 +315,7 @@ int main(int argc, char *argv[]) {
     /* just in case */
     main_setup_signals();
     /* wait for the initial thread to finish */
-    if (! cfg->intval[cfg_client_mode])
+    if (! config_intval(cfg, cfg_client_mode))
 	pthread_join(initial, &result);
     /* wait for the threads */
     while (main_running)
@@ -280,17 +323,17 @@ int main(int argc, char *argv[]) {
     if (main_signal_seen)
 	error_report(info_signal_received, main_signal_seen);
     main_running = 0;
-    if (cfg->intval[cfg_client_mode])
+    if (config_intval(cfg, cfg_client_mode))
 	wait_thread(copy, "copy", 0);
 #if NOTIFY != NOTIFY_NONE
-    if (! cfg->intval[cfg_client_mode]) {
+    if (! config_intval(cfg, cfg_client_mode)) {
 	wait_thread(notify, "notify", 0);
 	wait_thread(store, "store", 0);
     }
 #endif /* NOTIFY != NOTIFY_NONE */
     wait_thread(control, "control", 0);
 out_copy_store_control_notify:
-    if (cfg->intval[cfg_client_mode])
+    if (config_intval(cfg, cfg_client_mode))
 	copy_exit();
 out_store_control_notify:
 #if NOTIFY != NOTIFY_NONE
@@ -311,8 +354,12 @@ out_nothreads:
     config_put(cfg);
     config_free();
     error_closelog();
-    error_free();
     mymalloc_exit();
     return status;
+#if USE_EXTRA_FORK
+out_cleanup:
+    // XXX remove any socket created and not yet destroyed by the child
+    goto out_nothreads;
+#endif
 }
 

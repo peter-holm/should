@@ -260,22 +260,40 @@ there are two forms of this option, with an absolute path or with a
 host and port. If only absolute paths are used, or if this option is
 omitted, the server will only listen on local Unix domain sockets.
 .TP
-allow_unix=\fINAME\fR
-Allow Unix user \fINAME\fR to connect via Unix domain sockets. The
-user has full control (a future version may introduce a mechanism to
-restrict access). This option can be repeated to allow more than one
-user to connect. If it is not specified, only the user who started
-the program (or the superuser) will be allowed to connect.
+allow_unix=\fINAME\fR[:\fIRESTRICTIONS\fR]
+Allow Unix user \fINAME\fR to connect via Unix domain sockets. The optional
+\fIRESTRICTIONS\fR specify what the user is allowed to do and using which
+socket: by default, the user has full control and can connect via any socket.
+The \fIRESTRICTIONS\fR is a comma-separated list; each element is either
+the name of an action, as explained in
+.SM
+.B CLIENT MODE
+below, or a condition in the form "socket=\fI/path\fR" which specifies that
+the user must have connected via that socket (if the program is listening
+on more than one). If more than one "socket" option is specified, the user
+will be allowed to connect using any of the ones listed. This option can
+be repeated to allow more than one user to connect, or to add to a user's
+existing list of permitted actions and sockets.
 .TP
-allow_tcp=\fINAME\fR:\fIPASS\fR
-Allow TCP connections authenticated with \fINAME\fR and \fIPASS\fR.
-It is recommended to put this sort of configuration in a file, rather
-than on the command line. The user will receive full control
-(a future version may introduce a mechanism to restrict access
-and/or to restrict based on the host one is connecting from).
-This option can be repeated to allow more than one user to connect.
-If this option is not specified, nobody will be able to connect
-using TCP.
+allow_tcp=\fINAME\fR:\fIPASS\fR[:\fIRESTRICTIONS\fR]
+Allow TCP connections authenticated with user name \fINAME\fR and 
+password \fIPASS\fR. It is recommended to put this sort of configuration
+in a file, rather than on the command line. The optional \fIRESTRICTIONS\fR
+specify what the user is allowed to do, and where from: by default, the user
+has full control and can connect from anywhere.
+The \fIRESTRICTIONS\fR is a comma-separated list; each element is either
+the name of an action, as explained in
+.SM
+.B CLIENT MODE
+below, or an IPv4/IPv6 range in the form "host=\fIIP1\fR-\fIIP2\fR" or
+"host=\fIIP\fR/\fIBITS\fR", which specifies that the user must have
+connected from a matching host; an exclamation point before the range
+means that access is forbidden from there. If more than one "host" option
+is specified, the first one which matches will be used: for example,
+"host=!192.168.5.0/24,host=192.168.0.0/16" allows access from any host
+in 192.168.0.0/16, except for 192.168.5.0/24. The "allow_tcp" option
+can be repeated to allow more than one user to connect, or to add to a
+user's existing list of permitted actions and hosts.
 .TP
 detach
 Detach from the terminal; this is the default if the program is
@@ -347,6 +365,9 @@ Identifies the user to the server, if a TCP connection is used (for
 Unix domain connection, the user running the program is always used
 for identification). If this option is not specified, and a TCP
 connection is requested, the program will prompt for the username.
+The username also determines what the client will be allowed to do,
+depending on the actions listed in the server's "allow_unix" or
+"allow_tcp" options.
 .TP
 password=\fISECRET\fR
 Provides a password to the server, if a TCP connection is used.
@@ -370,7 +391,8 @@ documentation, not in the order they are specified on the command line):
 .TP
 remove=\fI/path\fR
 Asks the server to stop watching a directory to watch. This option can
-be repeated as many times as necessary.
+be repeated as many times as necessary. The server must allow the
+"remove" action for this to work.
 .TP
 add=\fI/path\fR
 Asks the server to add a directory to watch; this command can be
@@ -379,41 +401,59 @@ followed by options refining the directory selection, as described in
 .B DIRECTORY SELECTION
 below. This command can be repeated to add more than one watch, however
 note that directory selection options only apply to the last "add"
-command which precedes them.
+command which precedes them. The server must allow the "add" action
+for this to work.
 .TP
 closelog
 Asks the server to close and reopen its log file; this can be used
-from a log rotation program.
+from a log rotation program. The server must allow the "closelog" action
+for this to work.
 .TP
 purge=\fIDAYS\fR
 Asks the server to remove any event log files older than the specified
 number of days. Replication which requires older events will need to be
 set up again manually, presumably after making the data consistent to
-the server's.
+the server's. The server must allow the "purge" action for this to work.
 .TP
 status
-Asks the server's status and prints a summary.
+Asks the server's status and prints a summary. The server must allow
+the "status" action for this to work.
 .TP
 serverversion
-Print the software version of the server.
+Print the software version of the server. The server must allow the
+"status" action for this to work.
 .TP
 pid
-Print the server's process ID.
+Print the server's process ID. The server must allow the
+"status" action for this to work.
 .TP
 box
 Print the contents of the server's shouldbox (which counts the number
 of times a bit of code labelled "this shouldn't happen" is executed).
 This only works if the server has been compiled with shouldbox support.
+The server must allow the "status" action for this to work.
 .TP
 watches
 Asks the server for the list of directories currently watched. This can
 be a long list, including any directories specified when starting the
 server or using "add", as well as their subdirectories. The list is
-printed to the client's standard output.
+printed to the client's standard output. The server must allow the
+"watches" action for this to work.
 .TP
 servercompress
 Asks the server which compression methods it supports, and prints them
 to standard output.
+The server must allow the "getconf" or "read" action for this to work.
+.TP
+serverchecksums
+Asks the server which checksum methods it supports, and prints them
+to standard output.
+The server must allow the "getconf" or "read" action for this to work.
+.TP
+dirsync=\fIpath\fR
+Schedules a "dirsync"; the server must be running in copy mode, and
+allow the "dirsync" action. The \fIpath\fR is relative to the "from"
+and "to" directories.
 .TP
 update=\fIoption\fR[=\fIvalue\fR]
 Updates the server's configuration. This has the same effect as restarting
@@ -426,35 +466,42 @@ which case the updates are all applied at the same time, and are all rejected
 if one fails. See the
 .BR should.conf(5)
 manpage for a complete list of server configuration options.
+The server must allow the "setconf" action for this to work.
 .TP
 serverconfig
 Asks the server for its current configuration (if appropriate, as modified
 while the server was running), and prints the result to standard output.
+The server must allow the "getconf" action for this to work.
 .TP
 ls=\fI/path\fR
 Asks the server for a directory listing and prints the result to standard
 output. The main reason this exists is because "should" has been used
 for remote backups on systems where no other access worked. This command
 can be repeated to list more than one directory.
+The server must allow the "read" action for this to work.
 .TP
 cp=\fI/path\fR
 Copies a file from the server. This command must be repeated at least
 twice (source, destination), and can be repeated more times (list
 of sources, destination), in which case the last one must be a directory
 on the client's host.
+The server must allow the "read" action for this to work.
 .TP
 df=\fI/path\fR
 Determines the disk free and used on the filesystem containing
 \fI/path\fR on the server. This command can be repeated.
+The server must allow the "read" action for this to work.
 .TP
 stop
 Asks the server to close all files and all network connections and
 exit. This could be used in initscripts etc.
+The server must allow the "stop" action for this to work.
 .SH COPY SETUP MODE
 In copy setup mode, the client creates a "status file" to be used
 for subsequent copy operations. The file contains information on
 how to connect to the server as well as the current event file
-number and the position within that file.
+number and the position within that file. The server must grant the
+"read" and "status" actions to the client for copy mode to work.
 .PP
 The following options must always be specified:
 .TP

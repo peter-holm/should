@@ -22,222 +22,69 @@
 #ifndef __SHOULD_CONFIG_H__
 #define __SHOULD_CONFIG_H__ 1
 
-/* operation mode */
+/* read package-dependent definitions; the configuration system is meant to
+ * be reusable on different packages */
 
-typedef enum {
-    config_client_add           = 0x0000001,
-    config_client_remove        = 0x0000002,
-    config_client_stop          = 0x0000004,
-    config_client_status        = 0x0000008,
-    config_client_box           = 0x0000010,
-    config_client_client        = 0x0000020,
-    config_client_closelog      = 0x0000040,
-    config_client_watches       = 0x0000080,
-    config_client_setup         = 0x0000100,
-    config_client_copy          = 0x0000200,
-    config_client_peek          = 0x0000400,
-    config_client_config        = 0x0000800,
-    config_client_purge         = 0x0001000,
-    config_client_listcompress  = 0x0002000,
-    config_client_listchecksum  = 0x0004000,
-    config_client_telnet        = 0x0008000,
-    config_client_version       = 0x0010000,
-    config_client_ls            = 0x0020000,
-    config_client_cp            = 0x0040000,
-    config_client_df            = 0x0080000,
-    config_client_getpid        = 0x0100000,
-    config_client_setdebug      = 0x0200000,
-    config_client_cleardebug    = 0x0400000,
-    config_client_update        = 0x0800000,
-    config_client_NONE          = 0
-} config_client_t;
+#include "config-package.h"
+#include "error.h"
 
-typedef enum {
-    config_server_start         = 0x00001,
-    config_server_detach        = 0x00002,
-    config_server_NONE          = 0
-} config_server_t;
+/* generic ACL mechanism */
 
-typedef enum {
-    config_flag_debug_server     = 0x00001,
-    config_flag_translate_ids    = 0x00002,
-    config_flag_skip_matching    = 0x00004,
-    config_flag_skip_should      = 0x00008,
-    config_flag_initial_dirsync  = 0x00010,
-    config_flag_overflow_dirsync = 0x00020,
-    config_flag_dirsync_delete   = 0x00040,
-    config_flag_copy_oneshot     = 0x00080,
-    config_flag_socket_changed   = 0x00100,
-    config_flag_NONE             = 0
-} config_flags_t;
-
-/* specifies a list of subdirectories to exclude */
-
-typedef struct config_match_s config_match_t;
-struct config_match_s {
-    config_match_t * next;
+typedef struct config_acl_cond_s config_acl_cond_t;
+struct config_acl_cond_s {
+    config_acl_cond_t * next;
     enum {
-	config_match_name,      /* last component of the name only */
-	config_match_path       /* full path */
-    } match;
-    enum {
-	config_match_exact,     /* like strcmp() */
-	config_match_icase,     /* like strcasecmp() */
-	config_match_glob,      /* like a shell glob */
-	config_match_iglob      /* like a shell glob, ignoring case */
+	cfg_acl_exact,          /* like strcmp() */
+	cfg_acl_icase,          /* like strcasecmp() */
+	cfg_acl_glob,           /* like a shell glob */
+	cfg_acl_iglob,          /* like a shell glob, ignoring case */
+	cfg_acl_ip4range,       /* for IPv4 data only: match range */
+	cfg_acl_ip6range,       /* for IPv6 data only: match range */
+	cfg_acl_function,       /* call func(PATTERN, DATA, ALL_DATA, DSIZE) */
+	cfg_acl_call_or,        /* any subcondition returns true */
+	cfg_acl_call_and        /* all subconditions return true */
     } how;
-    char * pattern;
+    int data_index;             /* index into the data supplied to match */
+    int negate;                 /* negate result */
+    /* which of the union element is used depends on the value of "how";
+     * if "pattern" is used, its size will extend this structure */
+    union {
+	int (*func)(const char *, const char *, const char *[], int);
+	config_acl_cond_t * subcond;
+    };
+    char pattern[0];
 };
 
-/* specifies a directory tree to watch */
+typedef struct config_acl_s config_acl_t;
+struct config_acl_s {
+    config_acl_t * next;
+    config_acl_cond_t * cond;
+    int result;
+};
+
+/* specification for a generic directory tree */
 
 typedef struct config_dir_s config_dir_t;
 struct config_dir_s {
     config_dir_t * next;
     int crossmount;
-    config_match_t * exclude;
-    config_match_t * find;
+    config_acl_cond_t * exclude;
+    config_acl_cond_t * find;
     char * path;
 };
 
-/* defines a username/password pair */
-
-typedef struct config_user_s config_user_t;
-struct config_user_s {
-    config_user_t * next;
-    char * user;
-    const char * pass;
-};
-
-/* defines a list of "listen" */
-
-typedef struct config_listen_s config_listen_t;
-struct config_listen_s {
-    config_listen_t * next;
-    char * host;
-    const char * port;
-};
-
-/* defines a list of paths for "cp" and "ls" */
+/* list of strings */
 
 typedef struct config_strlist_s config_strlist_t;
 struct config_strlist_s {
     config_strlist_t * next;
+    int datalen;
     char * data;
 };
 
-/* definitions for timed dirsyncs */
-typedef struct {
-    int daymask;
-    int start_time;
-} config_dirsync_t;
-
-/* definitions for the filter */
-typedef enum {
-    config_event_meta          = 0,
-    config_event_data          = 1,
-    config_event_create        = 2,
-    config_event_delete        = 3,
-    config_event_rename        = 4,
-    config_event_COUNT         = 5,
-    config_event_all           = (1 << config_event_COUNT) - 1
-} config_event_t;
-
-typedef enum {
-    config_file_regular        = 0x01,
-    config_file_dir            = 0x02,
-    config_file_char           = 0x04,
-    config_file_block          = 0x08,
-    config_file_fifo           = 0x10,
-    config_file_symlink        = 0x20,
-    config_file_socket         = 0x40,
-    config_file_unknown        = 0x80,
-    config_file_all            = 0xff,
-} config_filter_t;
-
-/* integer-valued configuration elements */
-
-typedef enum {
-    cfg_client_mode,              /* do an operation to a running should */
-    cfg_server_mode,              /* start server */
-    cfg_flags,                    /* various flags */
-    cfg_notify_queue_block,       /* size of the notify queue alloc. block */
-    cfg_notify_initial,           /* initial number of blocks allocated */
-    cfg_notify_max,               /* max number of blocks allocated */
-    cfg_notify_watch_block,       /* size of the notify watch alloc. block */
-    cfg_notify_buffer,            /* size of buffer used to read from kernel */
-    cfg_notify_name_block,        /* size of notify name allocation block */
-    cfg_eventsize,                /* size of file before rotation */
-    cfg_checkpoint_events,        /* during copy, checkpoint to state file after
-                                   * this number of events */
-    cfg_checkpoint_time,          /* during copy, checkpoint to state file after
-                                   * this number of seconds */
-    cfg_from_length,              /* length of from_prefix (see strings) */
-    cfg_to_length,                /* length of to_prefix (see strings) */
-    cfg_bwlimit,                  /* bandwidth limit KB/s, 0 == network's max */
-    cfg_purge_days,               /* if nonzero, client asks to purge event
-				   * files older than that number of days */
-    cfg_autopurge_days,           /* if nonzero, store thread automatically
-				   * purges files on rotation */
-    cfg_optimise_client,          /* number of events the client tries to
-                                   * pre-read to optimise event processing */
-    cfg_optimise_buffer,          /* buffer allocated by the client to optimise
-				   * events received from server. */
-    cfg_nchecksums,               /* size of "checksums" */
-    cfg_ncompressions,            /* size of "compressions" */
-    cfg_dirsync_interval,         /* frequency of periodic dirsyncs, 0=never */
-    cfg_dirsync_count,            /* size of "dirsync_timed" */
-    cfg_int_COUNT                 /* number of integer elements */
-} config_int_t;
-
-/* string-valued configuration elements */
-
-typedef enum {
-    cfg_base_name,                /* used to generate other defaults */
-    cfg_error_ident,              /* program identity */
-    cfg_error_logfile,            /* log file */
-    cfg_error_email,              /* email notification recipients */
-    cfg_error_submit,             /* email submit program.
-				   * must behave like /usr/sbin/sendmail */
-    cfg_user,                     /* identity to use on server */
-    cfg_password,                 /* identity to use on server */
-    cfg_eventdir,                 /* log file base name */
-    cfg_store,                    /* method used by the store thread */
-    cfg_from_prefix,              /* copy events with this prefix */
-    cfg_to_prefix,                /* replace this to the from_prefix */
-    cfg_copy_state,               /* state file to use for copy */
-    cfg_homedir,                  /* user's home directory */
-    cfg_str_COUNT                 /* number of string elements */
-} config_str_t;
-
-/* string-list-valued configuration elements */
-
-typedef enum {
-    cfg_cp_path,                  /* arguments to "cp" */
-    cfg_ls_path,                  /* arguments to "ls" */
-    cfg_df_path,                  /* arguments to "df" */
-    cfg_update,                   /* configuration updates to request */
-    cfg_strlist_COUNT             /* number of string-list elements */
-} config_list_t;
-
 /* the configuration data */
 
-typedef struct {
-    int intval[cfg_int_COUNT];    /* integer-valued data */
-    char * strval[cfg_str_COUNT]; /* string data */
-    config_strlist_t * strlist[cfg_strlist_COUNT]; /* string list data */
-    config_dir_t * dirs;          /* initial list of directory trees to watch */
-    config_dir_t * remove;        /* directories to remove from server */
-    config_user_t * users;        /* users allowed to connect to server */
-    config_listen_t * listen;     /* listen for TCP connections */
-    config_listen_t server;       /* run as a TCP client to server */
-    char ** tunnel;               /* run a program to set up tunnel */
-    char ** remote_should;        /* path to should at other end of tunnel */
-    int * checksums;              /* checksum method preference */
-    int * compressions;           /* compression method preference */
-    config_dirsync_t * dirsync_timed; /* timed dirsyncs */
-    config_filter_t filter[config_event_COUNT]; /* bitmaps of allowed events */
-} config_data_t;
+typedef struct config_data_s config_data_t;
 
 /* obtain configuration data from command-line arguments; returns 0 on
  * error, 1 on success */
@@ -249,6 +96,25 @@ int config_init(int argc, char *argv[]);
  * call to config_get may return different data */
 
 const config_data_t * config_get(void);
+
+/* obtain values */
+
+int config_intval(const config_data_t *, config_int_names_t);
+
+int config_intarr_len(const config_data_t *, config_intarr_names_t);
+const int * config_intarr_data(const config_data_t *, config_intarr_names_t);
+
+int config_strlen(const config_data_t *, config_str_names_t);
+const char * config_strval(const config_data_t *, config_str_names_t);
+
+char * const * config_strarr(const config_data_t *, config_strarr_names_t);
+
+const config_strlist_t * config_strlist(const config_data_t *,
+					config_strlist_names_t);
+
+const config_dir_t * config_treeval(const config_data_t *, config_tree_names_t);
+
+const config_acl_t * config_aclval(const config_data_t *, config_acl_names_t);
 
 /* stop using a read-only copy of the configuration */
 
@@ -310,23 +176,41 @@ int config_parse_size(const char *);
 
 const char * config_print_size(int);
 
-/* parse a day range (mon-fri or tue,sat or sun,tue-thu,sat etc); returns
- * a pointer to the end of the parsed range and updates the second argument
- * with the corresponding mask; if the range is invalid, returns NULL */
-
-const char * config_parse_dayrange(const char *, int *);
-
-/* the opposite of the above */
-
-const char * config_print_dayrange(int);
-
 /* stores copy data to a small configuration file, suitable for loading
  * by the copy thread */
 
 int config_store_copy(int fnum, int fpos, const char * user, const char * pass);
 
-/* useful functions we export */
+/* used by the store thread to change its error dest to syslog; to be
+ * called during initialisation only. Not thread-safe */
 
-const char * config_getfacility(const char *, int *);
+const char * config_change_error_dest(error_message_t, const char *);
+
+/* check an ACL */
+
+int config_check_acl(const config_acl_t * acl,
+		     const char *data[], int datasize, int notfound);
+
+/* check an ACL condition; if is_and is nonzero, all the element must
+ * return true; if is_and is zero, the first which matches decides whether
+ * the result is true (if it is not negated) or false (if it is negated) */
+
+int config_check_acl_cond(const config_acl_cond_t * cond, int is_and,
+			  const char *data[], int datasize);
+
+/* copies an ACL / condition (deep copy) */
+
+config_acl_cond_t * config_copy_acl_cond(const config_acl_cond_t * cond);
+config_acl_t * config_copy_acl(const config_acl_t * acl);
+
+/* frees a condition */
+
+void config_free_acl_cond(config_acl_cond_t * cond);
+
+/* user-editable error message data */
+
+const char * config_error_message(const config_data_t *, error_message_t);
+error_dest_t config_error_destination(const config_data_t *, error_message_t);
+int config_error_facility(const config_data_t *, error_message_t);
 
 #endif /* __SHOULD_CONFIG_H__ */

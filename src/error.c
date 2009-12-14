@@ -49,668 +49,483 @@ static FILE * logfile;
 typedef enum {
     arg_void,
     arg_int,
-    arg_longlong,
+    arg_llong,
     arg_string,
     arg_errno,
     arg_addr
 } arg_t;
 
-/* user-defined error message */
+/* default error messages etc */
 
 typedef struct {
-    error_dest_t destination;
-    int facility;               /* facility, if using syslog */
-    int changed;
-    const char * message;       /* message */
-    arg_t argdata[ARGS];
-    char * free_me;
-    const char * name;
-} err_t;
+    error_level_t level;        /* the error level */
+    const char * defmsg;        /* default message */
+    arg_t argtype[ARGS];        /* arguments it takes */
+    const char * name;          /* name used to change the defaults */
+} deferr_t;
 
-#define DEST_INFO (error_dest_file)
-#define DEST_WARN (error_dest_file)
-#define DEST_ERR  (error_dest_file | error_dest_syslog)
-#define DEST_CRIT (error_dest_file | error_dest_syslog)
-
-static err_t errdata[error_MAX] = {
+static deferr_t deferr[error_MAX] = {
     [error_shouldbox_int] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: %s = %s",
-	.argdata     = { arg_string, arg_string, arg_int, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "shouldbox_int",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "%s: %s = %s",
+	.argtype  = { arg_string, arg_string, arg_int, arg_void, arg_void },
+	.name     = "shouldbox_int",
     },
     [error_shouldbox_less] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: %s = %s < %s",
-	.argdata     = { arg_string, arg_string, arg_int, arg_int, arg_void },
-	.free_me     = NULL,
-	.name        = "shouldbox_less",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "%s: %s = %s < %s",
+	.argtype  = { arg_string, arg_string, arg_int, arg_int, arg_void },
+	.name     = "shouldbox_less",
     },
     [error_shouldbox_more] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: %s = %s > %s",
-	.argdata     = { arg_string, arg_string, arg_int, arg_int, arg_void },
-	.free_me     = NULL,
-	.name        = "shouldbox_more",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "%s: %s = %s > %s",
+	.argtype  = { arg_string, arg_string, arg_int, arg_int, arg_void },
+	.name     = "shouldbox_more",
     },
     [error_shouldbox_noteq] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: %s = %s != %s = %s",
-	.argdata     = { arg_string, arg_string, arg_int, arg_string, arg_int },
-	.free_me     = NULL,
-	.name        = "shouldbox_noteq",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "%s: %s = %s != %s = %s",
+	.argtype  = { arg_string, arg_string, arg_int, arg_string, arg_int },
+	.name     = "shouldbox_noteq",
     },
     [error_shouldbox_null] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: %s is NULL",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "shouldbox_null",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "%s: %s is NULL",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "shouldbox_null",
     },
     [error_shouldbox_misptr] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: %s points to the wrong place!",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "shouldbox_misptr",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "%s: %s points to the wrong place!",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "shouldbox_misptr",
     },
     [error_shouldbox_mod] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: %s = %s %% %s = %s != 0",
-	.argdata     = { arg_string, arg_string, arg_int, arg_int, arg_int },
-	.free_me     = NULL,
-	.name        = "shouldbox_mod",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "%s: %s = %s %% %s = %s != 0",
+	.argtype  = { arg_string, arg_string, arg_int, arg_int, arg_int },
+	.name     = "shouldbox_mod",
     },
     [error_shouldbox_notfound] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: %s not found",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "shouldbox_notfound",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "%s: %s not found",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "shouldbox_notfound",
     },
     [error_internal] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Internal error in %s: %s",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "internal",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "Internal error in %s: %s",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "internal",
     },
     [error_allocation] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: %s: free() of invalid memory area!",
-	.argdata     = { arg_string, arg_int, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "allocation",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "%s: %s: free() of invalid memory area!",
+	.argtype  = { arg_string, arg_int, arg_void, arg_void, arg_void },
+	.name     = "allocation",
     },
     [error_fork] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "fork(): %s",
-	.argdata     = { arg_errno, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "fork",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "fork(): %s",
+	.argtype  = { arg_errno, arg_void, arg_void, arg_void, arg_void },
+	.name     = "fork",
+    },
+    [error_wait] = {
+	.level    = error_level_crit,
+	.defmsg   = "wait(): %s",
+	.argtype  = { arg_errno, arg_void, arg_void, arg_void, arg_void },
+	.name     = "wait",
     },
     [error_badevent] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Bad event descriptor: %s",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "badevent",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "Bad event descriptor: %s",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "badevent",
     },
     [error_baddirent] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Bad directory entry: %s",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "baddirent",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "Bad directory entry: %s",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "baddirent",
     },
     [error_bad_id] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Bad %d ID in event: %s",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "bad_id",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "Bad %d ID in event: %s",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "bad_id",
     },
     [error_event] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Error receiving event: %s",
-	.argdata     = { arg_errno, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "event",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "Error receiving event: %s",
+	.argtype  = { arg_errno, arg_void, arg_void, arg_void, arg_void },
+	.name     = "event",
     },
     [error_getdir] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Error receiving directory data for %s: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "getdir",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "Error receiving directory data for %s: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "getdir",
     },
     [error_accept] = {
-	.destination = DEST_CRIT,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "accept(): %s",
-	.argdata     = { arg_errno, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "fork",
-	.changed     = 0,
+	.level    = error_level_crit,
+	.defmsg   = "accept(): %s",
+	.argtype  = { arg_errno, arg_void, arg_void, arg_void, arg_void },
+	.name     = "accept",
     },
     [error_add_watch] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Cannot add watch %2$s: %1$s",
-	.argdata     = { arg_errno, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "add_watch",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Cannot add watch %2$s: %1$s",
+	.argtype  = { arg_errno, arg_string, arg_void, arg_void, arg_void },
+	.name     = "add_watch",
     },
     [error_rename_watch] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Cannot rename watch %s to %s",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "rename_watch",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Cannot rename watch %s to %s",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "rename_watch",
     },
     [error_rename_unknown] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Cannot rename unknown watch %s",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "rename_unknown",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Cannot rename unknown watch %s",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "rename_unknown",
     },
     [error_rename_exists] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Rename: %s already exists",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "rename_exists",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Rename: %s already exists",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "rename_exists",
     },
     [error_rename_children] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Rename: %s has a subtree",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "rename_children",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Rename: %s has a subtree",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "rename_children",
     },
     [error_buffer_tiny] = {
-	.destination = DEST_WARN,
-	.facility    = LOG_LOCAL0 | LOG_WARNING,
-	.message     = "Buffer should be increased to at least %s",
-	.argdata     = { arg_int, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "buffer_tiny",
-	.changed     = 0,
+	.level    = error_level_warn,
+	.defmsg   = "Buffer should be increased to at least %s",
+	.argtype  = { arg_int, arg_void, arg_void, arg_void, arg_void },
+	.name     = "buffer_tiny",
     },
     [error_extending_queue] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Error extending queue: %s",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "extending_queue",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Error extending queue: %s",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "extending_queue",
     },
     [error_queue_too_small] = {
-	.destination = DEST_WARN,
-	.facility    = LOG_LOCAL0 | LOG_WARNING,
-	.message     = "Queue too small, consider increasing size",
-	.argdata     = { arg_void, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "queue_too_small",
-	.changed     = 0,
+	.level    = error_level_warn,
+	.defmsg   = "Queue too small, consider increasing size",
+	.argtype  = { arg_void, arg_void, arg_void, arg_void, arg_void },
+	.name     = "queue_too_small",
     },
     [error_connect] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Error accepting connection: %s: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "connect",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Error accepting connection: %s: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "connect",
     },
     [error_server] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Server thread error: %s: %s: %s",
-	.argdata     = { arg_addr, arg_string, arg_errno, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "server",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Server thread error: %s: %s: %s",
+	.argtype  = { arg_addr, arg_string, arg_errno, arg_void, arg_void },
+	.name     = "server",
     },
     [error_server_msg] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Server thread error: %s: %s: %s",
-	.argdata     = { arg_addr, arg_string, arg_string, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "server_msg",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Server thread error: %s: %s: %s",
+	.argtype  = { arg_addr, arg_string, arg_string, arg_void, arg_void },
+	.name     = "server_msg",
     },
     [error_start] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Error initialising %s thread: %s",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "start",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Error initialising %s thread: %s",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "start",
     },
     [error_create] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Error creating %s thread: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "create",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Error creating %s thread: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "create",
     },
     [error_control] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Error adding watch %s: %s",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "control",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Error adding watch %s: %s",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "control",
     },
     [error_run] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Error running %s thread: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "run",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Error running %s thread: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "run",
     },
     [error_lock] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: locking: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "lock",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "%s: locking: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "lock",
     },
     [error_invalid] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Internal error: invalid error code %s",
-	.argdata     = { arg_int, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "invalid",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Internal error: invalid error code %s",
+	.argtype  = { arg_int, arg_void, arg_void, arg_void, arg_void },
+	.name     = "invalid",
     },
     [error_scan_dir] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "scan_dir: %s: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "scan_dir",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "scan_dir: %s: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "scan_dir",
     },
     [error_scan_find] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "scan_find: %s: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "scan_find",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "scan_find: %s: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "scan_find",
     },
     [error_client] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "client",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "%s: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "client",
     },
     [error_client_msg] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "%s: %s",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "client_msg",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "%s: %s",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "client_msg",
     },
     [error_setup] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Copy setup: %s: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "setup",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Copy setup: %s: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "setup",
     },
     [error_readcopy] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Read copy state: %s: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "readcopy",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Read copy state: %s: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "readcopy",
     },
     [error_readcopy_fmt] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Read copy state: %s: invalid file format",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "readcopy_fmt",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Read copy state: %s: invalid file format",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "readcopy_fmt",
     },
     [error_readcopy_compress] ={
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Read copy state: %s: invalid compress method %s",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "readcopy_compress",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Read copy state: %s: invalid compress method %s",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "readcopy_compress",
     },
     [error_readcopy_locked] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Read copy state: % is locked by another process",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "readcopy_locked",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Read copy state: % is locked by another process",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "readcopy_locked",
     },
     [error_copy_sys] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Error copying %s: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "copy_sys",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Error copying %s: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "copy_sys",
     },
     [error_copy_rename] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Error renaming %s to %s) %s",
-	.argdata     = { arg_string, arg_string, arg_errno, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "copy_rename",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Error renaming %s to %s) %s",
+	.argtype  = { arg_string, arg_string, arg_errno, arg_void, arg_void },
+	.name     = "copy_rename",
     },
     [error_copy_invalid] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Invalid reply while copying %s: %s",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "copy_invalid",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Invalid reply while copying %s: %s",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "copy_invalid",
     },
     [error_copy_short] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Unexpected EOF while copying %s",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "copy_short",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Unexpected EOF while copying %s",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "copy_short",
     },
     [error_copy_socket] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Cannot copy %s: is a socket",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "copy_socket",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Cannot copy %s: is a socket",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "copy_socket",
     },
     [error_copy_uncompress] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Cannot copy %s: error while uncompressing: %s",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "copy_uncompress",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Cannot copy %s: error while uncompressing: %s",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "copy_uncompress",
     },
     [error_copy_unknown] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Cannot copy %s: unknown file type",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "copy_unknown",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Cannot copy %s: unknown file type",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "copy_unknown",
     },
     [error_copy_sched_dirsync] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Cannot schedule dirsync %s: %s",
-	.argdata     = { arg_string, arg_errno, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "copy_sched_dirsync",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Cannot schedule dirsync %s: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "copy_sched_dirsync",
     },
     [error_unimplemented] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Not implemented: %s",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "unimplemented",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Not implemented: %s",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "unimplemented",
     },
     [error_notserver] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Server is not in server mode",
-	.argdata     = { arg_void, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "notserver",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Server is not in server mode",
+	.argtype  = { arg_void, arg_void, arg_void, arg_void, arg_void },
+	.name     = "notserver",
     },
     [error_nonotify] = {
-	.destination = DEST_ERR,
-	.facility    = LOG_LOCAL0 | LOG_ERR,
-	.message     = "Server does not support notify",
-	.argdata     = { arg_void, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "nonotify",
-	.changed     = 0,
+	.level    = error_level_err,
+	.defmsg   = "Server does not support notify",
+	.argtype  = { arg_void, arg_void, arg_void, arg_void, arg_void },
+	.name     = "nonotify",
+    },
+    [error_child_status] = {
+	.level    = error_level_err,
+	.defmsg   = "Child process exited with status %s",
+	.argtype  = { arg_int, arg_void, arg_void, arg_void, arg_void },
+	.name     = "child_status",
+    },
+    [error_child_signal] = {
+	.level    = error_level_err,
+	.defmsg   = "Child process terminated by signal %s",
+	.argtype  = { arg_int, arg_void, arg_void, arg_void, arg_void },
+	.name     = "child_signal",
+    },
+    [error_child_coredump] = {
+	.level    = error_level_err,
+	.defmsg   = "Child process terminated by signal %s (core dumped)",
+	.argtype  = { arg_int, arg_void, arg_void, arg_void, arg_void },
+	.name     = "child_coredump",
+    },
+    [error_child_unknown] = {
+	.level    = error_level_err,
+	.defmsg   = "Child process terminated with unknown status %s",
+	.argtype  = { arg_int, arg_void, arg_void, arg_void, arg_void },
+	.name     = "child_unknown",
     },
     [info_normal_operation] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "Entering normal operation",
-	.argdata     = { arg_void, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "normal_operation",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "Entering normal operation",
+	.argtype  = { arg_void, arg_void, arg_void, arg_void, arg_void },
+	.name     = "normal_operation",
     },
     [info_initial_watches] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "Added %s initial watch(es)",
-	.argdata     = { arg_int, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "initial_watches",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "Added %s initial watch(es)",
+	.argtype  = { arg_int, arg_void, arg_void, arg_void, arg_void },
+	.name     = "initial_watches",
     },
     [info_user_stop] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "User requested program stop",
-	.argdata     = { arg_void, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "user_stop",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "User requested program stop",
+	.argtype  = { arg_void, arg_void, arg_void, arg_void, arg_void },
+	.name     = "user_stop",
     },
     [info_adding_watch] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "Adding watch: %s",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "adding_watch",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "Adding watch: %s",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "adding_watch",
     },
     [info_removing_watch] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "Removing watch: %s",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "removing_watch",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "Removing watch: %s",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "removing_watch",
     },
     [info_signal_received] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "Received signal #%s",
-	.argdata     = { arg_int, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "signal_received",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "Received signal #%s",
+	.argtype  = { arg_int, arg_void, arg_void, arg_void, arg_void },
+	.name     = "signal_received",
     },
     [info_extending_buffer] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "Extending buffer to %s blocks",
-	.argdata     = { arg_int, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "extending_buffer",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "Extending buffer to %s blocks",
+	.argtype  = { arg_int, arg_void, arg_void, arg_void, arg_void },
+	.name     = "extending_buffer",
     },
     [info_connection_open] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "Accepting connection from %s@%s",
-	.argdata     = { arg_string, arg_addr, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "connection_open",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "Accepting connection from %s@%s",
+	.argtype  = { arg_string, arg_addr, arg_void, arg_void, arg_void },
+	.name     = "connection_open",
     },
     [info_connection_close] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "Closing connection from %s@%s",
-	.argdata     = { arg_string, arg_addr, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "connection_close",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "Closing connection from %s@%s",
+	.argtype  = { arg_string, arg_addr, arg_void, arg_void, arg_void },
+	.name     = "connection_close",
     },
     [info_count_watches] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "%s directories watched",
-	.argdata     = { arg_int, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "count_watches",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "%s directories watched",
+	.argtype  = { arg_int, arg_void, arg_void, arg_void, arg_void },
+	.name     = "count_watches",
     },
     [info_stop_thread] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "Stopping %s thread",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "stop_thread",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "Stopping %s thread",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "stop_thread",
     },
     [info_detach] = {
-	.destination = error_dest_stderr,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "Detaching, PID is %s",
-	.argdata     = { arg_int, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "detach",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "Detaching, PID is %s",
+	.argtype  = { arg_int, arg_void, arg_void, arg_void, arg_void },
+	.name     = "detach",
     },
     [info_changelog] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "%-6s %-4s %s",
-	.argdata     = { arg_string, arg_string, arg_string, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "info_changelog",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "%-6s %-4s %s",
+	.argtype  = { arg_string, arg_string, arg_string, arg_void, arg_void },
+	.name     = "info_changelog",
     },
     [info_replication_meta] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "replication: meta(%s, %s)",
-	.argdata     = { arg_string, arg_int, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "info_replication_meta",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "replication: meta(%s, %s)",
+	.argtype  = { arg_string, arg_int, arg_void, arg_void, arg_void },
+	.name     = "info_replication_meta",
     },
     [info_replication_copy] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "replication: copy(%s, %s, %s)",
-	.argdata     = { arg_string, arg_string, arg_longlong, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "info_replication_copy",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "replication: copy(%s, %s, %s)",
+	.argtype  = { arg_string, arg_string, arg_llong, arg_void, arg_void },
+	.name     = "info_replication_copy",
     },
     [info_replication_delete] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "replication: delete(%s)",
-	.argdata     = { arg_string, arg_void, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "info_replication_delete",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "replication: delete(%s)",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "info_replication_delete",
     },
     [info_replication_rename] = {
-	.destination = DEST_INFO,
-	.facility    = LOG_LOCAL0 | LOG_INFO,
-	.message     = "replication: rename(%s, %s)",
-	.argdata     = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.free_me     = NULL,
-	.name        = "info_replication_rename",
-	.changed     = 0,
+	.level    = error_level_info,
+	.defmsg   = "replication: rename(%s, %s)",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "info_replication_rename",
+    },
+    [info_sched_dirsync] = {
+	.level    = error_level_info,
+	.defmsg   = "scheduling %s dirsync \"%s\"",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "info_sched_dirsync",
     },
 };
 
@@ -719,7 +534,7 @@ static err_t errdata[error_MAX] = {
 void error_init(void) {
     const config_data_t * cfg = config_get();
     logfile = NULL;
-    openlog(cfg->strval[cfg_error_ident], LOG_ODELAY | LOG_PID, 0);
+    openlog(config_strval(cfg, cfg_error_ident), LOG_ODELAY | LOG_PID, 0);
     config_put(cfg);
 }
 
@@ -792,7 +607,7 @@ const char * error_sys_errno(const char * caller, const char * called,
 
 void error_report(error_message_t em, ...) {
     int i, dest, uselog, ec;
-    err_t ed;
+    deferr_t ed;
     char buffers[ARGS][ARGSIZE + 1], timestamp[TIMESTAMP];
     const char * bptr[ARGS], * msg;
     va_list ap;
@@ -802,10 +617,23 @@ void error_report(error_message_t em, ...) {
 	error_report(error_invalid, em);
 	return;
     }
-    ed = errdata[em];
+    cfg = config_get();
+    dest = config_error_destination(cfg, em);
+    if (! dest) {
+	/* ignore this error message */
+	config_put(cfg);
+	return;
+    }
+    msg = config_error_message(cfg, em);
+    if (! msg) {
+	/* shouldn't happen, but what can you do? */
+	config_put(cfg);
+	return;
+    }
+    ed = deferr[em];
     va_start(ap, em);
     for (i = 0; i < ARGS; i++) {
-	switch(ed.argdata[i]) {
+	switch(ed.argtype[i]) {
 	    case arg_void :
 		bptr[i] = "";
 		break;
@@ -852,7 +680,7 @@ void error_report(error_message_t em, ...) {
 		buffers[i][ARGSIZE] = 0;
 		bptr[i] = buffers[i];
 		break;
-	    case arg_longlong :
+	    case arg_llong :
 		snprintf(buffers[i], ARGSIZE, "%lld", va_arg(ap, long long));
 		buffers[i][ARGSIZE] = 0;
 		bptr[i] = buffers[i];
@@ -872,12 +700,11 @@ void error_report(error_message_t em, ...) {
     }
     va_end(ap);
     set_timestamp(timestamp, time(NULL));
-    dest = ed.destination;
-    msg = ed.message;
     if (dest & error_dest_email) {
-	if (! cfg) cfg = config_get();
-	if (cfg->strval[cfg_error_email] && cfg->strval[cfg_error_submit]) {
-	    /* XXX send email to cfg->strval[cfg_error_email] */
+	if (config_strval(cfg, cfg_error_email) &&
+	    config_strarr(cfg, cfg_strarr_email_submit))
+	{
+	    /* XXX send email to config_strval(cfg, cfg_error_email) */
 	}
     }
     /* if we use a log file or stderr we lock stderr now: as a result:
@@ -889,34 +716,33 @@ void error_report(error_message_t em, ...) {
     if (uselog) flockfile(stderr);
     if (dest & error_dest_file) {
 	if (! logfile) {
-	    if (! cfg) cfg = config_get();
-	    logfile = fopen(cfg->strval[cfg_error_logfile], "a");
+	    logfile = fopen(config_strval(cfg, cfg_error_logfile), "a");
 	    if (! logfile) {
 		fprintf(stderr, "%s  %s:  ",
-			timestamp, cfg->strval[cfg_error_ident]);
-		perror(cfg->strval[cfg_error_logfile]);
+			timestamp, config_strval(cfg, cfg_error_ident));
+		perror(config_strval(cfg, cfg_error_logfile));
 		dest |= error_dest_stderr;
 	    }
 	}
 	if (logfile) {
 	    fprintf(logfile, "%s  %s:  ",
-		    timestamp, cfg->strval[cfg_error_ident]);
+		    timestamp, config_strval(cfg, cfg_error_ident));
 	    fprintf(logfile, msg, bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]);
 	    fprintf(logfile, "\n");
 	    fflush(logfile);
 	}
     }
     if (dest & error_dest_stderr) {
-	if (! cfg) cfg = config_get();
-	fprintf(stderr, "%s  %s:  ", timestamp, cfg->strval[cfg_error_ident]);
+	fprintf(stderr, "%s  %s:  ", timestamp,
+		config_strval(cfg, cfg_error_ident));
 	fprintf(stderr, msg, bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]);
 	fprintf(stderr, "\n");
     }
     if (uselog) funlockfile(stderr);
-    if (dest & error_dest_syslog) {
-	syslog(ed.facility, msg, bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]);
-    }
-    if (cfg) config_put(cfg);
+    if (dest & error_dest_syslog)
+	syslog(config_error_facility(cfg, em), msg,
+	       bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]);
+    config_put(cfg);
 }
 
 /* closes logfile: it will be reopened next time a message is logged; can
@@ -927,93 +753,13 @@ void error_closelog(void) {
     logfile = NULL;
 }
 
-/* change an error message; caller allocates string with mymalloc, and they
- * also myfree() it if they get an error */
-
-const char * error_change_message(error_message_t em, char * msg) {
-    if (em < error_MAX) {
-	int old, new, ptr;
-	const char * omsg = errdata[em].message;
-	/* do a simple validity check, and make sure it contains the
-	 * same number of %...s formats */
-	for (old = ptr = 0; omsg[ptr]; ptr++) {
-	    if (omsg[ptr] == '%' && omsg[ptr + 1] != '%') {
-		ptr++;
-		if (omsg[ptr] != '%')
-		    old++;
-	    }
-	}
-	for (new = ptr = 0; msg[ptr]; ptr++) {
-	    if (msg[ptr] == '%') {
-		ptr++;
-		if (msg[ptr] != '%') {
-		    if (msg[ptr] == '-') ptr++;
-		    while (msg[ptr] && isdigit((int)msg[ptr])) ptr++;
-		    if (msg[ptr] != 's')
-			return "Invalid conversion, use %s";
-		    new++;
-		}
-	    }
-	}
-	if (old != new)
-	    return "Invalid message: wrong number of conversions";
-	if (errdata[em].free_me) myfree (errdata[em].free_me);
-	errdata[em].message = msg;
-	errdata[em].free_me = msg;
-	return NULL;
-    } else {
-	return "Invalid error code";
-    }
-}
-
-/* get current error message */
-
-const char * error_get_message(error_message_t em) {
-    if (em < error_MAX)
-	return errdata[em].message;
-    return "?";
-}
-
-/* change an error destination: facility is only used with syslog */
-
-void error_change_dest(error_message_t em, error_dest_t dest, int facility) {
-    if (em < error_MAX) {
-	errdata[em].destination = dest;
-	errdata[em].facility = facility;
-	errdata[em].changed = 1;
-    }
-}
-
-/* get current destination and facility */
-
-error_dest_t error_get_dest(error_message_t em) {
-    if (em < error_MAX)
-	return errdata[em].destination;
-    return error_dest_stderr;
-}
-
-int error_get_facility(error_message_t em) {
-    if (em < error_MAX)
-	return errdata[em].facility;
-    return 0;
-}
-
-/* check if an error destination has been changed from its default; returns
- * 0 if no, 1 if yes, -1 if invalid */
-
-int error_dest_changed(error_message_t em) {
-    if (em < error_MAX)
-	return errdata[em].changed;
-    return -1;
-}
-
 /* get an error code from its name */
 
 error_message_t error_code(const char * name, int len) {
     error_message_t em;
     for (em = 0; em < error_MAX; em++)
-	if (strncmp(errdata[em].name, name, len) == 0)
-	    if (strlen(errdata[em].name) == len)
+	if (strncmp(deferr[em].name, name, len) == 0)
+	    if (strlen(deferr[em].name) == len)
 		return em;
     return error_MAX;
 }
@@ -1022,16 +768,28 @@ error_message_t error_code(const char * name, int len) {
 
 const char * error_name(error_message_t em) {
     if (em < error_MAX)
-	return errdata[em].name;
+	return deferr[em].name;
     return "?";
 }
 
-/* frees any allocated error messages */
+/* get default error messge, error level, number of arguments */
 
-void error_free(void) {
-    error_message_t em;
-    for (em = 0; em < error_MAX; em++)
-	if (errdata[em].free_me)
-	    myfree(errdata[em].free_me);
+const char * error_defmsg(error_message_t em) {
+    return em < error_MAX ? deferr[em].defmsg : "";
+}
+
+error_level_t error_level(error_message_t em) {
+    return em < error_MAX ? deferr[em].level : error_level_info;
+}
+
+int error_argcount(error_message_t em) {
+    if (em < error_MAX) {
+	int na = 0, i;
+	for (i = 0; i < ARGS; i++)
+	    if (deferr[em].argtype[i] != arg_void)
+		na++;
+	return na;
+    }
+    return 0;
 }
 

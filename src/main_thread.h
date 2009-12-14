@@ -27,7 +27,7 @@
 
 #define VERSION_MAJOR 1
 #define VERSION_MINOR 0
-#define VERSION_OFFSET -5
+#define VERSION_OFFSET -4
 
 /* when the program started */
 

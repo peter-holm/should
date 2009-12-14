@@ -4,11 +4,12 @@ A "should" client will connect to a "should" server using a Unix domain
 socket or a TCP network connection, depending on configuration and
 command-line options. A client in copy mode behaves as a server and
 can also be controlled this way, however the set of commands is limited.
-Each command will indicate the mode (server, copy, all) in which it is
-available.
+The description of each command in this document indicate the mode
+(server, copy, all) in which it is available.
 
 The first thing the server will do is authenticate the client and check
-authorisation.
+authorisation. This will also determine which commands a user will be allowed
+to issue.
 
 For Unix domain connections, the server looks up the user ID of the client,
 and translates it to a user name: if the user is listed in a configuration
@@ -46,6 +47,16 @@ username and password. This can be in a configuration file using options
 although this is not secure. If either is missing, the program will
 prompt the user.
 
+The username determines which operations are allowed (depending on the
+server's allow_unix and allow_tcp options). The description of each
+command in this document indicates the required permission after the
+mode, for example (all, stop) means that the command is available in
+all modes and requires the "stop" permission, and (server, read) means
+that the command is available in server mode and requires the "read"
+permission; "any" means that the command is available as long as the
+user can connect, although the result may deepend on the actual
+permissions available.
+
 Once authentication and authorisation succeed, the client starts issuing
 commands and waiting for replies from the server, until the connection
 is dropped or the client issues the "QUIT" command. Each line from the
@@ -80,7 +91,7 @@ end of the multiline reply.
 The following commands are recognised by the current server code:
 
 EXTENSIONS
-(all)
+(all, any)
     This command is only available in version 1.1 or later of the
     protocol; a server using an older version will return an error.
 
@@ -104,13 +115,28 @@ EXTENSIONS
     UPDATE
 	The server supports the UPDATE command.
 
+DEBUG
+(all, debug)
+    The server will produce extra debugging information about this client's
+    connection, even if started without debugging.
+
+NODEBUG
+(all, debug)
+    The server will not produce extra debugging information about this client's
+    connection, even if started with debugging.
+
+QUIT
+(all, any)
+    The server will close connection. This command is always successful.
+
 STOP
-(all)
-    The server will stop as soon as the current client has disconnected.
+(all, stop)
+    The server will stop; the current connection is closed as soon as the
+    command is processed, so there is no need to issue a QUIT as well.
     This command is always successful.
 
 STATUS
-(all)
+(all, status)
     The server sends a multiline reply, terminated with a line containing a
     single dot. Each line in the reply has the format: "KEYWORD: NUMBER",
     and the server currently sends the following:
@@ -157,33 +183,37 @@ STATUS
     read_file_num      event file number being processed
     read_file_pos      position in event file
     pending_dirsyncs   number of paths in the current dirsync queue
+    bytes_received     total number of bytes received from server
+    bytes_sent         total number of bytes sent to server
+    file_data_total    total size of file data copied
+    file_data_xfer     size of file data actually copied
 
     Older servers did not send server_mode; however they did not listen
     for commands in copy mode, so if this keyword is missing the client
     can assume that the server is operating in server mode.
 
 ADD (watch)
-(server)
+(server, add)
     The server prepares to add a watch on the directory specified. Data
     structures are allocated at this point, but the watch is not added yet,
     waiting for the client to provide any further options.
 
 CROSS
-(server)
+(server, add)
     Completes a current ADD command. The server will find all subdirectories
     within the path to watch, crossing filesystem boundaries, and add all
     these subdirectories to the current watch list. The "OK" message will
     contain the number of subdirectories added.
 
 NOCROSS
-(server)
+(server, add)
     Completes a current ADD command. The server will find all subdirectories
     within the path to watch, but won't cross filesystem boundaries, and add
     all these subdirectories to the current watch list. The "OK" message will
     contain the number of subdirectories added.
 
 EXCL NAME|PATH EXACT|ICASE|GLOB|IGLOB (match)
-(server)
+(server, add)
     This command must be between an ADD and its closing CROSS/NOCROSS. It
     indicates that subdirectories must be excluded: NAME or PATH specifies
     whether the "match" applies to a name or a full path; EXACT means that
@@ -194,7 +224,7 @@ EXCL NAME|PATH EXACT|ICASE|GLOB|IGLOB (match)
     exclude more things.
 
 FIND NAME|PATH EXACT|ICASE|GLOB|IGLOB (match)
-(server)
+(server, add)
     This command must be between an ADD and its closing CROSS/NOCROSS. It
     modifies the ADD command by first finding all matching subdirectories
     within the "watch" specified by ADD, then executing a separate ADD
@@ -233,29 +263,29 @@ FIND NAME|PATH EXACT|ICASE|GLOB|IGLOB (match)
     /home/user/dir3/f
 
 REMOVE (watch)
-(server)
+(server, remove)
     The server removes the watch and all its subdirectories from its list of
     current watches. There is no find/exclude mechanism like for ADD, but a
     client can always get the list of watches, select the ones to remove, and
     then issue the corresponding REMOVE commands.
 
 CLOSELOG
-(all)
+(all, closelog)
     The server closes the current log file (it will reopen it next time it
     needs to write to it). This can be used after log rotation.
 
 ENCRYPT
-(all)
+(all, read)
     The server and the client will negotiate a link encryption mechanism.
     This command is only supported if the server returns LINK_ENCRYPTION
     in reply to the "EXTENSIONS" command.
 
 PURGE d
-(server)
+(server, purge)
     The server removes event files older than d days. d must be >= 2.
 
 GETDIR (path) translate?
-(server)
+(server, read)
     reads the given directory and returns a multiline reply with one of
     the following formats (depending on whether "translate?" is zero or
     nonzero):
@@ -278,7 +308,7 @@ GETDIR (path) translate?
     A line containing just a "." terminates the list.
 
 STAT (path) translate?
-(server)
+(server, read)
     executes lstat on the path, and returns the same information as GETDIR,
     omitting the name:
 
@@ -286,24 +316,24 @@ STAT (path) translate?
     OK type dnum ino mode uname uid gname gid size mtime ctime rmaj rmin (target)
 
 STATFS (path)
-(server)
+(server, read)
     returns filesystem status for the filesystem on which path is mounted.
     The result will be like:
 
     OK blocksize blocktotal blockfree blockavail files ffree favail rw?
 
 OPEN (path)
-(server)
+(server, read)
     Opens a file for reading on the server. This is used before copying the
     file data. Only one file can be open for reading at any time (for each
     client), so if another one is open it will be closed first.
 
 CLOSEFILE
-(server)
+(server, read)
     Closes any file currently open for reading.
 
-DATA start size [checksum]
-(server)
+DATA start size
+(server, read)
     Reads a data block of up to "size" bytes starting at position "start".
     This uses the file currently open for reading, and the command must be
     between an OPEN and a CLOSEFILE. The reply will contain a number
@@ -317,7 +347,7 @@ DATA start size [checksum]
     data size, the second one the uncompressed.
 
 CHECKSUM start size
-(server)
+(server, read)
     This command is only available if the server lists CHECKSUM in reply to
     the EXTENSIONS command.
 
@@ -332,7 +362,7 @@ CHECKSUM start size
     on the client. This option is only available if
 
 SETCHECKSUM name
-(server)
+(server, read)
     This command is only available if the server lists CHECKSUM in reply to
     the EXTENSIONS command.
 
@@ -340,7 +370,7 @@ SETCHECKSUM name
     default MD5 to another supported method.
 
 LISTCHECKSUM
-(server)
+(server, read or getconf)
     This command is only available if the server lists CHECKSUM in reply to
     the EXTENSIONS command.
 
@@ -350,36 +380,36 @@ LISTCHECKSUM
     indicates the end of the list.
 
 BWLIMIT n
-(server)
+(server, read)
     Asks the next DATA commands to limit bandwidth to n kilobytes/second.
     The limit is an average, and the data may be produced in small bursts.
     A value of 0 removes any existing limit.
 
 COMPRESS name
-(server)
+(server, read)
     Asks the next DATA commands to compress the data using the given
     compression method. For best result, use a large-ish data block in
     the DATA command.
 
 LISTCOMPRESS
-(server)
+(server, read or getconf)
     Returns a multiline result listing the compression methods supported.
     The lines in the reply are terminated with a normal newline rather
     than a carriage return, new line pair. A line containing just "__END__"
     indicates the end of the list.
 
 WATCHES
-(server)
+(server, watches)
     Returns a multiline reply, in which each watch in the current list is
     sent as size followed by path. A size 0 indicates the end of the list.
 
 CONFIG
-(all)
+(all, getconf)
     Returns the current server's configuration as a multiline reply.
     A line containing just "__END__" indicates the end of the configuration.
 
 SETROOT file pos (prefix) translate
-(server)
+(server, read)
     Prepares to send events from server to client. The "file" and "pos"
     numbers identify the event log file and position at which the server
     will start reading events (presumably this is where the client left
@@ -392,7 +422,7 @@ SETROOT file pos (prefix) translate
     send numeric user and group IDs (0) or names (nonzero).
 
 EVENT timeout max
-(server)
+(server, read)
     Requests the next event from the server; the server will wait up to
     "timeout" seconds for an event; a value of 0 means that the server will
     not wait at all for new events, but will still return events if they
@@ -474,7 +504,7 @@ EVENT timeout max
     7           unknown
 
 IGNORE evtype (file1) (file2)
-(server)
+(server, ignore)
     This command is only available if the server lists IGNORE in the reply
     to the EXTENSIONS command.
 
@@ -483,7 +513,7 @@ IGNORE evtype (file1) (file2)
     in a multi-master setup to prevent replication loops.
 
 DIRSYNC (path)
-(copy)
+(all, dirsync)
     This command is only available if the server lists DIRSYNC in the reply
     to the EXTENSIONS command.
 
@@ -492,7 +522,7 @@ DIRSYNC (path)
     the copy directory (use an empty path or "." for a full synchronisation).
 
 UPDATE (arg)
-(all)
+(all, setconf)
     This command is only available if the server lists UPDATE in the reply
     to the EXTENSIONS command.
 

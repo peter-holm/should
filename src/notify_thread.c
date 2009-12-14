@@ -91,6 +91,7 @@ struct notify_watch_s {
     notify_watch_t * next_name, * prev_name;
     notify_watch_t * parent;
     notify_watch_t * subdir[NAME_HASH];
+    const config_dir_t * how;
     watch_block_t * block_ptr;
     int valid;
     int name_hash;
@@ -146,6 +147,7 @@ static int notify_queue_block, overflow, too_big;
 static int event_count, watch_count, max_events, max_bytes;
 static int queue_events, queue_bytes, queue_blocks;
 static int notify_initial, watch_memory, watch_active, name_block;
+static config_dir_t * how_cache = NULL;
 
 #if NOTIFY == NOTIFY_INOTIFY
 static int inotify_fd = -1;
@@ -158,7 +160,7 @@ static watch_block_t * watches_by_inode;
 static watch_by_id_t * watches_by_id;
 static unsigned int notify_watch_block;
 
-static pthread_mutex_t queue_lock;
+static pthread_mutex_t queue_lock, how_lock;
 static pthread_cond_t queue_read_cond, queue_write_cond;
 
 static notify_watch_t ** watch_by_id, * root_watch;
@@ -386,32 +388,43 @@ static void deallocate_queue(void) {
     pthread_cond_destroy(&queue_write_cond);
     pthread_cond_destroy(&queue_read_cond);
     pthread_mutex_destroy(&queue_lock);
+    pthread_mutex_destroy(&how_lock);
 }
 
 /* initialise event queue */
 
 static const char * initialise_queue(const config_data_t * cfg) {
     int code;
-    name_block = 1 + cfg->intval[cfg_notify_name_block] / sizeof(free_name_t);
-    notify_queue_block = cfg->intval[cfg_notify_queue_block];
-    notify_initial = cfg->intval[cfg_notify_initial];
+    name_block = 1 + config_intval(cfg, cfg_notify_name_block) /
+		     sizeof(free_name_t);
+    notify_queue_block = config_intval(cfg, cfg_notify_queue_block);
+    notify_initial = config_intval(cfg, cfg_notify_initial);
     code = pthread_mutex_init(&queue_lock, NULL);
     if (code)
 	return error_sys_errno("initialise_queue", "pthread_mutex_init", code);
+    code = pthread_mutex_init(&how_lock, NULL);
+    if (code) {
+	pthread_mutex_destroy(&queue_lock);
+	return error_sys_errno("initialise_queue", "pthread_mutex_init", code);
+    }
     code = pthread_cond_init(&queue_read_cond, NULL);
     if (code) {
+	pthread_mutex_destroy(&how_lock);
 	pthread_mutex_destroy(&queue_lock);
 	return error_sys_errno("initialise_queue", "pthread_cond_init", code);
     }
     code = pthread_cond_init(&queue_write_cond, NULL);
     if (code) {
 	pthread_cond_destroy(&queue_read_cond);
+	pthread_mutex_destroy(&how_lock);
 	pthread_mutex_destroy(&queue_lock);
 	return error_sys_errno("initialise_queue", "pthread_cond_init", code);
     }
     first_block = NULL;
     queue_blocks = 0;
-    while (queue_blocks < cfg->intval[cfg_notify_initial] || queue_blocks < 1) {
+    while (queue_blocks < config_intval(cfg, cfg_notify_initial) ||
+	   queue_blocks < 1)
+    {
 	const char * err = allocate_block(NULL);
 	if (err) {
 	    deallocate_queue();
@@ -455,6 +468,57 @@ static int name_hash(const char * name) {
     return num % NAME_HASH;
 }
 
+static const config_dir_t * copy_how(const config_dir_t * how) {
+    /* see if we already have one of them */
+    config_dir_t * c;
+    int code = pthread_mutex_lock(&how_lock);
+    if (code) {
+	errno = code;
+	return NULL;
+    }
+    c = how_cache;
+    while (c) {
+	if (c->crossmount == how->crossmount) {
+	    const config_acl_cond_t * cm = c->exclude, * hm = how->exclude;
+	    while (cm && hm) {
+		if (cm->data_index != hm->data_index) break;
+		if (cm->how != hm->how) break;
+		if (strcmp(cm->pattern, hm->pattern) != 0) break;
+		cm = cm->next;
+		hm = hm->next;
+	    }
+	    if (! cm && ! hm) {
+		pthread_mutex_unlock(&how_lock);
+		return c;
+	    }
+	}
+	c = c->next;
+    }
+    /* need to allocate a new one */
+    c = mymalloc(sizeof(config_dir_t));
+    if (! c) {
+	int e = errno;
+	pthread_mutex_unlock(&how_lock);
+	errno = e;
+	return NULL;
+    }
+    c->exclude = NULL;
+    if (how->exclude) {
+	c->exclude = config_copy_acl_cond(how->exclude);
+	if (! c->exclude) {
+	    int e = errno;
+	    myfree(c);
+	    pthread_mutex_unlock(&how_lock);
+	    errno = e;
+	    return NULL;
+	}
+    }
+    c->next = how_cache;
+    how_cache = c;
+    pthread_mutex_unlock(&how_lock);
+    return c;
+}
+
 /* store watch in a block */
 
 static inline notify_watch_t * store_watch(dev_t device,
@@ -462,7 +526,8 @@ static inline notify_watch_t * store_watch(dev_t device,
 					   const char * name,
 					   notify_watch_t * parent,
 					   watch_block_t * wb,
-					   int offset)
+					   int offset,
+					   const config_dir_t * how)
 {
     int hash = name_hash(name), len = strlen(name), j;
     char * wname = allocate_watch_name(&wb->w[offset], len);
@@ -474,6 +539,13 @@ static inline notify_watch_t * store_watch(dev_t device,
     wb->w[offset].watch_id = -1;
     wb->w[offset].device = device;
     wb->w[offset].inode = inode;
+    if (how) {
+	wb->w[offset].how = copy_how(how);
+	if (! wb->w[offset].how)
+	    return NULL;
+    } else {
+	wb->w[offset].how = NULL;
+    }
     if (parent) {
 	wb->w[offset].next_name = parent->subdir[hash];
 	if (parent->subdir[hash])
@@ -496,7 +568,8 @@ static inline notify_watch_t * store_watch(dev_t device,
 static notify_watch_t * find_watch_by_inode(dev_t device,
 					    ino_t inode,
 					    const char * name,
-					    notify_watch_t * parent)
+					    notify_watch_t * parent,
+					    const config_dir_t * how)
 {
     unsigned int id = (unsigned int)device + (unsigned int)inode;
     unsigned int block = id / notify_watch_block;
@@ -511,7 +584,8 @@ static notify_watch_t * find_watch_by_inode(dev_t device,
 			return &wb->w[offset];
 	    } else if (name) {
 		/* we can allocate it here */
-		return store_watch(device, inode, name, parent, wb, offset);
+		return store_watch(device, inode, name, parent,
+				   wb, offset, how);
 	    }
 	}
 	wb = wb->next;
@@ -520,7 +594,7 @@ static notify_watch_t * find_watch_by_inode(dev_t device,
     if (! name) return NULL;
     wb = allocate_watch_block(block);
     if (! wb) return NULL;
-    return store_watch(device, inode, name, parent, wb, offset);
+    return store_watch(device, inode, name, parent, wb, offset, how);
 }
 
 /* find watch given its kernel ID */
@@ -945,18 +1019,19 @@ const char * notify_init(void) {
 	config_put(cfg);
 	return err;
     }
-    notify_watch_block = cfg->intval[cfg_notify_watch_block];
+    notify_watch_block = config_intval(cfg, cfg_notify_watch_block);
     /* in case we need to undo init midway */
     root_watch = NULL;
     watch_by_id = NULL;
     event_buffer = NULL;
     watches_by_inode = NULL;
     watches_by_id = NULL;
+    how_cache = NULL;
 #if NOTIFY == NOTIFY_INOTIFY
     inotify_fd = -1;
 #endif
     /* allocate event buffer */
-    buffer_size = cfg->intval[cfg_notify_buffer];
+    buffer_size = config_intval(cfg, cfg_notify_buffer);
     buffer_extra = buffer_size + sizeof(EVENT) + NAME_MAX + 32;
     event_buffer = mymalloc(buffer_extra);
     if (! event_buffer) {
@@ -979,11 +1054,11 @@ const char * notify_init(void) {
      * them to update our watch list */
     i_mask = IN_DELETE_SELF | CREATE_EVENT |
 	     IN_UNMOUNT | IN_Q_OVERFLOW | IN_IGNORED;
-    if (cfg->filter[config_event_meta]) i_mask |= ATTRIB_EVENT;
-    if (cfg->filter[config_event_data]) i_mask |= CHANGE_EVENT;
-    if (cfg->filter[config_event_create]) i_mask |= CREATE_EVENT;
-    if (cfg->filter[config_event_delete]) i_mask |= DELETE_EVENT;
-    if (cfg->filter[config_event_rename]) i_mask |= RENAME_EVENT;
+    if (config_intval(cfg, cfg_event_meta)) i_mask |= ATTRIB_EVENT;
+    if (config_intval(cfg, cfg_event_data)) i_mask |= CHANGE_EVENT;
+    if (config_intval(cfg, cfg_event_create)) i_mask |= CREATE_EVENT;
+    if (config_intval(cfg, cfg_event_delete)) i_mask |= DELETE_EVENT;
+    if (config_intval(cfg, cfg_event_rename)) i_mask |= RENAME_EVENT;
 #endif
     config_put(cfg);
     /* set up root watch */
@@ -994,7 +1069,7 @@ const char * notify_init(void) {
 	return err;
     }
     root_watch =
-	find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, "", NULL);
+	find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, "", NULL, NULL);
     if (! root_watch) {
 	err = error_sys("notify_init", "/");
 	deallocate_buffers();
@@ -1087,7 +1162,7 @@ const char * notify_thread(void) {
     int ov;
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &ov);
     while (main_running) {
-	config_filter_t filter[config_event_COUNT];
+	config_filter_t filter[cfg_event_COUNT];
 	const config_data_t * cfg;
 	int buffer_start = 0, buffer_end = 0, errcode, i, skip_should;
 #if NOTIFY == NOTIFY_INOTIFY
@@ -1104,9 +1179,9 @@ const char * notify_thread(void) {
 	    return "notify_thread: read: unexpected end of file";
 #endif
 	cfg = config_get();
-	for (i = 0; i < config_event_COUNT; i++)
-	    filter[i] = cfg->filter[i];
-	skip_should = cfg->intval[cfg_flags] & config_flag_skip_should;
+	for (i = 0; i < cfg_event_COUNT; i++)
+	    filter[i] = config_intval(cfg, i);
+	skip_should = config_intval(cfg, cfg_flags) & config_flag_skip_should;
 	config_put(cfg);
 	/* lock queue */
 	errcode = pthread_mutex_lock(&queue_lock);
@@ -1128,7 +1203,8 @@ const char * notify_thread(void) {
 	    /* handle all nameless events */
 #if NOTIFY == NOTIFY_INOTIFY
 	    if (evp->mask & IN_Q_OVERFLOW) {
-		queue_event(notify_overflow, 0, cfg->intval[cfg_notify_max],
+		queue_event(notify_overflow, 0,
+			    config_intval(cfg, cfg_notify_max),
 			    NULL, NULL, NULL, NULL, 1);
 		overflow++;
 		continue;
@@ -1184,9 +1260,10 @@ const char * notify_thread(void) {
 				find_watch_by_id(destp->wd);
 			    if (destw) {
 				buffer_start += sizeof(EVENT) + destp->len;
-				if (filter[config_event_rename] & filter_mask)
+				if (filter[cfg_event_rename] & filter_mask)
 				    rename_event(evp, evw, destp, destw, is_dir,
-						 cfg->intval[cfg_notify_max]);
+						 config_intval(cfg,
+							       cfg_notify_max));
 				continue;
 			    }
 			}
@@ -1197,27 +1274,56 @@ const char * notify_thread(void) {
 	    /* not a rename event, or from/to is not watched */
 	    if (evp->mask & CREATE_EVENT) {
 		evtype = notify_create;
-		filter_data = config_event_create;
-#if NOTIFY == NOTIFY_INOTIFY
+		filter_data = cfg_event_create;
 		if (is_dir) {
-		    notify_watch_t * added = notify_add(evw, evp->name);
-		    if (! added)
-			error_report(error_add_watch, errno, evp->name);
+		    int addit = 1;
+		    /* check if we do want to add this one */
+		    if (evw->how) {
+			int len = strlen(evp->name);
+			int pathlen = store_length(evw, len);
+			char path[pathlen + 1];
+			store_name(evw, evp->name, len, path, pathlen, 1);
+			if (! evw->how->crossmount) {
+			    /* check parent and subdir on same device */
+			    struct stat sp;
+			    addit = 0;
+			    if (stat(path, &sp) >= 0) {
+				struct stat sc;
+				char sv = path[pathlen - len];
+				path[pathlen - len] = 0;
+				if (stat(path, &sc) >= 0)
+				    addit = sp.st_dev == sc.st_dev;
+				path[pathlen - len] = sv;
+			    }
+			}
+			if (addit && evw->how->exclude) {
+			    /* check the name against the exclude list */
+			    const char * data[cfg_dacl_COUNT];
+			    data[cfg_dacl_name] = evp->name;
+			    data[cfg_dacl_path] = path;
+			    if (! config_check_acl_cond(evw->how->exclude, 0,
+							data, cfg_dacl_COUNT))
+				addit = 0;
+			}
+		    }
+		    if (addit) {
+			notify_watch_t * added =
+			    notify_add(evw, evp->name, evw->how);
+			if (! added)
+			    error_report(error_add_watch, errno, evp->name);
+		    }
 		}
-#endif
 	    } else if (evp->mask & DELETE_EVENT) {
 		evtype = notify_delete;
-		filter_data = config_event_delete;
-#if NOTIFY == NOTIFY_INOTIFY
+		filter_data = cfg_event_delete;
 		if (evp->mask & IN_ISDIR)
 		    notify_remove(evw, evp->name, 1);
-#endif
 	    } else if (evp->mask & CHANGE_EVENT) {
 		evtype = notify_change_data;
-		filter_data = config_event_data;
+		filter_data = cfg_event_data;
 	    } else if (evp->mask & ATTRIB_EVENT) {
 		evtype = notify_change_meta;
-		filter_data = config_event_meta;
+		filter_data = cfg_event_meta;
 	    } else {
 #if USE_SHOULDBOX
 		/* shouldn't happen(TM) */
@@ -1229,8 +1335,9 @@ const char * notify_thread(void) {
 	    }
 #if NOTIFY == NOTIFY_INOTIFY
 	    if (filter_data & filter_mask)
-		queue_event(evtype, is_dir, cfg->intval[cfg_notify_max], evw,
-			    evp->len > 0 ? evp->name : NULL, NULL, NULL, 1);
+		queue_event(evtype, is_dir, config_intval(cfg, cfg_notify_max),
+			    evw, evp->len > 0 ? evp->name : NULL,
+			    NULL, NULL, 1);
 #endif
 	}
 	/* if reader is waiting for data, let them know */
@@ -1264,18 +1371,28 @@ void notify_exit(void) {
 	pthread_mutex_unlock(&queue_lock);
     }
     deallocate_buffers();
+    while (how_cache) {
+	config_dir_t * this = how_cache;
+	how_cache = this->next;
+	this->find = NULL;
+	this->next = NULL;
+	this->path = NULL;
+	config_dir_free(this);
+    }
 }
 
 /* look up a directory by name and return the corresponding watch, if
  * found; if not found, return NULL if addit is 0, otherwise it will
  * try to add it: returns NULL if that is not possible. */
 
-notify_watch_t * notify_find_bypath(const char * path, int addit) {
+notify_watch_t * notify_find_bypath(const char * path,
+				    const config_dir_t * addit)
+{
     const config_data_t * cfg = config_get();
     struct stat sbuff;
     notify_watch_t * wc;
     int olddir, pathdir, e, p = -1;
-    int notify_max = cfg->intval[cfg_notify_max], com = 0;
+    int notify_max = config_intval(cfg, cfg_notify_max), com = 0;
     dev_t dev[MAXPATHCOM];
     ino_t ino[MAXPATHCOM];
     config_put(cfg);
@@ -1293,12 +1410,13 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 	errno = ENOTDIR;
 	return NULL;
     }
-    wc = find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, NULL, NULL);
+    wc = find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, NULL, NULL, addit);
     if (wc) {
 	if (addit && wc->watch_id < 0) {
 	    int wid, errcode;
 	    errcode = pthread_mutex_lock(&queue_lock);
 	    if (errcode) {
+		close(pathdir);
 		errno = errcode;
 		return NULL;
 	    }
@@ -1307,18 +1425,25 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 	    pthread_cond_signal(&queue_read_cond);
 	    pthread_mutex_unlock(&queue_lock);
 	    wid = ADDWATCH(path);
-	    if (wid < 0)
+	    if (wid < 0) {
+		int e = errno;
+		close(pathdir);
+		errno = e;
 		return NULL;
+	    }
 	    if (! set_watch_id(wc, wid)) {
 		int e = errno;
 		RMWATCH(wid);
+		close(pathdir);
 		errno = e;
 		return NULL;
 	    }
 	}
+	close(pathdir);
 	return wc;
     }
     if (! addit) {
+	close(pathdir);
 	errno = ENOENT;
 	return NULL;
     }
@@ -1357,7 +1482,7 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 	    goto error;
 	if (fstat(p, &sbuff) < 0)
 	    goto error;
-	wc = find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, NULL, NULL);
+	wc = find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, NULL, NULL, addit);
 	if (wc) {
 	    /* we found one we already know about */
 	    while (com > 0) {
@@ -1385,8 +1510,8 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 		    if (sbuff.st_dev != dev[com - 1])
 			continue;
 		    /* found it... */
-		    wc = find_watch_by_inode(sbuff.st_dev,
-					     sbuff.st_ino, E->d_name, wc);
+		    wc = find_watch_by_inode(sbuff.st_dev, sbuff.st_ino,
+					     E->d_name, wc, addit);
 		    if (! wc) {
 			e = errno;
 			closedir(D);
@@ -1408,6 +1533,7 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 		    perror("WARNING: cannot change back to original dir");
 		close(olddir);
 		close(pathdir);
+		olddir = pathdir = -1;
 		errcode = pthread_mutex_lock(&queue_lock);
 		if (errcode) {
 		    errno = errcode;
@@ -1438,15 +1564,17 @@ notify_watch_t * notify_find_bypath(const char * path, int addit) {
 	}
 	if (fchdir(p) < 0)
 	    goto error;
+	close(p);
+	p = -1;
     }
     /* we only get here if there's an error */
 error:
     e = errno;
     if (p >= 0) close(p);
-    if (fchdir(olddir) < 0)
+    if (olddir >= 0 && fchdir(olddir) < 0)
 	perror("WARNING: cannot change back to original dir");
-    close(pathdir);
-    close(olddir);
+    if (pathdir >= 0) close(pathdir);
+    if (olddir >= 0) close(olddir);
     errno = e;
     return NULL;
 }
@@ -1459,9 +1587,13 @@ void notify_remove_under(notify_watch_t * wp) {
 
 /* adds a directory watch; returns NULL, and sets errno, on error;
  * parent is an existing directory watch; name is relative to that
- * directory and must not contain directory separator characters */
+ * directory and must not contain directory separator characters;
+ * the last parameter just tells us how this was added, as this will
+ * be required when new directories are created inside this one */
 
-notify_watch_t * notify_add(notify_watch_t * parent, const char * path) {
+notify_watch_t * notify_add(notify_watch_t * parent, const char * path,
+			    const config_dir_t * how)
+{
     struct stat sbuff;
     notify_watch_t * wc;
     int wid, plen = path ? strlen(path) : -1;
@@ -1484,7 +1616,7 @@ notify_watch_t * notify_add(notify_watch_t * parent, const char * path) {
     }
     if (stat(full_path, &sbuff) < 0)
 	return NULL;
-    wc = find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, path, parent);
+    wc = find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, path, parent, how);
     if (! wc)
 	return NULL;
     if (wc->watch_id >= 0)
@@ -1502,7 +1634,8 @@ notify_watch_t * notify_add(notify_watch_t * parent, const char * path) {
 }
 
 /* removes a directory watch; returns 1 if found, 0 if not found,
- * -1 if found but has children; takes the same arguments as notify_add() */
+ * -1 if found but has children; parent and name are the same as
+ * notify_add() */
 
 int notify_remove(notify_watch_t * parent, const char * path, int recurse) {
     int hash = name_hash(path), namelen = strlen(path);
@@ -1533,6 +1666,7 @@ notify_watch_t * notify_root(void) {
 
 /* returns current queue status */
 
+#if NOTIFY == NOTIFY_INOTIFY
 static int get_proc(const char * name) {
     FILE * proc;
     int rv = -1;
@@ -1543,10 +1677,11 @@ static int get_proc(const char * name) {
     fclose(proc);
     return rv;
 }
+#endif
 
 void notify_status(notify_status_t * status) {
     const config_data_t * cfg = config_get();
-    status->queue_max = cfg->intval[cfg_notify_max] * notify_queue_block;
+    status->queue_max = config_intval(cfg, cfg_notify_max) * notify_queue_block;
     config_put(cfg);
     status->queue_bytes = queue_bytes;
     status->queue_min = notify_initial * notify_queue_block;
@@ -1559,10 +1694,15 @@ void notify_status(notify_status_t * status) {
     status->watches = watch_active;
     status->watchmem = watch_memory;
     status->events = event_count;
+#if NOTIFY == NOTIFY_INOTIFY
     status->kernel_max_watches =
 	get_proc("/proc/sys/fs/inotify/max_user_watches");
     status->kernel_max_events =
 	get_proc("/proc/sys/fs/inotify/max_queued_events");
+#else
+    status->kernel_max_watches = -1;
+    status->kernel_max_events = -1;
+#endif
 }
 
 /* returns next pending event; returns:
@@ -1771,6 +1911,49 @@ out:
 	read_block->write_space = notify_queue_block;
 	read_block = read_block->next;
 	if (! read_block) read_block = first_block;
+    }
+    /* have they just created a directory? */
+    if (nev->stat_valid &&
+	nev->file_type == notify_filetype_dir &&
+	nev->event_type == notify_create)
+    {
+	/* scan this directory and generate synthetic events for
+	 * everything already in it */
+	notify_watch_t * wp;
+	DIR * D;
+	wp = notify_find_bypath(nev->from_name, NULL);
+	D = opendir(nev->from_name);
+	if (wp && D) {
+	    int slen = strlen(nev->from_name);
+	    char sname[slen + NAME_MAX + 2];
+	    struct dirent * E;
+	    const config_data_t * cfg = config_get();
+	    config_filter_t filter = config_intval(cfg, cfg_event_create);
+	    config_filter_t filter_mask;
+	    int notify_max = config_intval(cfg, cfg_notify_max);
+	    config_put(cfg);
+	    strcpy(sname, nev->from_name);
+	    sname[slen++] = '/';
+	    while ((E = readdir(D)) != NULL) {
+		int len = strlen(E->d_name), is_dir;
+		struct stat ebuff;
+		if (E->d_name[0] == '.') {
+		    if (len == 1) continue;
+		    if (len == 2 && E->d_name[1] == '.') continue;
+		}
+		if (len > NAME_MAX) continue;
+		strcpy(sname + slen, E->d_name);
+		if (lstat(sname, &ebuff) < 0) continue;
+		is_dir = S_ISDIR(ebuff.st_mode);
+		filter_mask = is_dir ? config_file_dir : ~config_file_dir;
+		if (! (filter & filter_mask)) continue;
+		/* don't wait if there isn't space, but try to queue this */
+		queue_event(notify_create, S_ISDIR(ebuff.st_mode), notify_max,
+			    wp, E->d_name, NULL, NULL, 0);
+	    }
+	}
+	if (D)
+	    closedir(D);
     }
     /* somebody may be waiting for space */
     pthread_cond_signal(&queue_write_cond);

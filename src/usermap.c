@@ -55,6 +55,8 @@ int usermap_fromid(uid_t uid, char * uname, int usize) {
     if (getpwuid_r(uid, &pwd, ubuffer,
 		   sizeof(ubuffer), &pwb) < 0)
 	return 0;
+    if (! pwd.pw_name)
+	return -1;
     if (strlen(pwd.pw_name) >= usize)
 	return -1;
     strcpy(uname, pwd.pw_name);
@@ -76,6 +78,8 @@ int groupmap_fromid(gid_t gid, char * gname, int gsize) {
     if (getgrgid_r(gid, &grp, gbuffer,
 		   sizeof(gbuffer), &grb) < 0)
 	return 0;
+    if (! grp.gr_name)
+	return -1;
     if (strlen(grp.gr_name) >= gsize)
 	return -1;
     strcpy(gname, grp.gr_name);

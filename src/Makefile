@@ -51,7 +51,7 @@ clean :
 .PHONY : realclean
 
 realclean :
-	rm -f $(OBJECTS) $(THREADS) $(PROGRAMS) depend
+	rm -f $(OBJECTS) $(THREADS) $(PROGRAMS) depend configure.h
 
 .PHONY : TODO
 

@@ -48,10 +48,10 @@
 #include "mymalloc.h"
 #include "config.h"
 #include "notify_thread.h"
+#include "main_thread.h"
 #include "error.h"
 #include "usermap.h"
 
-#define CHALLENGE_SIZE 8
 #define AUXSIZE 256
 #define PACKETSIZE 8192
 
@@ -127,20 +127,21 @@ struct socket_s {
     enum { TYPE_CLIENT, TYPE_SERVER, TYPE_LISTEN } type;
     struct sockaddr_storage addr;
     int count;
-    union {
 #if defined UCRED
-	UCRED creds;             /* for UNIX domain */
+    UCRED creds;
 #endif
-	config_user_t * user;    /* for TCP sockets */
-    };
+    config_userop_t actions;
     char * username;
     char * password;
+    char * user;
     pid_t pid;
     int debug;
     int b_in;
     int r_in;
     int b_out;
     int autoflush;
+    long long recv;
+    long long sent;
     char p_in[PACKETSIZE];
     char p_out[PACKETSIZE];
 };
@@ -180,6 +181,9 @@ static int listen_unix(socket_t * p, const char * path) {
     p->b_out = 0;
     p->autoflush = 1;
     p->username = p->password = NULL;
+    p->user = NULL;
+    p->recv = 0;
+    p->sent = 0;
     return 1;
 }
 
@@ -207,6 +211,9 @@ static int listen_tcp(socket_t * p, const struct addrinfo * addr) {
     p->b_out = 0;
     p->autoflush = 1;
     p->username = p->password = NULL;
+    p->user = NULL;
+    p->recv = 0;
+    p->sent = 0;
     return 1;
 }
 #endif
@@ -216,7 +223,7 @@ static int listen_tcp(socket_t * p, const struct addrinfo * addr) {
 socket_t * socket_listen(void) {
     int count, acount;
     const config_data_t * cfg = config_get();
-    config_listen_t * L = cfg->listen;
+    const config_strlist_t * L = config_strlist(cfg, cfg_listen);
     socket_t * r;
 #ifdef THEY_HAVE_SSL
     typedef struct ailist_s ailist_t;
@@ -228,21 +235,32 @@ socket_t * socket_listen(void) {
 #endif
     count = 0;
     while (L) {
-	if (L->port) {
+	if (L->data[0] == '/') {
+	    count++;
+	} else {
 #ifdef THEY_HAVE_SSL
 	    int errcode;
 	    struct addrinfo hints, * ptr;
+	    const char * port, * host;
 	    ailist_t * ai = mymalloc(sizeof(ailist_t));
 	    if (! ai) {
 		config_put(cfg);
 		return NULL;
 	    }
 	    memset(&hints, 0, sizeof(hints));
-	    hints.ai_family = PF_UNSPEC;
+	    hints.ai_family = AF_UNSPEC;
 	    hints.ai_socktype = SOCK_STREAM;
 	    hints.ai_protocol = IPPROTO_TCP;
 	    hints.ai_flags = AI_PASSIVE;
-	    errcode = getaddrinfo(L->host, L->port, &hints, &ai->this);
+	    host = L->data;
+	    port = host + 1 + strlen(host);
+	    if (! *host) {
+		host = NULL;
+#ifndef __NetBSD__
+		hints.ai_family = AF_INET6;
+#endif
+	    }
+	    errcode = getaddrinfo(host, port, &hints, &ai->this);
 	    if (errcode) {
 		int e = EINVAL;
 		switch (errcode) {
@@ -284,8 +302,6 @@ socket_t * socket_listen(void) {
 	    errno = ENOSYS;
 	    return NULL;
 #endif /* THEY_HAVE_SSL */
-	} else {
-	    count++;
 	}
 	L = L->next;
     }
@@ -299,22 +315,22 @@ socket_t * socket_listen(void) {
 	config_put(cfg);
 	return NULL;
     }
-    L = cfg->listen;
+    L = config_strlist(cfg, cfg_listen);
     acount = 0;
     while (L) {
 	int ok;
-	if (! L->port) {
-	    ok = listen_unix(&r[acount], L->host);
+	if (L->data[0] == '/') {
+	    ok = listen_unix(&r[acount], L->data);
 	    if (! ok) {
 		int e = errno;
 		if (r[acount].r_fd >= 0) close(r[acount].r_fd);
 		myfree(r);
-		L = cfg->listen;
+		L = config_strlist(cfg, cfg_listen);
 		while (L && acount > 0) {
-		    if (! L->port) {
+		    if (L->data[0] == '/') {
 			acount--;
 			if (r[acount].r_fd >= 0) close(r[acount].r_fd);
-			unlink(L->host);
+			unlink(L->data);
 		    }
 		    L = L->next;
 		}
@@ -348,10 +364,10 @@ socket_t * socket_listen(void) {
 		    acount--;
 		    if (r[acount].r_fd) close(r[acount].r_fd);
 		}
-		L = cfg->listen;
+		L = config_strlist(cfg, cfg_listen);
 		while (L) {
-		    if (! L->port)
-			unlink(L->host);
+		    if (L->data[0] == '/')
+			unlink(L->data);
 		    L = L->next;
 		}
 		myfree(r);
@@ -393,6 +409,7 @@ static int receive_credentials_unix(const config_data_t * cfg, socket_t * p) {
     char buffvec[AUXSIZE], buffmsg[AUXSIZE];
     struct cmsghdr * cmsg;
 #endif
+    const config_acl_t * allow = config_aclval(cfg, cfg_acl_local);
 #if defined RECVOPTS
     if (setsockopt(p->r_fd, OPTLEVEL, RECVOPTS, &one, sizeof(int)) < 0)
 	return 0;
@@ -414,7 +431,9 @@ static int receive_credentials_unix(const config_data_t * cfg, socket_t * p) {
 	 cmsg = CMSG_NXTHDR(&auxdata, cmsg))
     {
 	if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == CREDTYPE) {
-	    p->creds = *(UCRED *)CMSG_DATA(cmsg);
+	    /* the extra variable is needed to keep gcc from throwing a fit */
+	    UCRED * ucred = (UCRED *)CMSG_DATA(cmsg);
+	    p->creds = *ucred;
 	    got_creds = 1;
 	}
     }
@@ -428,20 +447,15 @@ static int receive_credentials_unix(const config_data_t * cfg, socket_t * p) {
     }
 #endif /* GETCRED */
     if (! got_creds) {
-	if (cfg->users) {
-	    config_user_t * allow = cfg->users;
-	    while (allow) {
-		if (! allow->pass) {
-		    socket_puts(p, "EPERM Invalid username or password");
-		    errno = EPERM;
-		    return 0;
-		}
-		allow = allow->next;
-	    }
+	if (allow) {
+	    socket_puts(p, "EPERM Invalid username or password");
+	    errno = EPERM;
+	    return 0;
 	}
 	A->sun_path[len] = 0;
 	if (! socket_puts(p, "OK welcome"))
 	    return 0;
+	p->actions = config_op_all;
 	return 1;
     }
 #if defined PIDFIELD
@@ -450,22 +464,24 @@ static int receive_credentials_unix(const config_data_t * cfg, socket_t * p) {
     len += strlen(A->sun_path + len) + 1;
 #endif
 #if defined UIDFIELD
+    p->actions = config_op_all;
     if (usermap_fromid(p->creds.UIDFIELD,
 		       A->sun_path + len,
 		       sizeof(A->sun_path) - len) > 0)
     {
-	if (cfg->users) {
-	    config_user_t * allow = cfg->users;
-	    int found = 0, required = 0;
-	    while (allow) {
-		if (! allow->pass) {
-		    required = 1;
-		    if (strcmp(allow->user, A->sun_path + len) == 0)
-			found = 1;
-		}
-		allow = allow->next;
-	    }
-	    if (required && ! found) {
+	p->user = mystrdup(A->sun_path + len);
+	if (allow) {
+	    const char * data[cfg_uacl_COUNT];
+	    /* compare with stored userlist */
+	    data[cfg_uacl_ipv4] = NULL;
+	    data[cfg_uacl_ipv6] = NULL;
+	    data[cfg_uacl_path] = A->sun_path;
+	    data[cfg_uacl_user] = p->user;
+	    data[cfg_uacl_pass] = NULL;
+	    data[cfg_uacl_challenge] = NULL;
+	    data[cfg_uacl_checksum] = NULL;
+	    p->actions = config_check_acl(allow, data, cfg_uacl_COUNT, 0);
+	    if (! p->actions) {
 		socket_puts(p, "EPERM Invalid username or password");
 		errno = EPERM;
 		return 0;
@@ -476,21 +492,23 @@ static int receive_credentials_unix(const config_data_t * cfg, socket_t * p) {
     } else {
 	snprintf(A->sun_path + len, sizeof(A->sun_path) - len,
 		 "uid#%d:", p->creds.UIDFIELD);
-	if (cfg->users) {
-	    config_user_t * allow = cfg->users;
-	    while (allow) {
-		if (! allow->pass) {
-		    /* we have user checking, but no way to check */
-		    errno = EPERM;
-		    return 0;
-		}
-		allow = allow->next;
-		break;
-	    }
+	if (allow) {
+	    /* we have user checking, but no way to check */
+	    errno = EPERM;
+	    return 0;
 	}
 	len += strlen(A->sun_path + len);
     }
-#endif
+#else /* UIDFIELD */
+    while (allow) {
+	if (! allow->pass) {
+	    socket_puts(p, "EPERM Invalid username or password");
+	    errno = EPERM;
+	    return 0;
+	}
+	allow = allow->next;
+    }
+#endif /* UIDFIELD */
 #if defined GIDFIELD
     if (groupmap_fromid(p->creds.GIDFIELD,
 			A->sun_path + len,
@@ -502,28 +520,6 @@ static int receive_credentials_unix(const config_data_t * cfg, socket_t * p) {
 	return 0;
     return 1;
 }
-
-/* generates hash from user, password, challenge */
-
-#ifdef THEY_HAVE_SSL
-static void hash_user(const char * user, const char * pass, int ctype,
-		      const unsigned char * challenge, unsigned char * hash)
-{
-    int ulen = user ? strlen(user) : 0, plen = pass ? strlen(pass) : 0;
-    char data[2 + CHALLENGE_SIZE + ulen + plen], * dptr = data;
-    if (user) {
-	strcpy(dptr, user);
-	dptr += ulen;
-    }
-    memcpy(dptr, challenge, CHALLENGE_SIZE);
-    dptr += CHALLENGE_SIZE;
-    if (pass) {
-	strcpy(dptr, pass);
-	dptr += plen;
-    }
-    checksum_data(ctype, data, ulen + plen + CHALLENGE_SIZE, hash);
-}
-#endif
 
 /* receive credentials from a TCP socket */
 
@@ -551,7 +547,7 @@ static int receive_credentials_tcp(const config_data_t * cfg, socket_t * p) {
     int csmax = max_csize(count), i, wp = 0, ulen, ctype, cslen;
     char welcome[2 * CHALLENGE_SIZE + 2 * csmax + cname + 32];
     unsigned char challenge[CHALLENGE_SIZE], hash[csmax];
-    config_user_t * allow = cfg->users;
+    const char * data[cfg_uacl_COUNT];
     RAND_bytes(challenge, CHALLENGE_SIZE);
     /* send welcome string, challenge and supported checksum methods */
     wp += sprintf(welcome + wp, "SHOULD [");
@@ -597,32 +593,33 @@ static int receive_credentials_tcp(const config_data_t * cfg, socket_t * p) {
 	val[1] = welcome[wp++];
 	hash[i] = strtol(val, NULL, 16);
     }
-    /* compare with stored userlist */
-    while (allow) {
-	if (allow->pass) {
-	    if (strlen(allow->user) == ulen) {
-		if (strncmp(allow->user, welcome, ulen) == 0) {
-		    unsigned char hashcmp[cslen];
-		    p->user = allow;
-		    /* for testing only: empty password */
-		    if (! *allow->pass)
-			goto welcome;
-		    hash_user(allow->user, allow->pass, ctype,
-			      challenge, hashcmp);
-		    if (memcmp(hash, hashcmp, cslen) == 0)
-			goto welcome;
-		    goto noperm;
-		}
-	    }
-	}
-	allow = allow->next;
-    }
-    goto noperm;
-welcome:
-    if (! socket_puts(p, "OK welcome"))
+    p->user = mymalloc(1 + ulen);
+    if (! p->user)
 	return 0;
-    return 1;
-noperm:
+    strncpy(p->user, welcome, ulen);
+    p->user[ulen] = 0;
+    /* compare with stored userlist */
+    if (p->family == AF_INET) {
+	const struct sockaddr_in * S = (const struct sockaddr_in *)&p->addr;
+	data[cfg_uacl_ipv4] = (char *)&S->sin_addr;
+	data[cfg_uacl_ipv6] = NULL;
+    } else {
+	const struct sockaddr_in6 * S = (const struct sockaddr_in6 *)&p->addr;
+	data[cfg_uacl_ipv4] = NULL;
+	data[cfg_uacl_ipv6] = (char *)&S->sin6_addr;
+    }
+    data[cfg_uacl_path] = NULL;
+    data[cfg_uacl_user] = p->user;
+    data[cfg_uacl_pass] = (char *)hash;
+    data[cfg_uacl_challenge] = (char *)challenge;
+    data[cfg_uacl_checksum] = (char *)&ctype;
+    p->actions = config_check_acl(config_aclval(cfg, cfg_acl_tcp),
+				  data, cfg_uacl_COUNT, 0);
+    if (p->actions) {
+	if (! socket_puts(p, "OK welcome"))
+	    return 0;
+	return 1;
+    }
     socket_puts(p, "EPERM Invalid username or password");
     errno = EPERM;
     return 0;
@@ -688,12 +685,16 @@ socket_t * socket_accept(socket_t * p, int timeout) {
     c->r_in = 0;
     c->b_out = 0;
     c->username = c->password = NULL;
+    c->user = NULL;
+    c->recv = 0;
+    c->sent = 0;
     cfg = config_get();
-    c->debug = cfg->intval[cfg_flags] & config_flag_debug_server;
+    c->debug = config_intval(cfg, cfg_flags) & config_flag_debug_server;
     if (c->family == PF_UNIX) {
 	if (! receive_credentials_unix(cfg, c)) {
 	    int e = errno;
 	    close(fd);
+	    if (c->user) myfree(c->user);
 	    myfree(c);
 	    config_put(cfg);
 	    errno = e;
@@ -705,6 +706,7 @@ socket_t * socket_accept(socket_t * p, int timeout) {
 	if (! receive_credentials_tcp(cfg, c)) {
 	    int e = errno;
 	    close(fd);
+	    if (c->user) myfree(c->user);
 	    myfree(c);
 	    config_put(cfg);
 	    errno = e;
@@ -720,12 +722,12 @@ socket_t * socket_accept(socket_t * p, int timeout) {
 
 static int get_user(socket_t * p, const config_data_t * cfg) {
     static char ubuffer[AUXSIZE], pbuffer[AUXSIZE];
-    char * user, * pass;
-    if (cfg->strval[cfg_user]) {
-	user = cfg->strval[cfg_user];
-    } else {
+    const char * user, * pass, * server;
+    user = config_strval(cfg, cfg_user);
+    server = config_strval(cfg, cfg_server);
+    if (! user) {
 	int i;
-	fprintf(stderr, "User for %s: ", cfg->server.host);
+	fprintf(stderr, "User for %s: ", server);
 	fflush(stderr);
 	if (! fgets(ubuffer, sizeof(ubuffer), stdin))
 	    return 0;
@@ -736,12 +738,11 @@ static int get_user(socket_t * p, const config_data_t * cfg) {
     p->username = mystrdup(user);
     if (! p->username)
 	return 0;
-    if (cfg->strval[cfg_password]) {
-	pass = cfg->strval[cfg_password];
-    } else {
+    pass = config_strval(cfg, cfg_password);
+    if (! pass) {
 	struct termios T;
 	int ok, ok2, i;
-	fprintf(stderr, "Password for %s@%s: ", user, cfg->server.host);
+	fprintf(stderr, "Password for %s@%s: ", user, server);
 	fflush(stderr);
 	ok = tcgetattr(fileno(stdin), &T) >= 0;
 	if (ok) {
@@ -770,25 +771,17 @@ static int get_user(socket_t * p, const config_data_t * cfg) {
 static int connect_tunnel(const config_data_t * cfg, socket_t * p) {
     int fromchild[2], tochild[2], cmdlen = 0, shouldlen = 0, connlen;
     pid_t pid;
-    char * const * tptr = cfg->tunnel;
+    char * const * tptr = config_strarr(cfg, cfg_strarr_tunnel);
     while (tptr[cmdlen]) cmdlen++;
-    tptr = cfg->remote_should;
+    tptr = config_strarr(cfg, cfg_strarr_remote_should);
     if (tptr && tptr[0])
 	while (tptr[shouldlen]) shouldlen++;
     else
 	shouldlen = 1;
-    if (cfg->intval[cfg_flags] & config_flag_socket_changed) {
-	if (cfg->server.port) {
-	    if (! get_user(p, cfg))
-		return 0;
-	    connlen = 80 + strlen(cfg->server.host) + strlen(cfg->server.port)
-			 + strlen(p->username);
-	} else {
-	    connlen = 8 + strlen(cfg->server.host);
-	}
-    } else {
+    if (config_intval(cfg, cfg_flags) & config_flag_socket_changed)
+	connlen = 8 + config_strlen(cfg, cfg_server);
+    else
 	connlen = 1;
-    }
     if (pipe(fromchild) < 0) {
 	perror("pipe");
 	return 0;
@@ -811,7 +804,8 @@ static int connect_tunnel(const config_data_t * cfg, socket_t * p) {
     }
     if (pid == 0) {
 	/* child process */
-	char * command[cmdlen + shouldlen + 6], conndata[connlen], * ecd;
+	char * command[cmdlen + shouldlen + 6];
+	char conndata[connlen], * ecd;
 	int i, ptr;
 	close(fromchild[0]);
 	close(tochild[1]);
@@ -832,19 +826,23 @@ static int connect_tunnel(const config_data_t * cfg, socket_t * p) {
 	}
 	ecd = conndata;
 	ptr = 0;
+	tptr = config_strarr(cfg, cfg_strarr_tunnel);
 	for (i = 0; i < cmdlen; i++)
-	    command[ptr++] = cfg->tunnel[i];
-	if (cfg->remote_should && cfg->remote_should[0])
+	    command[ptr++] = tptr[i];
+	tptr = config_strarr(cfg, cfg_strarr_remote_should);
+	if (tptr && tptr[0])
 	    for (i = 0; i < shouldlen; i++)
-		command[ptr++] = cfg->remote_should[i];
+		command[ptr++] = tptr[i];
 	else
 	    command[ptr++] = "should";
-	if (cfg->intval[cfg_flags] & config_flag_socket_changed) {
-	    if (cfg->server.port)
-		sprintf(ecd, "server=%s:%s", 
-			cfg->server.host, cfg->server.port);
-	    else
-		sprintf(ecd, "server=%s", cfg->server.host);
+	if (config_intval(cfg, cfg_flags) & config_flag_socket_changed) {
+	    const char * sp = config_strval(cfg, cfg_server);
+	    if (sp[0] == '/') {
+		sprintf(ecd, "server=%s", sp);
+	    } else {
+		const char * pn = sp + 1 + strlen(sp);
+		sprintf(ecd, "server=%s:%s", sp, pn);
+	    }
 	    command[ptr++] = ecd;
 	    ecd += 1 + strlen(ecd);
 	}
@@ -891,7 +889,7 @@ static int connect_unix(const config_data_t * cfg, socket_t * p) {
 #if defined SENDOPTS
     int one;
 #endif
-    if (strlen(cfg->server.host) >= sizeof(addr->sun_path)) {
+    if (config_strlen(cfg, cfg_server) >= sizeof(addr->sun_path)) {
 	errno = ENAMETOOLONG;
 	return 0;
     }
@@ -900,7 +898,7 @@ static int connect_unix(const config_data_t * cfg, socket_t * p) {
     if (p->r_fd < 0)
 	return 0;
     addr->sun_family = AF_UNIX;
-    strcpy(addr->sun_path, cfg->server.host);
+    strcpy(addr->sun_path, config_strval(cfg, cfg_server));
     if (connect(p->r_fd, (struct sockaddr *)addr, sizeof(*addr)) < 0)
 	return 0;
 #if defined SENDOPTS
@@ -958,14 +956,16 @@ invalid:
 static int connect_tcp(const config_data_t * cfg, socket_t * p) {
     struct addrinfo * ai, hints, * ptr;
     int errcode;
+    const char * host, * port;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
     hints.ai_flags = 0;
-    errcode = getaddrinfo(cfg->server.host, cfg->server.port, &hints, &ai);
+    host = config_strval(cfg, cfg_server);
+    port = host + 1 + strlen(host);
+    errcode = getaddrinfo(host, port, &hints, &ai);
     if (errcode) {
-	myfree(p);
 	switch (errcode) {
 #ifdef EAI_ADDRFAMILY
 	    case EAI_ADDRFAMILY :
@@ -1051,7 +1051,8 @@ static int send_credentials_tcp(const config_data_t * cfg, socket_t * p) {
     while (welcome[wp] && isspace((int)welcome[wp])) wp++;
     /* see if they provided a list of recognised methods, if so select one */
     if (welcome[wp]) {
-	int known[count];
+	int known[count], nv;
+	const int * dp;
 	ctype = -1;
 	for (i = 0; i < count; i++)
 	    known[i] = 0;
@@ -1064,9 +1065,10 @@ static int send_credentials_tcp(const config_data_t * cfg, socket_t * p) {
 	    mi = checksum_byname(mn);
 	    if (mi >= 0 && mi < count) known[mi] = 1;
 	}
-	for (i = 0; i < cfg->intval[cfg_nchecksums] && ctype < 0; i++) {
-	    int mi = cfg->checksums[i];
-	    if (mi >= 0 && mi < count && known[mi]) ctype = mi;
+	nv = config_intarr_len(cfg, cfg_checksums);
+	dp = config_intarr_data(cfg, cfg_checksums);
+	for (i = 0; i < nv && ctype < 0; i++) {
+	    if (dp[i] >= 0 && dp[i] < count && known[dp[i]]) ctype = dp[i];
 	}
 	for (i = 0; i < count && ctype < 0; i++) {
 	    if (known[i]) ctype = i;
@@ -1082,7 +1084,7 @@ static int send_credentials_tcp(const config_data_t * cfg, socket_t * p) {
     if (csize < 0 || csize >= csmax)
 	goto invalid;
     /* prepare hash and send identification string */
-    hash_user(p->username, p->password, ctype, challenge, hash);
+    config_hash_user(p->username, p->password, ctype, challenge, hash);
     strcpy(welcome, p->username);
     wp = strlen(welcome);
     welcome[wp++] = ' ';
@@ -1123,6 +1125,8 @@ socket_t * socket_connect(void) {
     const config_data_t * cfg;
     socket_t * p = mymalloc(sizeof(socket_t));
     int ok;
+    char * const * tptr;
+    const char * server;
     if (! p) return NULL;
     p->w_fd = p->r_fd = -1;
     memset(&p->addr, 0, sizeof(p->addr));
@@ -1132,11 +1136,16 @@ socket_t * socket_connect(void) {
     p->autoflush = 1;
     p->pid = -1;
     p->username = p->password = NULL;
+    p->user = NULL;
+    p->recv = 0;
+    p->sent = 0;
     cfg = config_get();
-    p->debug = cfg->intval[cfg_flags] & config_flag_debug_server;
-    if (cfg->tunnel) {
+    tptr = config_strarr(cfg, cfg_strarr_tunnel);
+    p->debug = config_intval(cfg, cfg_flags) & config_flag_debug_server;
+    server = config_strval(cfg, cfg_server);
+    if (tptr && tptr[0]) {
 	ok = connect_tunnel(cfg, p);
-    } else if (cfg->server.port) {
+    } else if (server[0] != '/') {
 #ifdef THEY_HAVE_SSL
 	ok = connect_tcp(cfg, p);
 #else
@@ -1159,7 +1168,10 @@ socket_t * socket_connect(void) {
 	return NULL;
     }
 #ifdef THEY_HAVE_SSL
-    if (cfg->server.port && ! cfg->tunnel && ! send_credentials_tcp(cfg, p)) {
+    if (server[0] != '/' &&
+	! (tptr && tptr[0]) &&
+	! send_credentials_tcp(cfg, p))
+    {
 	int e = errno, ws;
 	if (p->w_fd >= 0 && p->w_fd != p->r_fd) close(p->w_fd);
 	if (p->pid >= 0) waitpid(p->pid, &ws, 0);
@@ -1186,7 +1198,10 @@ const char * socket_user(const socket_t * p) {
     if (p->type == TYPE_SERVER) {
 	switch (p->family) {
 	    case AF_INET :
-	    case AF_INET6 : return p->user->user;
+	    case AF_INET6 :
+		if (p->user)
+		    return p->user;
+		break;
 	    case AF_UNIX :  {
 		const char * A = ((struct sockaddr_un *)&p->addr)->sun_path;
 		if (A) A += 1 + strlen(A);
@@ -1205,6 +1220,18 @@ const char * socket_password(const socket_t * p) {
 	return p->password;
     return NULL;
 }
+
+config_userop_t socket_actions(const socket_t * p) {
+    if (p->type == TYPE_SERVER)
+	return p->actions;
+    return 0;
+}
+
+void socket_stats(socket_t * p, long long * recv, long long * sent) {
+    *recv = p->recv;
+    *sent = p->sent;
+}
+
 /* closes connection */
 
 void socket_disconnect(socket_t * p) {
@@ -1221,6 +1248,7 @@ void socket_disconnect(socket_t * p) {
 	}
 	if (p[i].username) myfree(p[i].username);
 	if (p[i].password) myfree(p[i].password);
+	if (p[i].user) myfree(p[i].user);
     }
     myfree(p);
 }
@@ -1244,6 +1272,7 @@ static int flushit(socket_t * p) {
 	    errno = EBADF;
 	    return 0;
 	}
+	p->sent += nw;
 	n -= nw;
 	s += nw;
     }
@@ -1306,11 +1335,37 @@ void socket_autoflush(socket_t * p, int af) {
 
 static int getin(socket_t * p) {
     ssize_t nr;
+    struct pollfd pfd;
+    int nfd;
+    /* wait for data or a signal */
+    while (main_running) {
+	pfd.fd = p->r_fd;
+	pfd.events = POLLIN | POLLHUP;
+	nfd = poll(&pfd, 1, POLL_TIME);
+	if (nfd < 1) {
+	    if (errno != EINTR) continue;
+	    p->b_in = p->r_in = 0;
+	    return 0;
+	}
+	if (pfd.revents & POLLHUP) {
+	    errno = EINTR;
+	    p->b_in = p->r_in = 0;
+	    return 0;
+	}
+	if (pfd.revents & POLLIN)
+	    break;
+    }
+    if (! main_running) {
+	errno = EINTR;
+	p->b_in = p->r_in = 0;
+	return 0;
+    }
     nr = read(p->r_fd, p->p_in, PACKETSIZE);
     if (nr < 0) {
 	p->b_in = p->r_in = 0;
 	return 0;
     }
+    p->recv += nr;
     p->b_in = nr;
     p->r_in = 0;
     if (nr == 0) {
@@ -1339,7 +1394,7 @@ int socket_get(socket_t * p, void * _d, int l) {
 	int avail = p->b_in - p->r_in;
 	if (avail < 1) {
 	    if (! getin(p))
-		return -1;
+		return 0;
 	    avail = p->b_in - p->r_in;
 	    if (avail == 0)
 		return 0;

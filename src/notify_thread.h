@@ -29,6 +29,7 @@
 #define OUR_INOTIFY             11
 
 #include <sys/types.h>
+#include "config.h"
 
 /* type used to identify a single event */
 
@@ -83,22 +84,22 @@ typedef struct {
 /* type used to return information about queue usage */
 
 typedef struct {
-    int queue_events;  /* number of events awaiting processing */
-    int queue_bytes;   /* space allocated to the queue */
-    int queue_min;     /* minimum queue space */
-    int queue_max;     /* maximum queue space */
-    int queue_cur;     /* allocated queue space */
-    int max_events;    /* maximum value of queue_events observed */
-    int max_bytes;     /* maximum value of queue_bytes observed */
-    int overflow;      /* queue overflow count, if nonzero it suggests
-                        * that the kernel queue should be increased */
-    int too_big;       /* number of events which did not fit in buffer.
-                        * if nonzero increase blocksize */
-    int watches;       /* number of watches currently active */
-    int watchmem;      /* memory allocated to watches */
-    int events;        /* total number of events since startup */
-    int kernel_max_watches;
-    int kernel_max_events;
+    int queue_events;       /* number of events awaiting processing */
+    int queue_bytes;        /* space allocated to the queue */
+    int queue_min;          /* minimum queue space */
+    int queue_max;          /* maximum queue space */
+    int queue_cur;          /* allocated queue space */
+    int max_events;         /* maximum value of queue_events observed */
+    int max_bytes;          /* maximum value of queue_bytes observed */
+    int overflow;           /* queue overflow count, if nonzero it suggests
+			     * that the kernel queue should be increased */
+    int too_big;            /* number of events which did not fit in buffer.
+			     * if nonzero increase blocksize */
+    int watches;            /* number of watches currently active */
+    int watchmem;           /* memory allocated to watches */
+    int events;             /* total number of events since startup */
+    int kernel_max_watches; /* value of sysconf(fs:inotify:max_user_watches) */
+    int kernel_max_events;  /* value of sysconf(fs:inotify:max_queued_events) */
 } notify_status_t;
 
 #if NOTIFY != NOTIFY_NONE
@@ -122,10 +123,12 @@ const char * notify_thread(void);
 void notify_exit(void);
 
 /* look up a directory by name and return the corresponding watch, if
- * found; if not found, return NULL if addit is 0, otherwise it will
- * try to add it: returns NULL if that is not possible. */
+ * found; if not found, return NULL if addit is NULL, otherwise it will
+ * try to add it: returns NULL if that is not possible; the value
+ * of addit is the same as for notify_add */
 
-notify_watch_t * notify_find_bypath(const char * path, int addit);
+notify_watch_t * notify_find_bypath(const char * path,
+				    const config_dir_t * addit);
 
 /* remove a watch and all its subdirectories */
 
@@ -133,12 +136,16 @@ void notify_remove_under(notify_watch_t *);
 
 /* adds a directory watch; returns NULL, and sets errno, on error;
  * parent is an existing directory watch; name is relative to that
- * directory and must not contain directory separator characters */
+ * directory and must not contain directory separator characters;
+ * the last parameter just tells us how this was added, as this will
+ * be required when new directories are created inside this one */
 
-notify_watch_t * notify_add(notify_watch_t * parent, const char * name);
+notify_watch_t * notify_add(notify_watch_t * parent, const char * name,
+			    const config_dir_t * how);
 
 /* removes a directory watch; returns 1 if found, 0 if not found,
- * -1 if found but has children; takes the same arguments as notify_add() */
+ * -1 if found but has children; parent and name are the same as
+ * notify_add */
 
 int notify_remove(notify_watch_t * parent, const char * name, int recurse);
 

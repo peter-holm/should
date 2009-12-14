@@ -1,0 +1,62 @@
+Changes from 1.0.-5 to 1.0.-4:
+
+* Added a mask of allowed operations to allow_unix and allow_tcp so that
+  users can be given limited control. They also check for duplicate users,
+  and merge all the permissions together. Likewise, disallow_unix and
+  disallow_tcp remove permissions from an existing user, and remove the
+  whole user if no permissions are left.
+
+* Allowed quoting in commands (tunnel and remote_should) so that components
+  can have spaces.
+
+* printconfig and serverconfig now mask out passwords (they appear as "*").
+
+* documentation changes to match all the above.
+
+* added an "external_copy" command to use when the program needs to copy
+  file data; this is for people who demand to use rsync. Unfortunately,
+  rsync doesn't cooperate: one needs to call rsync once per file, because
+  asking it to take a list from standard input results in rsync waiting
+  until should exits to start the transfer; and giving the files on the
+  rsync's command line means that we need to call it once per copy event.
+  The problem with the list on standard input is not caused by stdio
+  buffering, because it happens even if we send the file name 1000000 times
+  for each file to copy, and buffers aren't that big. It's clearly rsync
+  buffering the whole list before starting (this happens with rsync 3.0.6).
+  We may try with librsync, but not in this release.
+
+* when a new watch is added automatically (after a create directory event),
+  now check for excludes and crossmount to avoid adding subdirectories we
+  do not really want to add.
+
+* added [dis]allow_local as alias for [dis]allow_unix.
+
+* allowing "listen=:port" as a shorthand for "listen=0.0.0.0:port" plus
+  "listen=[::]:port".
+
+* added "host=" to allow_tcp and "socket=" to allow_unix to specify
+  where one can connect from.
+
+* moved some code from the store to the notify thread for better handling
+  of recursive descent into subdirectories.
+
+* extensive changes to config.c which have not much to do with "should" but
+  rather to the fact that I am using the same config.c in several packages.
+  One day it'll be split out as a separate library.
+
+* added special names "info", "warn" (or "warning"), "err" (or "error"),
+  "crit" (or "critical") to the "report" option so groups of messages can
+  be redirected with just one option.
+
+* in 1.0.-5 some operations may try to use information from a configuration
+  which no longer exists (due to an update); this has been fixed in 1.0.-4.
+
+* in 1.0.-5 one could update error messages and destination on a running
+  server, then roll back, and the changes would still be committed; this
+  has been fixed in 1.0.-4.
+
+* changed error reporting on commands to make it clearer. Some more work
+  will be needed there.
+
+* other bug fixes.
+

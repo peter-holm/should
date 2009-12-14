@@ -1,4 +1,5 @@
 configure
+ChangeLog
 COPYING
 Makefile
 MANIFEST
@@ -22,6 +23,7 @@ src/compress.c
 src/compress.h
 src/config.c
 src/config.h
+src/config-package.h
 src/control_thread.c
 src/control_thread.h
 src/copy_thread.c

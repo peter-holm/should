@@ -22,6 +22,7 @@
 #ifndef __SHOULD_COPY_THREAD_H__
 #define __SHOULD_COPY_THREAD_H__ 1
 
+#include <time.h>
 #include "socket.h"
 
 /* type used to return information about event processed */
@@ -31,6 +32,10 @@ typedef struct {
     int file_pos;      /* bytes in the current event file */
     int events;        /* events processed since startup */
     int dirsyncs;      /* dirsyncs currently pending */
+    long long rbytes;  /* bytes read from server */
+    long long wbytes;  /* bytes written to server */
+    long long tbytes;  /* file data bytes (total) */
+    long long xbytes;  /* file data bytes (actually transferred) */
 } copy_status_t;
 
 /* initialisation required before the copy thread starts; returns
@@ -53,10 +58,12 @@ void copy_exit(void);
  * if compression is nonnegative it identifies a compression method to
  * use to copy the file data; if checksum is nonnegative it identifies a
  * checksum method to use to avoid copying data already present in the client;
- * both compression and checksum must have already been set up on the server */
+ * both compression and checksum must have already been set up on the server;
+ * extcopy is an open file descriptor to the external copy program, or -1
+ * to use the internal copy */
 
 void copy_file(socket_t * p, const char * from, const char * to, int tr_ids,
-	       int compression, int checksum);
+	       int compression, int checksum, int extcopy);
 
 /* returns current event files information etc */
 
@@ -64,6 +71,10 @@ void copy_status(copy_status_t *);
 
 /* schedules an immediate dirsync of server:from/path to client:to/path */
 
-int copy_dirsync(const char * path);
+int copy_dirsync(const char * reason, const char * path);
+
+/* time of the last full dirsync */
+
+time_t copy_last_dirsync(void);
 
 #endif /* __SHOULD_COPY_THREAD_H__ */

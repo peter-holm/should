@@ -67,6 +67,7 @@ typedef enum {
     error_internal,           /* const char * function, const char * problem */
     error_allocation,         /* const char * file, int line */
     error_fork,               /* int errno */
+    error_wait,               /* int errno */
     error_badevent,           /* const char * data */
     error_baddirent,          /* const char * data */
     error_bad_id,             /* const char * type, const char * data */
@@ -111,6 +112,10 @@ typedef enum {
     error_unimplemented,      /* const char * what */
     error_notserver,          /* void */
     error_nonotify,           /* void */
+    error_child_status,       /* int */
+    error_child_signal,       /* int */
+    error_child_coredump,     /* int */
+    error_child_unknown,      /* int */
     /* informational */
     info_adding_watch,        /* const char * */
     info_removing_watch,      /* const char * */
@@ -129,6 +134,7 @@ typedef enum {
     info_replication_copy,    /* const char *, const char *, long long */
     info_replication_delete,  /* const char * */
     info_replication_rename,  /* const char *, const char * */
+    info_sched_dirsync,       /* const char *, const char * */
     error_MAX
 } error_message_t;
 
@@ -142,34 +148,21 @@ void error_closelog(void);
 /* destination for an error message: OR one or more of the values */
 
 typedef enum {
-    error_dest_stderr = 1,    /* send message to standard error */
-    error_dest_email  = 2,    /* email message */
-    error_dest_file   = 4,    /* write message to file */
-    error_dest_syslog = 8     /* send message to syslog */
+    error_dest_stderr   = 0x0001,    /* send message to standard error */
+    error_dest_email    = 0x0002,    /* email message */
+    error_dest_file     = 0x0004,    /* write message to file */
+    error_dest_syslog   = 0x0008,    /* send message to syslog */
+    error_dest_none     = 0          /* do not emit this message */
 } error_dest_t;
 
-/* change an error message; caller allocates string using mymalloc, and they
- * also myfree() it if they get an error */
+/* error level: to automatically filter out messages */
 
-const char * error_change_message(error_message_t, char *);
-
-/* get current error message */
-
-const char * error_get_message(error_message_t);
-
-/* change an error destination: facility is only used with syslog */
-
-void error_change_dest(error_message_t, error_dest_t, int facility);
-
-/* get current destination and facility */
-
-error_dest_t error_get_dest(error_message_t);
-int error_get_facility(error_message_t);
-
-/* check if an error destination has been changed from its default; returns
- * 0 if no, 1 if yes, -1 if invalid */
-
-int error_dest_changed(error_message_t);
+typedef enum {
+    error_level_info,                /* informational */
+    error_level_warn,                /* warning */
+    error_level_err,                 /* error */
+    error_level_crit                 /* critical */
+} error_level_t;
 
 /* get an error code from its name */
 
@@ -179,8 +172,10 @@ error_message_t error_code(const char * name, int len);
 
 const char * error_name(error_message_t);
 
-/* frees any allocated error messages */
+/* get default error messge, error level, number of arguments */
 
-void error_free(void);
+const char * error_defmsg(error_message_t);
+error_level_t error_level(error_message_t);
+int error_argcount(error_message_t);
 
 #endif /* __SHOULD_ERROR_H__ */

@@ -1,4 +1,4 @@
-Should 1.0.-5
+Should 1.0.-4
 
 Before installing "should", it is strongly recommended to install
 the openssl library together with the corresponding development
@@ -32,5 +32,5 @@ file for any additional configuration (if you want to install into /usr/local
 and your system looks "normal" you don't need to do this). Then type:
 
     make
-    make instal
+    make install
 

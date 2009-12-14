@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -42,8 +43,6 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <ctype.h>
-#include <dirent.h>
-#include <fnmatch.h>
 #include "notify_thread.h"
 #include "control_thread.h"
 #include "store_thread.h"
@@ -61,13 +60,6 @@
 
 #if DATA_BLOCKSIZE < 8192
 #error DATA_BLOCKSIZE must be at least 8192
-#endif
-
-/* apr likes to screw up fnmatch.h */
-
-#ifdef FNM_CASE_BLIND
-int fnmatch(const char *, const char *, int);
-#define FNM_CASEFOLD    (1 << 4)
 #endif
 
 /* to wait for threads... */
@@ -89,7 +81,7 @@ static int clients, client_mode;
 
 const char * control_init(void) {
     const config_data_t * cfg = config_get();
-    client_mode = cfg->intval[cfg_client_mode];
+    client_mode = config_intval(cfg, cfg_client_mode);
     config_put(cfg);
     all_threads = NULL;
     clients = 0;
@@ -224,7 +216,7 @@ static const char * handle_excl_find(socket_t * p, char * lptr, int is_excl,
 				     config_dir_t * add, char cblock[])
 {
     int match, how, namelen = atoi(lptr);
-    config_match_t * item;
+    config_acl_cond_t * item;
     const char * rep, * kw;
     char line[LINESIZE];
     if (namelen < 1)
@@ -246,9 +238,9 @@ static const char * handle_excl_find(socket_t * p, char * lptr, int is_excl,
 	while (*lptr && isspace((int)*lptr)) lptr++;
     }
     if (strcasecmp(kw, "NAME") == 0) {
-	match = config_match_name;
+	match = cfg_dacl_name;
     } else if (strcasecmp(kw, "PATH") == 0) {
-	match = config_match_path;
+	match = cfg_dacl_path;
     } else {
 	rep = "EINVAL Invalid match type";
 	goto skip_report;
@@ -264,34 +256,26 @@ static const char * handle_excl_find(socket_t * p, char * lptr, int is_excl,
 	while (*lptr && isspace((int)*lptr)) lptr++;
     }
     if (strcasecmp(kw, "EXACT") == 0) {
-	how = config_match_exact;
+	how = cfg_acl_exact;
     } else if (strcasecmp(kw, "ICASE") == 0) {
-	how = config_match_icase;
+	how = cfg_acl_icase;
     } else if (strcasecmp(kw, "GLOB") == 0) {
-	how = config_match_glob;
+	how = cfg_acl_glob;
     } else if (strcasecmp(kw, "IGLOB") == 0) {
-	how = config_match_iglob;
+	how = cfg_acl_iglob;
     } else {
 	rep = "EINVAL Invalid match mode";
 	goto skip_report;
     }
-    item = mymalloc(sizeof(config_match_t));
+    item = mymalloc(sizeof(config_acl_cond_t) + 1 + namelen);
     if (! item) {
 	rep = error_sys_r(cblock, DATA_BLOCKSIZE,
 			  "run_server", "malloc");
 	goto skip_report;
     }
-    item->pattern = mymalloc(1 + namelen);
-    if (! item->pattern) {
-	rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-			  "run_server", "malloc");
-	myfree(item);
-	goto skip_report;
-    }
     if (! socket_get(p, item->pattern, namelen)) {
 	rep = error_sys_r(cblock, DATA_BLOCKSIZE,
 			  "run_server", "malloc");
-	myfree(item->pattern);
 	myfree(item);
 	return rep;
     }
@@ -364,6 +348,7 @@ void * run_server(void * _tp) {
 #endif /* NOTIFY != NOTIFY_NONE */
     long bwlimit = 0L;
     off_t mapsize = 0, maprealsize = 0;
+    config_userop_t allowed = socket_actions(p);
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &ov);
     error_report(info_connection_open, user, addr);
     csum_n = checksum_byname("md5");
@@ -392,6 +377,10 @@ void * run_server(void * _tp) {
 #if NOTIFY != NOTIFY_NONE
 	    case 'A' : case 'a' :
 		if (is_server && strcasecmp(kw, "ADD") == 0) {
+		    if (! (allowed & config_op_add)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    namelen = atoi(lptr);
 		    if (namelen < 1) {
 			rep = "EINVAL Invalid name";
@@ -426,7 +415,12 @@ void * run_server(void * _tp) {
 #endif /* NOTIFY != NOTIFY_NONE */
 	    case 'B' : case 'b' :
 		if (is_server && strcasecmp(kw, "BWLIMIT") == 0) {
-		    long limit = atol(lptr);
+		    long limit;
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
+		    limit = atol(lptr);
 		    if (limit < 0 || limit >= LONG_MAX / 1024L) {
 			rep = "EINVAL bandwidth limit";
 		    } else {
@@ -442,6 +436,10 @@ void * run_server(void * _tp) {
 		    long long start, usize;
 		    int i, wp, clen = checksum_size(csum_n);
 		    unsigned char hash[clen];
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    if (! pagemap) {
 			rep = "EBADF File not opened";
 			goto report;
@@ -473,6 +471,10 @@ void * run_server(void * _tp) {
 		}
 #if NOTIFY != NOTIFY_NONE
 		if (is_server && strcasecmp(kw, "CROSS") == 0) {
+		    if (! (allowed & config_op_add)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    add->crossmount = 1;
 		    rep = finish_add(add, &changes, cblock);
 		    add = NULL;
@@ -480,12 +482,20 @@ void * run_server(void * _tp) {
 		}
 #endif /* NOTIFY != NOTIFY_NONE */
 		if (strcasecmp(kw, "CLOSELOG") == 0) {
+		    if (! (allowed & config_op_closelog)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    error_closelog();
 		    rep = "OK closed";
 		    goto report;
 		}
 		if (is_server && strcasecmp(kw, "COMPRESS") == 0) {
 		    int num;
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    kw = lptr;
 		    while (*lptr && ! isspace((int)*lptr)) lptr++;
 		    if (lptr == kw) {
@@ -504,6 +514,10 @@ void * run_server(void * _tp) {
 		    goto report;
 		}
 		if (is_server && strcasecmp(kw, "CLOSEFILE") == 0) {
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    if (! pagemap) {
 			rep = "EBADF File not opened";
 			goto report;
@@ -516,6 +530,10 @@ void * run_server(void * _tp) {
 		    goto report;
 		}
 		if (strcasecmp(kw, "CONFIG") == 0) {
+		    if (! (allowed & config_op_getconf)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    socket_autoflush(p, 0);
 		    if (! socket_puts(p, "OK")) {
 			error_report(error_server, addr, "run_server", errno);
@@ -532,6 +550,10 @@ void * run_server(void * _tp) {
 		break;
 	    case 'D' : case 'd' :
 		if (is_server && strcasecmp(kw, "DATA") == 0) {
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    long long start, usize, csize, dsize;
 		    const char * dptr;
 		    if (! pagemap) {
@@ -602,8 +624,47 @@ void * run_server(void * _tp) {
 		    goto noreport;
 		}
 		if (strcasecmp(kw, "DEBUG") == 0) {
+		    if (! (allowed & config_op_debug)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    socket_setdebug(p, 1);
 		    rep = "OK";
+		    goto report;
+		}
+		if (! is_server && strcasecmp(kw, "DIRSYNC") == 0) {
+		    char * path;
+		    int ok;
+		    if (! (allowed & config_op_dirsync)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
+		    namelen = atoi(lptr);
+		    if (namelen < 1) {
+			rep = "EINVAL Invalid name";
+			goto report;
+		    }
+		    path = mymalloc(1 + namelen);
+		    if (! path) {
+			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					  "run_server", "malloc");
+			goto skip_report;
+		    }
+		    if (! socket_get(p, path, namelen)) {
+			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					  "run_server", "malloc");
+			myfree(path);
+			goto report;
+		    }
+		    path[namelen] = 0;
+		    ok = copy_dirsync("user", path);
+		    myfree(path);
+		    if (ok) {
+			rep = "OK scheduled";
+		    } else {
+			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					  "run_server", "schedule_dirsync");
+		    }
 		    goto report;
 		}
 		break;
@@ -642,15 +703,23 @@ void * run_server(void * _tp) {
 		    }
 		    continue;
 		}
-		// XXX ENCRYPT
+		// XXX ENCRYPT [config_op_read]
 #if NOTIFY != NOTIFY_NONE
 		if (is_server && strcasecmp(kw, "EXCL") == 0) {
+		    if (! (allowed & config_op_add)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    rep = handle_excl_find(p, lptr, 1, add, cblock);
 		    goto report;
 		}
 		if (is_server && strcasecmp(kw, "EVENT") == 0) {
 		    notify_event_t ev;
 		    int timeout, size, avail;
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    if (! get) {
 			rep = "EINVAL no root dir";
 			goto report;
@@ -744,6 +813,10 @@ void * run_server(void * _tp) {
 		break;
 	    case 'F' : case 'f' :
 		if (is_server && strcasecmp(kw, "FIND") == 0) {
+		    if (! (allowed & config_op_add)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    rep = handle_excl_find(p, lptr, 0, add, cblock);
 		    goto report;
 		}
@@ -751,12 +824,17 @@ void * run_server(void * _tp) {
 #endif /* NOTIFY != NOTIFY_NONE */
 	    case 'G' : case 'g' :
 		if (is_server && strcasecmp(kw, "GETDIR") == 0) {
-		    int len, trans;
+		    int len, trans, skip_should;
 		    DIR * dp;
 		    struct dirent * ent;
-		    const config_data_t * cfg = config_get();
-		    int skip_should =
-			cfg->intval[cfg_flags] & config_flag_skip_should;
+		    const config_data_t * cfg;
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
+		    cfg = config_get();
+		    skip_should =
+			config_intval(cfg, cfg_flags) & config_flag_skip_should;
 		    config_put(cfg);
 		    if (sscanf(lptr, "%d %d", &len, &trans) < 2) {
 			rep = "EINVAL Invalid request";
@@ -817,11 +895,15 @@ void * run_server(void * _tp) {
 		}
 		break;
 	    case 'I' : case 'i' :
-		// XXX IGNORE (is_server)
+		// XXX IGNORE (is_server) [config_op_ignore]
 		break;
 	    case 'L' : case 'l' :
 		if (is_server && strcasecmp(kw, "LISTCOMPRESS") == 0) {
 		    int n, max = compress_count(), err = 0;
+		    if (! (allowed & (config_op_read | config_op_getconf))) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    socket_autoflush(p, 0);
 		    if (! socket_puts(p, "OK")) {
 			error_report(error_server, addr, "run_server", errno);
@@ -854,6 +936,10 @@ void * run_server(void * _tp) {
 		}
 		if (is_server && strcasecmp(kw, "LISTCHECKSUM") == 0) {
 		    int n, max = checksum_count(), err = 0;
+		    if (! (allowed & (config_op_read | config_op_getconf))) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    socket_autoflush(p, 0);
 		    if (! socket_puts(p, "OK")) {
 			error_report(error_server, addr, "run_server", errno);
@@ -888,6 +974,10 @@ void * run_server(void * _tp) {
 	    case 'N' : case 'n' :
 #if NOTIFY != NOTIFY_NONE
 		if (is_server && strcasecmp(kw, "NOCROSS") == 0) {
+		    if (! (allowed & config_op_add)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    add->crossmount = 0;
 		    rep = finish_add(add, &changes, cblock);
 		    add = NULL;
@@ -895,6 +985,10 @@ void * run_server(void * _tp) {
 		}
 #endif /* NOTIFY != NOTIFY_NONE */
 		if (strcasecmp(kw, "NODEBUG") == 0) {
+		    if (! (allowed & config_op_debug)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    socket_setdebug(p, 0);
 		    rep = "OK";
 		    goto report;
@@ -904,6 +998,10 @@ void * run_server(void * _tp) {
 		if (is_server && strcasecmp(kw, "OPEN") == 0) {
 		    struct stat sbuff;
 		    int dfd;
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    namelen = atoi(lptr);
 		    if (namelen < 1) {
 			rep = "EINVAL Invalid name";
@@ -979,6 +1077,7 @@ void * run_server(void * _tp) {
 			pagemap = NULL;
 			goto report;
 		    }
+		    close(dfd);
 		    rep = "OK file opened";
 		    goto report;
 		}
@@ -986,7 +1085,12 @@ void * run_server(void * _tp) {
 #if NOTIFY != NOTIFY_NONE
 	    case 'P' : case 'p' :
 		if (is_server && strcasecmp(kw, "PURGE") == 0) {
-		    int days = atoi(lptr);
+		    int days;
+		    if (! (allowed & config_op_purge)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
+		    days = atoi(lptr);
 		    if (days < 2) {
 			rep = "EINVAL number of days";
 		    } else {
@@ -1011,6 +1115,10 @@ void * run_server(void * _tp) {
 	    case 'R' : case 'r' :
 		if (is_server && strcasecmp(kw, "REMOVE") == 0) {
 		    char * path;
+		    if (! (allowed & config_op_remove)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    namelen = atoi(lptr);
 		    if (namelen < 1) {
 			rep = "EINVAL Invalid name";
@@ -1037,47 +1145,24 @@ void * run_server(void * _tp) {
 		    }
 		    goto report;
 		}
-		if (! is_server && strcasecmp(kw, "DIRSYNC") == 0) {
-		    char * path;
-		    int ok;
-		    namelen = atoi(lptr);
-		    if (namelen < 1) {
-			rep = "EINVAL Invalid name";
-			goto report;
-		    }
-		    path = mymalloc(1 + namelen);
-		    if (! path) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			goto skip_report;
-		    }
-		    if (! socket_get(p, path, namelen)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			myfree(path);
-			goto report;
-		    }
-		    path[namelen] = 0;
-		    ok = copy_dirsync(path);
-		    myfree(path);
-		    if (ok) {
-			rep = "OK scheduled";
-		    } else {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "schedule_dirsync");
-		    }
-		    goto report;
-		}
 		break;
 #endif /* NOTIFY != NOTIFY_NONE */
 	    case 'S' : case 's' :
 		if (strcasecmp(kw, "STOP") == 0) {
+		    if (! (allowed & config_op_stop)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    main_running = 0;
 		    error_report(info_user_stop);
 		    rep = "OK stopping";
 		    goto report;
 		}
 		if (strcasecmp(kw, "STATUS") == 0) {
+		    if (! (allowed & config_op_status)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    if (! socket_puts(p, "OK sending status")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
@@ -1092,6 +1177,10 @@ void * run_server(void * _tp) {
 		if (is_server && strcasecmp(kw, "STATFS") == 0) {
 		    int len;
 		    struct statvfs sbuff;
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    if (sscanf(lptr, "%d", &len) < 1) {
 			rep = "EINVAL Invalid request";
 			goto report;
@@ -1129,6 +1218,10 @@ void * run_server(void * _tp) {
 		}
 		if (is_server && strcasecmp(kw, "STAT") == 0) {
 		    int len, trans, s;
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    if (sscanf(lptr, "%d %d", &len, &trans) < 2) {
 			rep = "EINVAL Invalid request";
 			goto report;
@@ -1158,6 +1251,10 @@ void * run_server(void * _tp) {
 #if NOTIFY != NOTIFY_NONE
 		if (is_server && strcasecmp(kw, "SETROOT") == 0) {
 		    int pos, file;
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    if (sscanf(lptr, "%d %d %d %d",
 			       &file, &pos, &namelen, &translate_ids) < 4)
 		    {
@@ -1195,6 +1292,10 @@ void * run_server(void * _tp) {
 #endif /* NOTIFY != NOTIFY_NONE */
 		if (is_server && strcasecmp(kw, "SETCHECKSUM") == 0) {
 		    int num;
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    kw = lptr;
 		    while (*lptr && ! isspace((int)*lptr)) lptr++;
 		    if (lptr == kw) {
@@ -1215,7 +1316,12 @@ void * run_server(void * _tp) {
 		break;
 	    case 'U' : case 'u' :
 		if (strcasecmp(kw, "UPDATE") == 0) {
-		    int len = atoi(lptr);
+		    int len;
+		    if (! (allowed & config_op_setconf)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
+		    len = atoi(lptr);
 		    if (len < 1) {
 			rep = "EINVAL Invalid update";
 			goto report;
@@ -1262,6 +1368,10 @@ void * run_server(void * _tp) {
 #if NOTIFY != NOTIFY_NONE
 	    case 'W' : case 'w' :
 		if (is_server && strcasecmp(kw, "WATCHES") == 0) {
+		    if (! (allowed & config_op_watches)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
 		    if (! socket_puts(p, "OK")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
@@ -1342,6 +1452,57 @@ const char * control_thread(void) {
 		pthread_join(name, &result);
 	    }
 	}
+	if (client_mode) {
+	    /* see if we need to schedule dirsyncs */
+	    time_t ld = copy_last_dirsync(), now = time(NULL);
+	    const config_data_t * cfg = config_get();
+	    int interval = config_intval(cfg, cfg_dirsync_interval);
+	    const char * do_one = NULL;
+	    /* for periodic rsyncs, check that we haven't done one in
+	     * the last "interval" seconds */
+	    if (interval > 0 && ld + interval <= now)
+		do_one = "periodic";
+	    /* for timed ones, check if we've done one more than 10 minutes
+	     * ago, and there is one with starttime up to 10 minutes in the
+	     * past; supposedly, POLL_TIME is small enough that we check
+	     * more often than once an hour... */
+	    if (! do_one &&
+		config_intarr_len(cfg, cfg_dirsync_timed) > 0 &&
+		ld + 600 <= now)
+	    {
+		struct tm tm_now;
+		if (localtime_r(&now, &tm_now)) {
+		    int i, daynum = 1 << (24 + tm_now.tm_wday);
+		    int thistime = tm_now.tm_hour * 3600
+				 + tm_now.tm_min * 60
+				 + tm_now.tm_sec;
+		    int count = config_intarr_len(cfg, cfg_dirsync_timed);
+		    const int * dp = config_intarr_data(cfg, cfg_dirsync_timed);
+		    for (i = 0; i < count; i++) {
+			int st = dp[i];
+			if (! (st & daynum))
+			    continue;
+			st &= 0xffffff;
+			if (st <= 85800) {
+			    /* start time between 00:00:00 and 23:50:00 */
+			    if (thistime >= st && thistime < st + 800) {
+				do_one = "timed";
+				break;
+			    }
+			} else {
+			    /* start time between 23:50:01 and 23:59:59 */
+			    if (thistime >= st || thistime < st - 85800) {
+				do_one = "timed";
+				break;
+			    }
+			}
+		    }
+		}
+	    }
+	    config_put(cfg);
+	    if (do_one)
+		copy_dirsync(do_one, "");
+	}
 	p = socket_accept(server, POLL_TIME);
 	if (! p) {
 	    if (errno != ETIMEDOUT && errno != EINTR)
@@ -1387,7 +1548,8 @@ const char * control_thread(void) {
 		myfree(this);
 		pthread_join(name, &result);
 	    } else {
-		pthread_cancel(this->name);
+		//pthread_cancel(this->name);
+		pthread_kill(this->name, SIGINT);
 		//this->completed = 1;
 	    }
 	}
@@ -1403,7 +1565,7 @@ void control_initial_thread(void) {
     if (! client_mode) {
 	notify_status_t info;
 	const config_data_t * cfg = config_get();
-	config_dir_t * d = cfg->dirs;
+	const config_dir_t * d = config_treeval(cfg, cfg_tree_add);
 	if (! d) {
 	    config_put(cfg);
 	    return;
@@ -1423,42 +1585,12 @@ void control_initial_thread(void) {
 }
 
 #if NOTIFY != NOTIFY_NONE
-/* check an exclude or find list */
-
-static int match_list(const char * name, const char * path,
-		      const config_match_t * list)
-{
-    while (list) {
-	const char * match =
-	    list->match == config_match_name ? name : path;
-	switch (list->how) {
-	    case config_match_exact :
-		if (strcmp(list->pattern, match) == 0)
-		    return 1;
-		break;
-	    case config_match_icase :
-		if (strcasecmp(list->pattern, match) == 0)
-		    return 1;
-		break;
-	    case config_match_glob :
-		if (fnmatch(list->pattern, match, 0) == 0)
-		    return 1;
-		break;
-	    case config_match_iglob :
-		if (fnmatch(list->pattern, match, FNM_CASEFOLD) == 0)
-		    return 1;
-		break;
-	}
-	list = list->next;
-    }
-    return 0;
-}
 
 /* scan a directory and adds a watch for all its subdirectories */
 
 static void scan_dir(notify_watch_t * parent,
 		     const char * path, int pathlen,
-		     const config_match_t * exclude,
+		     const config_dir_t * how,
 		     const dev_t * dev,
 		     const dev_t * ev, ino_t evino,
 		     int * count)
@@ -1483,6 +1615,7 @@ static void scan_dir(notify_watch_t * parent,
     buffer[pathlen++] = '/';
     while ((ent = readdir(dp)) != NULL) {
 	int entlen = strlen(ent->d_name);
+	const char * data[cfg_dacl_COUNT];
 #if USE_SHOULDBOX
 	if (entlen < 1 || entlen > NAME_MAX) {
 	    /* shouldn't happen(TM) */
@@ -1497,7 +1630,9 @@ static void scan_dir(notify_watch_t * parent,
 	strcpy(buffer + pathlen, ent->d_name);
 	entlen += pathlen;
 	/* check if this is excluded */
-	if (match_list(ent->d_name, buffer, exclude))
+	data[cfg_dacl_name] = ent->d_name;
+	data[cfg_dacl_path] = buffer;
+	if (config_check_acl_cond(how->exclude, 0, data, cfg_dacl_COUNT))
 	    continue;
 	/* see if it is a subdir */
 	if (lstat(buffer, &sbuff) < 0) {
@@ -1508,13 +1643,13 @@ static void scan_dir(notify_watch_t * parent,
 	    notify_watch_t * watch;
 	    if (dev && sbuff.st_dev != *dev)
 		continue;
-	    watch = notify_add(parent, ent->d_name);
+	    watch = notify_add(parent, ent->d_name, how);
 	    if (! watch) {
 		error_report(error_scan_dir, buffer, errno);
 		continue;
 	    }
 	    (*count)++;
-	    scan_dir(watch, buffer, entlen, exclude, dev, ev, evino, count);
+	    scan_dir(watch, buffer, entlen, how, dev, ev, evino, count);
 	}
     }
     closedir(dp);
@@ -1535,23 +1670,19 @@ static const char * scan_root(const config_dir_t * d,
     if (ev && sbuff.st_dev == *ev && sbuff.st_ino == evino)
 	return NULL;
     error_report(info_adding_watch, rootpath);
-    root = notify_find_bypath(rootpath, 1);
+    root = notify_find_bypath(rootpath, d);
     if (! root)
 	return error_sys("scan_root", "notify_find_bypath");
     (*count)++;
-    scan_dir(root, rootpath, strlen(rootpath), d->exclude,
-	     dev, ev, evino, count);
+    scan_dir(root, rootpath, strlen(rootpath), d, dev, ev, evino, count);
     return NULL;
 }
 
 /* find all matching directories, and scan them as separate roots */
 
-static const char * scan_find(const config_dir_t * d,
-			      const char * path, int pathlen,
-			      const config_match_t * find,
-			      const dev_t * dev,
-			      const dev_t * ev, ino_t evino,
-			      int * count)
+static const char * scan_find(const config_dir_t * d, const char * path,
+			      int pathlen, const dev_t * dev,
+			      const dev_t * ev, ino_t evino, int * count)
 {
     DIR * dp;
     struct dirent * ent;
@@ -1595,12 +1726,15 @@ static const char * scan_find(const config_dir_t * d,
 	}
 	if (S_ISDIR(sbuff.st_mode)) {
 	    const char * err = NULL;
+	    const char * data[cfg_dacl_COUNT];
 	    if (dev && sbuff.st_dev != *dev)
 		continue;
-	    if (match_list(ent->d_name, buffer, find))
+	    data[cfg_dacl_name] = ent->d_name;
+	    data[cfg_dacl_path] = buffer;
+	    if (config_check_acl_cond(d->find, 0, data, cfg_dacl_COUNT))
 		err = scan_root(d, buffer, dev, ev, evino, count);
 	    else
-		err = scan_find(d, buffer, entlen, find,
+		err = scan_find(d, buffer, entlen,
 				dev, ev, evino, count);
 	    if (err) {
 		closedir(dp);
@@ -1631,7 +1765,7 @@ const char * control_add_tree(const config_dir_t * d, int * count) {
 	dev = &devbuff;
     }
     cfg = config_get();
-    if (stat(cfg->strval[cfg_eventdir], &sbuff) >= 0) {
+    if (stat(config_strval(cfg, cfg_eventdir), &sbuff) >= 0) {
 	evbuff = sbuff.st_dev;
 	ev = &evbuff;
 	evino = sbuff.st_ino;
@@ -1641,7 +1775,7 @@ const char * control_add_tree(const config_dir_t * d, int * count) {
     /* make sure we identify this as a rootpoint */
     if (d->find)
 	return scan_find(d, d->path, strlen(d->path),
-			 d->find, dev, ev, evino, count);
+			 dev, ev, evino, count);
     else
 	return scan_root(d, d->path, dev, ev, evino, count);
 }

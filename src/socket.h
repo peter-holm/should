@@ -24,6 +24,7 @@
 #define __SHOULD_SOCKET_H__ 1
 
 #include <sys/socket.h>
+#include "config.h"
 
 /* used to represent a running connection */
 
@@ -85,6 +86,8 @@ int socket_poll(socket_t *);
 struct sockaddr_storage * socket_addr(socket_t *);
 const char * socket_user(const socket_t *);
 const char * socket_password(const socket_t *);
+config_userop_t socket_actions(const socket_t *);
+void socket_stats(socket_t *, long long * recv, long long * sent);
 
 void socket_setdebug(socket_t *, int);
 

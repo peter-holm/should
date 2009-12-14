@@ -85,6 +85,10 @@ const char * protocol_status_send(socket_t * p, const protocol_status_t * S) {
 	SEND_INT("read_file_pos", S->copy.file_pos);
 	SEND_INT("events_copied", S->copy.events);
 	SEND_INT("pending_dirsyncs", S->copy.dirsyncs);
+	SEND_LONG("bytes_received", S->copy.rbytes);
+	SEND_LONG("bytes_sent", S->copy.wbytes);
+	SEND_LONG("file_data_total", S->copy.tbytes);
+	SEND_LONG("file_data_xfer", S->copy.xbytes);
     }
     SEND_INT("pid", S->server_pid);
 #undef SEND_INT
@@ -200,6 +204,10 @@ const char * protocol_status_receive(socket_t * p, protocol_status_t * S) {
 	RECV_INT("read_file_pos", S->copy.file_pos);
 	RECV_INT("events_copied", S->copy.events);
 	RECV_INT("pending_dirsyncs", S->copy.dirsyncs);
+	RECV_LONG("bytes_received", S->copy.rbytes);
+	RECV_LONG("bytes_sent", S->copy.wbytes);
+	RECV_LONG("file_data_total", S->copy.tbytes);
+	RECV_LONG("file_data_xfer", S->copy.xbytes);
 	if (store_list(line, "version", 3, S->version)) continue;
 #undef RECV_INT
 #undef RECV_LONG

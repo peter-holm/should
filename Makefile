@@ -25,11 +25,11 @@ SRCDIRS = src
 PERLDIRS = perl
 DOCDIRS = doc
 INSTDIRS = $(SRCDIRS) $(PERLDIRS) $(DOCDIRS)
-VERSION = 1.0.-5
+VERSION = 1.0.-4
 
 .PHONY : all
 
-all : Configure.make perl/Makefile
+all : Configure.make perl/Makefile src/depend
 	@for sd in $(SRCDIRS) $(PERLDIRS); \
 	    do (cd "$$sd" && $(MAKE) all) || exit 1; done
 
@@ -38,6 +38,10 @@ Configure.make : configure
 
 perl/Makefile : perl/Makefile.PL Site.make
 	cd perl && perl Makefile.PL $(MAKEFILE_PL)
+
+# special rule for (non-g)make so it won't complain about missing depend
+src/depend :
+	cd src && $(CC) $(CFLAGS) -MM *.c > depend
 
 .PHONY : dist
 dist : should-$(VERSION).tar.bz2
