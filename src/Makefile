@@ -22,7 +22,7 @@ include ../Configure.make
 include ../Site.make
 
 OBJECTS = client.o checksum.o compress.o config.o error.o \
-	  mymalloc.o protocol.o socket.o usermap.o
+	  mymalloc.o pipe.o protocol.o socket.o usermap.o
 THREADS = main_thread.o notify_thread.o control_thread.o \
 	  store_thread.o copy_thread.o
 PROGRAMS = should

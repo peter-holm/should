@@ -23,6 +23,7 @@
 #define __SHOULD_CLIENT_H__ 1
 
 #include "socket.h"
+#include "pipe.h"
 
 /* type used to determine which extensions are supported by the server */
 
@@ -30,6 +31,7 @@ typedef enum {
     client_ext_checksum    = 0x01,
     client_ext_encrypt     = 0x02,
     client_ext_ignore      = 0x04,
+    client_ext_rsync       = 0x08,
     client_ext_none        = 0x00
 } client_extensions_t;
 
@@ -53,7 +55,7 @@ int client_find_compress(socket_t *);
 /* set up an external copy program, if configured; returns 1 if OK, 0
  * if an error occurred (errno will be set accordingly) */
 
-int client_setup_extcopy(int * extcopy, pid_t * pid);
+int client_setup_extcopy(pipe_t *);
 
 /* set connection parameters for file copy etc. */
 

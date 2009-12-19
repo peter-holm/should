@@ -62,9 +62,11 @@ socket_t * socket_connect(void);
 int socket_put(socket_t *, const void *, int);
 int socket_puts(socket_t *, const char *);
 
-/* enable/disable autoflush by socket_put/socket_puts */
+/* flush pending output to the socket; unlike previous versions of should,
+ * this no longer happens automatically (although a socket_get* will force
+ * output flush */
 
-void socket_autoflush(socket_t *, int);
+int socket_flush(socket_t *);
 
 /* receive data from the socket: socket_get receives binary data,
  * socket_gets receives a line of text, up to a terminating CRLF
@@ -94,5 +96,14 @@ void socket_setdebug(socket_t *, int);
 /* closes connection */
 
 void socket_disconnect(socket_t *);
+
+/* globally set a file descriptor which will receive notification of all
+ * local (Unix domain) sockets created so another process can clean up */
+
+void socket_setnotify(int);
+
+/* gets the notification file set by socket_notify */
+
+int socket_getnotify(void);
 
 #endif /* __SHOULD_SOCKET_H__ */

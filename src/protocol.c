@@ -47,8 +47,7 @@ const char * protocol_status_send(socket_t * p, const protocol_status_t * S) {
     if (! socket_puts(p, buffer)) \
 	return error_sys("protocol_status_send", "socket_puts");
 #define SEND_TIME(n, v) \
-    sprintf(buffer, "%s: %ld.%03ld", \
-	    n, v.tv_sec, v.tv_nsec / 1000000L); \
+    sprintf(buffer, "%s: %ld.%09ld", n, v.tv_sec, v.tv_nsec); \
     if (! socket_puts(p, buffer)) \
 	return error_sys("protocol_status_send", "socket_puts");
     SEND_INT("server_mode", S->server_mode);
@@ -85,6 +84,7 @@ const char * protocol_status_send(socket_t * p, const protocol_status_t * S) {
 	SEND_INT("read_file_pos", S->copy.file_pos);
 	SEND_INT("events_copied", S->copy.events);
 	SEND_INT("pending_dirsyncs", S->copy.dirsyncs);
+	SEND_TIME("event_time", S->copy.etime);
 	SEND_LONG("bytes_received", S->copy.rbytes);
 	SEND_LONG("bytes_sent", S->copy.wbytes);
 	SEND_LONG("file_data_total", S->copy.tbytes);
@@ -136,7 +136,18 @@ static int store_time(const char * line, const char * kw,
     if (! line) return 0;
     if (sscanf(line, "%ld.%ld", &res->tv_sec, &res->tv_nsec) < 2)
 	return 0;
-    res->tv_nsec *= 1000000L;
+    if (res->tv_nsec < 1000L) {
+	/* older servers sent seconds.milliseconds */
+	const char * p = line;
+	int i;
+	while (*p && isspace((int)*p)) p++;
+	while (*p && isdigit((int)*p)) p++;
+	if (*p == '.') p++;
+	i = 0;
+	while (p[i] && isdigit((int)p[i])) i++;
+	if (i < 4)
+	    res->tv_nsec *= 1000000L;
+    }
     return 1;
 }
 
@@ -204,6 +215,7 @@ const char * protocol_status_receive(socket_t * p, protocol_status_t * S) {
 	RECV_INT("read_file_pos", S->copy.file_pos);
 	RECV_INT("events_copied", S->copy.events);
 	RECV_INT("pending_dirsyncs", S->copy.dirsyncs);
+	RECV_TIME("event_time", S->copy.etime);
 	RECV_LONG("bytes_received", S->copy.rbytes);
 	RECV_LONG("bytes_sent", S->copy.wbytes);
 	RECV_LONG("file_data_total", S->copy.tbytes);

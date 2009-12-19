@@ -82,6 +82,18 @@ struct config_strlist_s {
     char * data;
 };
 
+/* define units, for configuration elements which use name + unit */
+
+typedef struct {
+    int multiply;
+    const char * name_singular;
+    const char * name_plural;
+} config_unit_t;
+
+/* predefined units */
+
+extern const config_unit_t config_intervals[], config_sizes[];
+
 /* the configuration data */
 
 typedef struct config_data_s config_data_t;
@@ -108,6 +120,7 @@ int config_strlen(const config_data_t *, config_str_names_t);
 const char * config_strval(const config_data_t *, config_str_names_t);
 
 char * const * config_strarr(const config_data_t *, config_strarr_names_t);
+int config_strarr_len(const config_data_t *, config_strarr_names_t);
 
 const config_strlist_t * config_strlist(const config_data_t *,
 					config_strlist_names_t);
@@ -160,21 +173,13 @@ void config_dir_free(config_dir_t *);
 
 void config_print(int (*)(void *, const char *), void *);
 
-/* parse a time interval and returns a number of seconds */
+/* parse a number + unit and returns a plain number */
 
-int config_parse_interval(const char *);
-
-/* the opposite of the above */
-
-const char * config_print_interval(int);
-
-/* parse a size and returns a number of bytes */
-
-int config_parse_size(const char *);
+int config_parse_unit(const config_unit_t[], const char *);
 
 /* the opposite of the above */
 
-const char * config_print_size(int);
+const char * config_print_unit(const config_unit_t[], int);
 
 /* stores copy data to a small configuration file, suitable for loading
  * by the copy thread */

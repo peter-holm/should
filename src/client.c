@@ -60,12 +60,12 @@
 #endif
 
 static inline void print_line(const char * a, const char * b) {
-    int dist = 40 - strlen(a) - strlen(b);
+    int dist = 45 - strlen(a) - strlen(b);
     printf("    %s%*c%s\n", a, dist, ' ', b);
 }
 
 static void print_time(const char * d, const struct timespec * t,
-		       const char * point)
+		       const char * point, int precision)
 {
     char buffer[128];
     if (t->tv_sec < 60)
@@ -85,9 +85,12 @@ static void print_time(const char * d, const struct timespec * t,
 		((int)t->tv_sec / 3600) % 24,
 		((int)t->tv_sec / 60) % 60,
 		(int)t->tv_sec % 60);
-    if (point)
-	sprintf(buffer + strlen(buffer), "%s%02d",
-	       point, (int)t->tv_nsec / 10000000);
+    if (point) {
+	long v = t->tv_nsec;
+	int i;
+	for (i = precision; i < 9; i++) v /= 10;
+	sprintf(buffer + strlen(buffer), "%s%0*ld", point, precision, v);
+    }
     print_line(d, buffer);
 }
 
@@ -252,6 +255,10 @@ client_extensions_t client_get_extensions(socket_t * p) {
 		if (rlen == 6 && strcasecmp(repl, "IGNORE") == 0)
 		    result |= client_ext_ignore;
 		break;
+	    case 'R' : case 'r' :
+		if (rlen == 5 && strcasecmp(repl, "RSYNC") == 0)
+		    result |= client_ext_rsync;
+		break;
 	}
     }
     return result;
@@ -301,9 +308,9 @@ static int print_status(socket_t * p, config_client_t mode) {
 	printf("%d\n", status.server_pid);
     }
     if (mode & config_client_status) {
-	print_time("Running time:", &status.running, point);
-	print_time("User CPU time:", &status.usertime, point);
-	print_time("System CPU time:", &status.systime, point);
+	print_time("Running time:", &status.running, point, 2);
+	print_time("User CPU time:", &status.usertime, point, 2);
+	print_time("System CPU time:", &status.systime, point, 2);
 	print_int("Client requests:", status.clients, comma, grouping);
 	print_long_long("Memory usage:", status.memory, comma, grouping);
     }
@@ -380,12 +387,25 @@ static int print_status(socket_t * p, config_client_t mode) {
 	putchar('\n');
     }
     if (! status.server_mode && (mode & config_client_status)) {
+	struct timespec eps;
+	long long td;
 	print_int("Event file procesed:", status.copy.file_current,
 		  comma, grouping);
 	print_int("Event file position:", status.copy.file_pos,
 		  comma, grouping);
 	print_int("Events since startup:", status.copy.events,
 		  comma, grouping);
+	print_time("Time spent processing events:", &status.copy.etime,
+		   point, 3);
+	if (status.copy.events > 0) {
+	    eps.tv_sec = status.copy.etime.tv_sec / status.copy.events;
+	    td = (long long)status.copy.etime.tv_sec * 1000000000LL
+	       + (long long)status.copy.etime.tv_nsec;
+	    td /= (long long)status.copy.events;
+	    eps.tv_nsec = td / 1000000000LL;
+	    eps.tv_nsec = td % 1000000000LL;
+	    print_time("Time per event:", &eps, point, 6);
+	}
 	print_int("Pending dir syncs:", status.copy.dirsyncs,
 		  comma, grouping);
 	print_long_long("Bytes received from server:", status.copy.rbytes,
@@ -700,13 +720,17 @@ static int do_ls(socket_t * p, const config_data_t * cfg) {
 }
 
 static int do_cp(socket_t * p, const config_data_t * cfg,
-		 int compression, int checksum, int extcopy)
+		 int compression, int checksum, pipe_t * extcopy,
+		 client_extensions_t extensions)
 {
     const config_strlist_t * P = config_strlist(cfg, cfg_cp_path);
     struct stat sbuff;
     int is_dir;
     const char * dest;
     int tr_ids = config_intval(cfg, cfg_flags) & config_flag_translate_ids;
+    int use_librsync =
+	(config_intval(cfg, cfg_flags) & config_flag_use_librsync) &&
+	(extensions & client_ext_rsync);
     if (! P || ! P->next) {
 	fprintf(stderr, "Please specify at least two names for \"cp\"\n");
 	return 0;
@@ -736,12 +760,14 @@ static int do_cp(socket_t * p, const config_data_t * cfg,
 	    if (slash) slash++;
 	    strncpy(dfn + len, slash, NAME_MAX);
 	    dfn[len + NAME_MAX] = 0;
-	    copy_file(p, P->data, dfn, tr_ids, compression, checksum, extcopy);
+	    copy_file(p, P->data, dfn, tr_ids, compression, checksum,
+		      extcopy, use_librsync);
 	    P = P->next;
 	}
     } else {
 	while (P) {
-	    copy_file(p, P->data, dest, tr_ids, compression, checksum, extcopy);
+	    copy_file(p, P->data, dest, tr_ids, compression, checksum,
+		      extcopy, use_librsync);
 	    P = P->next;
 	}
     }
@@ -1001,17 +1027,14 @@ int client_run(void) {
     if (cm & config_client_cp) {
 	int checksum = client_find_checksum(p, extensions);
 	int compress = client_find_compress(p);
-	int extcopy, ok, ws;
-	pid_t pid;
-	if (! client_setup_extcopy(&extcopy, &pid)) {
+	int ok;
+	pipe_t P;
+	if (! client_setup_extcopy(&P)) {
 	    perror("external_copy");
 	    goto out;
 	}
-	ok = do_cp(p, cfg, compress, checksum, extcopy);
-	if (extcopy >= 0)
-	    close(extcopy);
-	if (pid >= 0)
-	    waitpid(pid, &ws, 0);
+	ok = do_cp(p, cfg, compress, checksum, &P, extensions);
+	pipe_close(&P);
 	if (! ok)
 	    goto out;
     }
@@ -1040,45 +1063,18 @@ out_noquit:
 /* set up an external copy program, if configured; returns 1 if OK, 0
  * if an error occurred (errno will be set accordingly) */
 
-int client_setup_extcopy(int * extcopy, pid_t * pid) {
+int client_setup_extcopy(pipe_t * P) {
     const config_data_t * cfg = config_get();
     char * const * ecprog = config_strarr(cfg, cfg_strarr_extcopy);
-    *extcopy = -1;
-    *pid = -1;
+    P->fromchild = P->tochild = -1;
+    P->pid = -1;
     if (ecprog && ecprog[0]) {
-	int tochild[2];
-	if (pipe(tochild) < 0) {
+	if (! pipe_opento(ecprog, P)) {
 	    int e = errno;
 	    config_put(cfg);
 	    errno = e;
 	    return 0;
 	}
-	fflush(NULL);
-	*pid = fork();
-	if (*pid < 0) {
-	    int e = errno;
-	    close(tochild[0]);
-	    close(tochild[1]);
-	    config_put(cfg);
-	    errno = e;
-	    return 0;
-	}
-	if (*pid == 0) {
-	    /* child process - the thing doing the copy */
-	    close(tochild[1]);
-	    fclose(stdin);
-	    if (dup2(tochild[0], 0) < 0) {
-		perror("dup2");
-		close(tochild[0]);
-		exit(1);
-	    }
-	    execvp(ecprog[0], ecprog);
-	    perror(ecprog[0]);
-	    exit(2);
-	}
-	/* parent process */
-	close(tochild[0]);
-	*extcopy = tochild[1];
     }
     config_put(cfg);
     return 1;

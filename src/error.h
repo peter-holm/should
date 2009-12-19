@@ -68,12 +68,14 @@ typedef enum {
     error_allocation,         /* const char * file, int line */
     error_fork,               /* int errno */
     error_wait,               /* int errno */
+    error_pipe,               /* int errno */
     error_badevent,           /* const char * data */
     error_baddirent,          /* const char * data */
     error_bad_id,             /* const char * type, const char * data */
     error_event,              /* int errno */
     error_getdir,             /* const char * path, int errno */
     /* error */
+    error_cleanup,            /* int errno */
     error_accept,             /* int errno */
     error_add_watch,          /* int errno, const char * name */
     error_rename_watch,       /* const char * from, const char * to */
@@ -103,6 +105,7 @@ typedef enum {
     error_readcopy_locked,    /* const char * file */
     error_copy_sys,           /* const char * filename, int errcode */
     error_copy_rename,        /* const char * from, const char * to, int errc */
+    error_copy_hardlink,      /* const char * from, const char * to, int errc */
     error_copy_invalid,       /* const char * file, const char * error */
     error_copy_short,         /* const char * file */
     error_copy_socket,        /* const char * file */
@@ -134,6 +137,7 @@ typedef enum {
     info_replication_copy,    /* const char *, const char *, long long */
     info_replication_delete,  /* const char * */
     info_replication_rename,  /* const char *, const char * */
+    info_replication_hardlink,/* const char *, const char * */
     info_sched_dirsync,       /* const char *, const char * */
     error_MAX
 } error_message_t;

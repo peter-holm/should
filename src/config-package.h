@@ -74,6 +74,8 @@ typedef enum {
     config_flag_dirsync_delete   = 0x00040,
     config_flag_copy_oneshot     = 0x00080,
     config_flag_socket_changed   = 0x00100,
+    config_flag_use_librsync     = 0x00200,
+    config_flag_extra_fork       = 0x00400,
     config_flag_NONE             = 0
 } config_flags_t;
 
@@ -119,6 +121,7 @@ typedef enum {
     cfg_event_create,             /* event filter for create operations */
     cfg_event_delete,             /* event filter for delete operations */
     cfg_event_rename,             /* event filter for rename operations */
+    cfg_event_hardlink,           /* event filter for hard link creation */
     cfg_flags,                    /* bit-valued elements */
     cfg_client_mode,              /* do an operation to a running should */
     cfg_server_mode,              /* start server */
@@ -171,6 +174,9 @@ typedef enum {
     cfg_from_prefix,              /* copy events with this prefix */
     cfg_to_prefix,                /* replace this to the from_prefix */
     cfg_copy_state,               /* state file to use for copy */
+    cfg_copy_config,              /* separate copy configuration file,
+                                   * if the configuration is not included
+				   * in the copy state file */
     cfg_homedir,                  /* user's home directory */
     cfg_server,                   /* server to connect to */
     cfg_str_COUNT                 /* number of string elements */

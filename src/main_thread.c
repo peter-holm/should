@@ -31,6 +31,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <locale.h>
+#include <string.h>
 #include "main_thread.h"
 #include "notify_thread.h"
 #include "control_thread.h"
@@ -40,6 +41,16 @@
 #include "config.h"
 #include "error.h"
 #include "mymalloc.h"
+#include "socket.h"
+
+/* used to store socket creation events so we can clean up */
+
+typedef struct cleanup_s cleanup_t;
+struct cleanup_s {
+    cleanup_t * next;
+    int namelen;
+    char name[0];
+};
 
 /* when the program started */
 
@@ -141,8 +152,7 @@ int main(int argc, char *argv[]) {
     pthread_t notify, store;
 #endif /* NOTIFY != NOTIFY_NONE */
     pthread_t control, initial, copy;
-    int errcode, status = 1;
-    pid_t pid;
+    int errcode, status = 1, nfd;
     void * result;
     setlocale(LC_ALL, "");
     tzset(); /* localtime_r may want us to call it */
@@ -173,7 +183,7 @@ int main(int argc, char *argv[]) {
     /* do they want to detach? */
     if (config_intval(cfg, cfg_server_mode) & config_server_detach) {
 	int fd;
-	pid = fork();
+	pid_t pid = fork();
 	if (pid < 0) {
 	    error_report(error_fork, errno);
 	    goto out_nothreads;
@@ -189,46 +199,116 @@ int main(int argc, char *argv[]) {
 	}
     }
     /* wrapper process (not thread) to clean up in case of crash */
-#if USE_EXTRA_FORK
-    // XXX create a channel to receive socket create/delete notifications
-    pid = fork();
-    if (pid < 0) {
-	error_report(error_fork, errno);
-	goto out_nothreads;
-    }
-    if (pid > 0) {
-	/* wrapper process: wait for the child to finish, then clean up */
-	// XXX read socket notification pipe and store results
-	if (waitpid(pid, &status, 0) < 0) {
-	    error_report(error_wait, errno);
-	    status = 10;
-	    goto out_cleanup;
+    socket_setnotify(-1);
+    if (config_intval(cfg, cfg_flags) & config_flag_extra_fork) {
+	int fromchild[2];
+	pid_t pid;
+	if (pipe(fromchild) < 0) {
+	    error_report(error_pipe, errno);
+	    goto out_nothreads;
 	}
-	if (WIFEXITED(status)) {
-	    if (WEXITSTATUS(status)) {
-		error_report(error_child_status, WEXITSTATUS(status));
-		status = 11;
-	    } else {
-		status = 0;
+	pid = fork();
+	if (pid < 0) {
+	    error_report(error_fork, errno);
+	    close(fromchild[0]);
+	    close(fromchild[1]);
+	    goto out_nothreads;
+	}
+	if (pid > 0) {
+	    /* wrapper process: wait for the child to finish, then clean up */
+	    cleanup_t * cleanup = NULL;
+	    close(fromchild[1]);
+	    /* read socket notification pipe and store results */
+	    while (1) {
+		int namelen;
+		char namebuff[1 + sizeof(namelen)];
+		ssize_t nr;
+		nr = read(fromchild[0], namebuff, 1 + sizeof(namelen));
+		if (nr < 1 + sizeof(namelen)) break;
+		memcpy(&namelen, namebuff + 1, sizeof(namelen));
+		char name[namelen + 1];
+		nr = read(fromchild[0], name, namelen);
+		if (nr < namelen) break;
+		name[namelen] = 0;
+		if (namebuff[0] == 'C') {
+		    /* socket has been created */
+		    cleanup_t * c = mymalloc(sizeof(cleanup_t) + 1 + namelen);
+		    if (! c) {
+			error_report(error_cleanup, errno);
+			continue;
+		    }
+		    c->next = cleanup;
+		    c->namelen = namelen;
+		    strcpy(c->name, name);
+		    cleanup = c;
+		    continue;
+		}
+		if (namebuff[0] == 'U') {
+		    /* socket has been unlinked */
+		    cleanup_t * c = cleanup, * p = NULL;
+		    while (c) {
+			if (c->namelen == namelen &&
+			    strcmp(c->name, name) == 0)
+			{
+			    cleanup_t * gone = c;
+			    if (p)
+				p->next = c->next;
+			    else
+				cleanup = c->next;
+			    c = c->next;
+			    myfree(gone);
+			    continue;
+			}
+			p = c;
+			c = c->next;
+		    }
+		    continue;
+		}
 	    }
-	    goto out_cleanup;
-	}
-	if (WIFSIGNALED(status)) {
+	    kill(pid, SIGINT); /* just in case */
+	    close(fromchild[0]);
+	    if (waitpid(pid, &status, 0) < 0) {
+		error_report(error_wait, errno);
+		status = 10;
+		goto out_cleanup;
+	    }
+	    if (WIFEXITED(status)) {
+		if (WEXITSTATUS(status)) {
+		    error_report(error_child_status, WEXITSTATUS(status));
+		    status = 11;
+		} else {
+		    status = 0;
+		}
+		goto out_cleanup;
+	    }
+	    if (WIFSIGNALED(status)) {
 #ifdef WCOREDUMP
-	    error_report(WCOREDUMP(status) ? error_child_coredump
-					   : error_child_signal,
-			 WTERMSIG(status));
+		error_report(WCOREDUMP(status) ? error_child_coredump
+					       : error_child_signal,
+			     WTERMSIG(status));
 #else
-	    error_report(error_child_signal, WTERMSIG(status));
+		error_report(error_child_signal, WTERMSIG(status));
 #endif
-	    status = 12;
-	    goto out_cleanup;
+		status = 12;
+		goto out_cleanup;
+	    }
+	    error_report(error_child_unknown, status);
+	    status = 13;
+	out_cleanup:
+	    /* remove any socket created and not yet destroyed by the child */
+	    while (cleanup) {
+		cleanup_t * gone = cleanup;
+		cleanup = cleanup->next;
+		unlink(gone->name);
+		myfree(gone);
+	    }
+	    goto out_nothreads;
 	}
-	error_report(error_child_unknown, status);
-	status = 13;
-	goto out_cleanup;
+	/* child process -- will need to send all socket create/unlink
+	 * notification to fromchild[1] */
+	close(fromchild[0]);
+	socket_setnotify(fromchild[1]);
     }
-#endif
     /* initialise threads */
 #if NOTIFY != NOTIFY_NONE
     if (! config_intval(cfg, cfg_client_mode)) {
@@ -351,15 +431,12 @@ out_nothreads:
 	error_report(error_shouldbox_int, "main",
 		     "shouldbox", main_shouldbox);
 #endif
+    nfd = socket_getnotify();
+    if (nfd >= 0) close(nfd);
     config_put(cfg);
     config_free();
     error_closelog();
     mymalloc_exit();
     return status;
-#if USE_EXTRA_FORK
-out_cleanup:
-    // XXX remove any socket created and not yet destroyed by the child
-    goto out_nothreads;
-#endif
 }
 

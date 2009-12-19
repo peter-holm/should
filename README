@@ -1,4 +1,4 @@
-Should 1.0.-4
+Should 1.0.-3
 
 Before installing "should", it is strongly recommended to install
 the openssl library together with the corresponding development
@@ -26,6 +26,14 @@ the output of ./configure:
 If either says "Not found", you may want to install them and re-run
 ./configure -- they are not necessary, however compression of network
 traffic requires at least one of these.
+
+You may also want to check:
+
+    Checking for librsync... Found
+
+If librsync is not found, the program works normally but may be less efficient
+(although depending on the use case, there may be no difference, or even be
+more efficient without librsync!)
 
 Once you are happy with the result of ./configure, look at the Site.make
 file for any additional configuration (if you want to install into /usr/local

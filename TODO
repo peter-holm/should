@@ -1,35 +1,44 @@
+TEST for 1.0.-3:
+* errors via email
+* extra fork and cleanup
+
 TODO for 1.0.-3:
+* copy does not seem to close files correctly - and to rm tempfile
 * hard links seem to get notified as renames! find out why
-* optionally use librsync for copy_file_data if found by configure and
-  if selected by options
+* change rdiff --> librsync
+* change external_copy to open on demand and close as soon as a different
+  type of event, or a timeout, occurs
+* timed dirsyncs: change to have an array of "last done" times for each
+  one, initially (now-86400). Periodically make a list of each one which
+  is 1) enabled today, 2) in the future, 3) last done <= now-86400; then
+  if the list is not empty do one and record last-done on the whole list
+  to be now.
 * finish wrapper process and cleanup
 * should.1 - external_copy
 * watch struct uses more RAM then necessary by about 1 order of magnitude.
 * move config_dirs_t to config-package and replace with a generic pointer
   configuration element
-* change parsing/printing of numbers with units to be general; provide units
-  of time and size as extern arrays
 * split config.c into config.c and config-package.c
 * should.conf(5) manpage
-* server - IGNORE command and EXTENSION
-* copy - multi-master mode, connects to a local server as well as a remote
-  one, and uses IGNORE on the local server before doing any file operation as
-  a result of replication from the remote server.
-* client / should.1 - copy modify: for example "should modify=FILE new_options"
-* client / should.1 - copy display: for example "should display=FILE"
 * client / should.1 - copy catch up: for example "should catchup=FILE"
 * server: if disallow_unix removes the last user, need to make the socket
   accessible by the owner only (if then allow_unix adds a user again, it
   can give the socket more permissions). This is only important during
   config_commit_update. Or maybe we just prohibit removing the last user.
-* review all "poll()" calls to see if we are watching all necessary file
-  descriptors or instead always end up waiting for the timeout.
 * review and test dirsync mechanism
 * review and test event filtering
 * review and test initscripts
 * notify - review and test exclude/crossmount on automatic watch
 * review and test new ACL for exclude, find
 * copy - test timed / periodic dirsync as per dirsync_interval / dirsync_timed
+
+TODO for 1.0.-2:
+* server - IGNORE command and EXTENSION
+* copy - multi-master mode, connects to a local server as well as a remote
+  one, and uses IGNORE on the local server before doing any file operation as
+  a result of replication from the remote server.
+* client / should.1 - copy modify: for example "should modify=FILE new_options"
+* client / should.1 - copy display: for example "should display=FILE"
 
 Possible future improvements:
 * a nicer interface to the "should" configuration

@@ -40,9 +40,11 @@
 #include <time.h>
 #include <limits.h>
 #include <sys/times.h>
-#include <sys/mman.h>
 #include <string.h>
 #include <ctype.h>
+#if THEY_HAVE_LIBRSYNC
+#include <librsync.h>
+#endif
 #include "notify_thread.h"
 #include "control_thread.h"
 #include "store_thread.h"
@@ -329,6 +331,29 @@ static void skip_data(socket_t * p, int len) {
     }
 }
 
+static inline char * get_block(int fd, long long start, long long *size,
+			       char * block, long long * block_start, 
+			       long long * block_size)
+{
+    ssize_t nr;
+    if (*size < 1) return block;
+    if (*block_start >= 0 && *block_size >= 0) {
+	if (*block_start <= start &&
+	    *block_start + *block_size >= start + *size)
+		return block + (start - *block_start);
+    }
+    if (lseek(fd, (off_t)start, SEEK_SET) < 0)
+	return NULL;
+    if (*size > DATA_BLOCKSIZE)
+	*size = DATA_BLOCKSIZE;
+    nr = read(fd, block, *size);
+    if (nr < 0)
+	return NULL;
+    *size = *block_size = nr;
+    *block_start = start;
+    return block;
+}
+
 /* talks to a client */
 
 void * run_server(void * _tp) {
@@ -336,10 +361,16 @@ void * run_server(void * _tp) {
     socket_t * p = tp->p;
     struct sockaddr_storage * addr = socket_addr(p);
     int ov, running = 1, csum_n, is_server = ! client_mode, updating = 0;
-    int compression = -1, pagesize = sysconf(_SC_PAGESIZE);
-    char * Dname = NULL, * pagemap = NULL;
-    char cblock[DATA_BLOCKSIZE];
-    const char * user = socket_user(p);
+    int compression = -1, rfd = -1;
+    char * Dname = NULL;
+    char cblock[DATA_BLOCKSIZE], ublock[DATA_BLOCKSIZE];
+    const char * user = socket_user(p), * udata;
+    long long usize, block_start = -1, block_size = -1;
+#if THEY_HAVE_LIBRSYNC
+    long long rdiff_start = -1, rdiff_size = -1;
+    pipe_t rdiff_pipe; // XXX replace with librsync
+    int has_signatures = 0;
+#endif
 #if NOTIFY != NOTIFY_NONE
     store_get_t * get = NULL;
     config_dir_t * add = NULL;
@@ -347,11 +378,14 @@ void * run_server(void * _tp) {
     int changes = 0, translate_ids = 1;
 #endif /* NOTIFY != NOTIFY_NONE */
     long bwlimit = 0L;
-    off_t mapsize = 0, maprealsize = 0;
     config_userop_t allowed = socket_actions(p);
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &ov);
     error_report(info_connection_open, user, addr);
     csum_n = checksum_byname("md5");
+#if THEY_HAVE_LIBRSYNC
+    rdiff_pipe.pid = -1;
+    rdiff_pipe.fromchild = rdiff_pipe.tochild = -1;
+#endif
     while (main_running && running) {
 	char line[LINESIZE], * lptr, * kw;
 	const char * rep;
@@ -433,14 +467,15 @@ void * run_server(void * _tp) {
 	    case 'C' : case 'c' :
 		if (is_server && csum_n >= 0 && strcasecmp(kw, "CHECKSUM") == 0)
 		{
-		    long long start, usize;
+		    long long start;
 		    int i, wp, clen = checksum_size(csum_n);
 		    unsigned char hash[clen];
+		    char * block;
 		    if (! (allowed & config_op_read)) {
 			rep = "EPERM Operation not permitted";
 			goto report;
 		    }
-		    if (! pagemap) {
+		    if (rfd < 0) {
 			rep = "EBADF File not opened";
 			goto report;
 		    }
@@ -452,13 +487,14 @@ void * run_server(void * _tp) {
 			rep = "EINVAL Invalid request";
 			goto report;
 		    }
-		    if (start >= maprealsize) {
-			rep = "OK 0";
+		    block = get_block(rfd, start, &usize, ublock,
+				      &block_start, &block_size);
+		    if (! block) {
+			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					  "run_server", "get_block");
 			goto report;
 		    }
-		    if (start + usize >= maprealsize)
-			usize = maprealsize - start;
-		    if (! checksum_data(csum_n, pagemap + start, usize, hash)) {
+		    if (! checksum_data(csum_n, block, usize, hash)) {
 			rep = "Error calculating checksum";
 			goto report;
 		    }
@@ -469,18 +505,6 @@ void * run_server(void * _tp) {
 		    rep = cblock;
 		    goto report;
 		}
-#if NOTIFY != NOTIFY_NONE
-		if (is_server && strcasecmp(kw, "CROSS") == 0) {
-		    if (! (allowed & config_op_add)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    add->crossmount = 1;
-		    rep = finish_add(add, &changes, cblock);
-		    add = NULL;
-		    goto report;
-		}
-#endif /* NOTIFY != NOTIFY_NONE */
 		if (strcasecmp(kw, "CLOSELOG") == 0) {
 		    if (! (allowed & config_op_closelog)) {
 			rep = "EPERM Operation not permitted";
@@ -518,14 +542,14 @@ void * run_server(void * _tp) {
 			rep = "EPERM Operation not permitted";
 			goto report;
 		    }
-		    if (! pagemap) {
+		    if (rfd < 0) {
 			rep = "EBADF File not opened";
 			goto report;
 		    }
 		    if (Dname) myfree(Dname);
 		    Dname = NULL;
-		    munmap(pagemap, mapsize); 
-		    pagemap = NULL;
+		    close(rfd);
+		    rfd = -1;
 		    rep = "OK file closed";
 		    goto report;
 		}
@@ -534,29 +558,39 @@ void * run_server(void * _tp) {
 			rep = "EPERM Operation not permitted";
 			goto report;
 		    }
-		    socket_autoflush(p, 0);
 		    if (! socket_puts(p, "OK")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
 		    }
 		    config_print(sendlines, p);
-		    socket_autoflush(p, 1);
 		    if (! socket_puts(p, "__END__")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
 		    }
 		    goto noreport;
 		}
+#if NOTIFY != NOTIFY_NONE
+		if (is_server && strcasecmp(kw, "CROSS") == 0) {
+		    if (! (allowed & config_op_add)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
+		    add->crossmount = 1;
+		    rep = finish_add(add, &changes, cblock);
+		    add = NULL;
+		    goto report;
+		}
+#endif /* NOTIFY != NOTIFY_NONE */
 		break;
 	    case 'D' : case 'd' :
 		if (is_server && strcasecmp(kw, "DATA") == 0) {
+		    long long start, csize, dsize;
+		    const char * dptr;
 		    if (! (allowed & config_op_read)) {
 			rep = "EPERM Operation not permitted";
 			goto report;
 		    }
-		    long long start, usize, csize, dsize;
-		    const char * dptr;
-		    if (! pagemap) {
+		    if (rfd < 0) {
 			rep = "EBADF File not opened";
 			goto report;
 		    }
@@ -564,19 +598,18 @@ void * run_server(void * _tp) {
 			rep = "EINVAL Invalid request";
 			goto report;
 		    }
-		    if (start < 0 || usize < 0) {
-			rep = "EINVAL Invalid request";
+		    udata = get_block(rfd, start, &usize, ublock,
+				      &block_start, &block_size);
+		    if (! udata) {
+			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					  "run_server", "get_block");
 			goto report;
 		    }
-		    if (start >= maprealsize) {
-			rep = "OK 0";
-			goto report;
-		    }
-		    if (usize > DATA_BLOCKSIZE) usize = DATA_BLOCKSIZE;
-		    if (start + usize >= maprealsize)
-			usize = maprealsize - start;
-		    if (compression >= 0)
-			csize = compress_data(compression, pagemap + start,
+#if THEY_HAVE_LIBRSYNC
+		send_data:
+#endif
+		    if (compression >= 0 && usize > 0)
+			csize = compress_data(compression, udata,
 					      usize, cblock);
 		    else
 			csize = -1;
@@ -588,7 +621,7 @@ void * run_server(void * _tp) {
 					 "run_server", errno);
 			    break;
 			}
-			dptr = pagemap + start;
+			dptr = udata;
 			dsize = usize;
 		    } else {
 			char tmpbuff[64];
@@ -623,6 +656,41 @@ void * run_server(void * _tp) {
 		    }
 		    goto noreport;
 		}
+#if THEY_HAVE_LIBRSYNC
+		if (is_server && strcasecmp(kw, "DELTA") == 0) {
+		    long long msize;
+		    ssize_t nr;
+		    if (rfd < 0) {
+			rep = "EBADF File not opened";
+			goto report;
+		    }
+		    if (! has_signatures) {
+			rep = "EINVAL Did not see a SIGNATURE command";
+			goto report;
+		    }
+		    if (rdiff_pipe.tochild >= 0) {
+			close(rdiff_pipe.tochild);
+			rdiff_pipe.tochild = -1;
+		    }
+		    if (sscanf(lptr, "%lld", &msize) < 1) {
+			rep = "EINVAL Invalid request";
+			goto report;
+		    }
+		    if (msize > DATA_BLOCKSIZE)
+			msize = DATA_BLOCKSIZE;
+		    // XXX replace following with librsync
+		    block_start = block_size = -1;
+		    nr = read(rdiff_pipe.fromchild, ublock, msize);
+		    if (nr < 0) {
+			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					  "run_server", "rdiff");
+			goto report;
+		    }
+		    usize = nr;
+		    udata = ublock;
+		    goto send_data;
+		}
+#endif
 		if (strcasecmp(kw, "DEBUG") == 0) {
 		    if (! (allowed & config_op_debug)) {
 			rep = "EPERM Operation not permitted";
@@ -670,7 +738,6 @@ void * run_server(void * _tp) {
 		break;
 	    case 'E' : case 'e' :
 		if (strcasecmp(kw, "EXTENSIONS") == 0) {
-		    socket_autoflush(p, 0);
 		    if (! socket_puts(p, "OK sending extensions list")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
@@ -689,6 +756,13 @@ void * run_server(void * _tp) {
 			    break;
 			}
 			// XXX IGNORE (is_server)
+#if THEY_HAVE_LIBRSYNC
+			if (! socket_puts(p, "RSYNC")) {
+			    error_report(error_server, addr,
+					 "run_server", errno);
+			    break;
+			}
+#endif
 		    } else {
 			if (! socket_puts(p, "DIRSYNC")) {
 			    error_report(error_server, addr,
@@ -696,7 +770,6 @@ void * run_server(void * _tp) {
 			    break;
 			}
 		    }
-		    socket_autoflush(p, 1);
 		    if (! socket_puts(p, ".")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
@@ -793,7 +866,8 @@ void * run_server(void * _tp) {
 				    minor(ev.file_device));
 			}
 			if (! socket_puts(p, cblock)) {
-			    error_report(error_server, addr, "run_server", errno);
+			    error_report(error_server, addr,
+					 "run_server", errno);
 			    break;
 			}
 		    }
@@ -801,16 +875,20 @@ void * run_server(void * _tp) {
 			char mtime[64];
 			struct tm tm;
 			gmtime_r(&ev.file_mtime, &tm);
-			strftime(mtime, sizeof(mtime), "%Y-%m-%d:%H:%M:%S", &tm);
+			strftime(mtime, sizeof(mtime),
+				 "%Y-%m-%d:%H:%M:%S", &tm);
 			sprintf(cblock, "MTIME %s", mtime);
 			if (! socket_puts(p, cblock)) {
-			    error_report(error_server, addr, "run_server", errno);
+			    error_report(error_server, addr,
+					 "run_server", errno);
 			    break;
 			}
 		    }
 		    goto noreport;
 		}
+#endif /* NOTIFY != NOTIFY_NONE */
 		break;
+#if NOTIFY != NOTIFY_NONE
 	    case 'F' : case 'f' :
 		if (is_server && strcasecmp(kw, "FIND") == 0) {
 		    if (! (allowed & config_op_add)) {
@@ -857,7 +935,6 @@ void * run_server(void * _tp) {
 					  "opendir", cblock);
 			goto report;
 		    }
-		    socket_autoflush(p, 0);
 		    if (! socket_puts(p, "OK")) {
 			error_report(error_server, addr, "run_server", errno);
 			closedir(dp);
@@ -886,7 +963,6 @@ void * run_server(void * _tp) {
 			break;
 		    }
 		    closedir(dp);
-		    socket_autoflush(p, 1);
 		    if (! socket_puts(p, ".")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
@@ -904,7 +980,6 @@ void * run_server(void * _tp) {
 			rep = "EPERM Operation not permitted";
 			goto report;
 		    }
-		    socket_autoflush(p, 0);
 		    if (! socket_puts(p, "OK")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
@@ -927,7 +1002,6 @@ void * run_server(void * _tp) {
 			}
 		    }
 		    if (err) break;
-		    socket_autoflush(p, 1);
 		    if (! socket_puts(p, "__END__")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
@@ -940,7 +1014,6 @@ void * run_server(void * _tp) {
 			rep = "EPERM Operation not permitted";
 			goto report;
 		    }
-		    socket_autoflush(p, 0);
 		    if (! socket_puts(p, "OK")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
@@ -963,7 +1036,6 @@ void * run_server(void * _tp) {
 			}
 		    }
 		    if (err) break;
-		    socket_autoflush(p, 1);
 		    if (! socket_puts(p, "__END__")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
@@ -997,7 +1069,6 @@ void * run_server(void * _tp) {
 	    case 'O' : case 'o' :
 		if (is_server && strcasecmp(kw, "OPEN") == 0) {
 		    struct stat sbuff;
-		    int dfd;
 		    if (! (allowed & config_op_read)) {
 			rep = "EPERM Operation not permitted";
 			goto report;
@@ -1008,8 +1079,8 @@ void * run_server(void * _tp) {
 			goto report;
 		    }
 		    if (Dname) myfree(Dname);
-		    if (pagemap) munmap(pagemap, mapsize); 
-		    pagemap = NULL;
+		    if (rfd >= 0) close(rfd);
+		    rfd = -1;
 		    Dname = mymalloc(1 + namelen);
 		    if (! Dname) {
 			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
@@ -1040,44 +1111,33 @@ void * run_server(void * _tp) {
 		     * just right now. Nothing we can do about it, but we open
 		     * the file in nonblocking mode and then re-check with
 		     * fstat that it's still a regular file */
-		    dfd = open(Dname, O_RDONLY|O_NONBLOCK);
-		    if (dfd < 0) {
+		    rfd = open(Dname, O_RDONLY|O_NONBLOCK);
+		    if (rfd < 0) {
 			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
 					  "run_server", Dname);
 			goto report;
 		    }
-		    if (fstat(dfd, &sbuff) < 0) {
+		    if (fstat(rfd, &sbuff) < 0) {
 			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
 					  "run_server", Dname);
-			close(dfd);
+			close(rfd);
+			rfd = -1;
 			goto report;
 		    }
 		    if (! S_ISREG(sbuff.st_mode)) {
 			rep = "EBADF not a regular file";
-			close(dfd);
+			close(rfd);
+			rfd = -1;
 			goto report;
 		    }
 		    if (sbuff.st_size == 0) {
 			rep = "File has zero size, no need to OPEN it...";
-			close(dfd);
+			close(rfd);
+			rfd = -1;
 			goto report;
 		    }
 		    /* reset O_NONBLOCK */
-		    fcntl(dfd, F_SETFL, 0L);
-		    /* mmap the file */
-		    maprealsize = sbuff.st_size;
-		    mapsize = (maprealsize + pagesize - 1) / pagesize;
-		    mapsize *= pagesize;
-		    pagemap = mmap(NULL, mapsize, PROT_READ,
-				   MAP_PRIVATE, dfd, (off_t)0);
-		    if (! pagemap || pagemap == MAP_FAILED) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", Dname);
-			close(dfd);
-			pagemap = NULL;
-			goto report;
-		    }
-		    close(dfd);
+		    fcntl(rfd, F_SETFL, 0L);
 		    rep = "OK file opened";
 		    goto report;
 		}
@@ -1111,8 +1171,48 @@ void * run_server(void * _tp) {
 		    goto report;
 		}
 		break;
-#if NOTIFY != NOTIFY_NONE
 	    case 'R' : case 'r' :
+#if THEY_HAVE_LIBRSYNC
+		if (is_server && strcasecmp(kw, "RSYNC") == 0) {
+		    long long start;
+		    const char * command[6];
+		    if (rfd < 0) {
+			rep = "EBADF File not opened";
+			goto report;
+		    }
+		    if (sscanf(lptr, "%lld %lld", &start, &usize) < 2) {
+			rep = "EINVAL Invalid request";
+			goto report;
+		    }
+		    if (start < 0 || usize < 0) {
+			rep = "EINVAL Invalid request";
+			goto report;
+		    }
+		    // XXX replace following with librsync
+		    pipe_close(&rdiff_pipe);
+		    rdiff_start = rdiff_size = -1;
+		    has_signatures = 0;
+		    command[0] = "rdiff";
+		    command[1] = "delta";
+		    command[2] = "-";
+		    command[3] = Dname;
+		    command[4] = "-";
+		    command[5] = NULL;
+		    if (! pipe_openfromto((char * const *)command, &rdiff_pipe))
+		    {
+			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					  "run_server", "rdiff");
+			goto report;
+		    }
+		    rdiff_start = start;
+		    rdiff_size = usize;
+		    snprintf(cblock, DATA_BLOCKSIZE, "OK %lld %d",
+			     usize, DATA_BLOCKSIZE);
+		    rep = cblock;
+		    goto report;
+		}
+#endif /* THEY_HAVE_LIBRSYNC */
+#if NOTIFY != NOTIFY_NONE
 		if (is_server && strcasecmp(kw, "REMOVE") == 0) {
 		    char * path;
 		    if (! (allowed & config_op_remove)) {
@@ -1145,9 +1245,117 @@ void * run_server(void * _tp) {
 		    }
 		    goto report;
 		}
-		break;
 #endif /* NOTIFY != NOTIFY_NONE */
+		break;
 	    case 'S' : case 's' :
+#if THEY_HAVE_LIBRSYNC
+		if (is_server && strcasecmp(kw, "SIGNATURE") == 0) {
+		    long long csize;
+		    int dcount;
+		    const char * dptr;
+		    if (rfd < 0) {
+			rep = "EBADF File not opened";
+			goto report;
+		    }
+		    if (rdiff_start < 0) {
+			rep = "EINVAL Did not see an RSYNC command";
+			goto report;
+		    }
+		    dcount = sscanf(lptr, "%lld %lld", &csize, &usize);
+		    if (dcount < 1) {
+			rep = "EINVAL Invalid request";
+			goto report;
+		    }
+		    if (dcount < 2) {
+			usize = csize;
+		    } else if ( compression < 0) {
+			rep = "EINVAL no compression selected";
+			goto report;
+		    }
+		    if (csize < 0 || usize < 0 || usize < csize) {
+			rep = "EINVAL Invalid request";
+			goto report;
+		    }
+		    if (usize > DATA_BLOCKSIZE) {
+			skip_data(p, usize);
+			rep = "EINVAL Buffer overflow";
+			goto report;
+		    }
+		    if (! socket_puts(p, "OK send the data")) {
+			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					  "run_server", "socket_put");
+			goto report;
+		    }
+		    // XXX replace following with librsync
+		    if (! socket_get(p, cblock, csize)) {
+			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					  "run_server", "socket_get");
+			goto report;
+		    }
+		    dptr = cblock;
+		    if (dcount >= 2) {
+			int bsize = DATA_BLOCKSIZE;
+			block_start = block_size = -1;
+			rep = uncompress_data(compression, cblock, csize,
+					      ublock, &bsize);
+			if (rep) goto report;
+			if (bsize != usize) {
+			    rep = "EBADF Uncompressed data has wrong size";
+			    goto report;
+			}
+			dptr = ublock;
+		    }
+		    while (usize > 0) {
+			ssize_t nw = write(rdiff_pipe.tochild, dptr, usize);
+			if (nw < 0) {
+			    rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					      "run_server", "delta");
+			    goto report;
+			}
+			if (nw == 0) {
+			    rep = "EINVAL short write";
+			    goto report;
+			}
+			usize -= nw;
+			dptr += nw;
+		    }
+		    has_signatures = 1;
+		    rep = "OK";
+		    goto report;
+		}
+#endif
+		if (is_server && strcasecmp(kw, "STAT") == 0) {
+		    int len, trans, s;
+		    if (! (allowed & config_op_read)) {
+			rep = "EPERM Operation not permitted";
+			goto report;
+		    }
+		    if (sscanf(lptr, "%d %d", &len, &trans) < 2) {
+			rep = "EINVAL Invalid request";
+			goto report;
+		    }
+		    if (len >= DATA_BLOCKSIZE - NAME_MAX - 2) {
+			skip_data(p, len);
+			rep = "EINVAL name too long";
+			goto report;
+		    }
+		    if (! socket_get(p, cblock, len)) {
+			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					  "run_server", "socket_get");
+			goto report;
+		    }
+		    cblock[len] = 0;
+		    s = send_stat(p, cblock, trans, "OK ", NULL);
+		    if (s > 0)
+			goto noreport;
+		    if (s < 0) {
+			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
+					  "run_server", "stat");
+			goto report;
+		    }
+		    error_report(error_server, addr, "run_server", errno);
+		    break;
+		}
 		if (strcasecmp(kw, "STOP") == 0) {
 		    if (! (allowed & config_op_stop)) {
 			rep = "EPERM Operation not permitted";
@@ -1215,38 +1423,6 @@ void * run_server(void * _tp) {
 			break;
 		    }
 		    goto noreport;
-		}
-		if (is_server && strcasecmp(kw, "STAT") == 0) {
-		    int len, trans, s;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (sscanf(lptr, "%d %d", &len, &trans) < 2) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    if (len >= DATA_BLOCKSIZE - NAME_MAX - 2) {
-			skip_data(p, len);
-			rep = "EINVAL name too long";
-			goto report;
-		    }
-		    if (! socket_get(p, cblock, len)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "socket_get");
-			goto report;
-		    }
-		    cblock[len] = 0;
-		    s = send_stat(p, cblock, trans, "OK ", NULL);
-		    if (s > 0)
-			goto noreport;
-		    if (s < 0) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "stat");
-			goto report;
-		    }
-		    error_report(error_server, addr, "run_server", errno);
-		    break;
 		}
 #if NOTIFY != NOTIFY_NONE
 		if (is_server && strcasecmp(kw, "SETROOT") == 0) {
@@ -1376,10 +1552,8 @@ void * run_server(void * _tp) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
 		    }
-		    socket_autoflush(p, 0);
 		    if (! notify_forall_watches(send_watch, p))
 			break;
-		    socket_autoflush(p, 1);
 		    if (! socket_puts(p, "0")) {
 			error_report(error_server, addr, "run_server", errno);
 			break;
@@ -1396,6 +1570,7 @@ void * run_server(void * _tp) {
 	    socket_get(p, line, LINESIZE);
 	    namelen -= sz;
 	}
+	goto report;
     not_found:
 	rep = "Invalid request";
     report:
@@ -1404,10 +1579,14 @@ void * run_server(void * _tp) {
 	    break;
 	}
     noreport:
+	if (! socket_flush(p)) {
+	    error_report(error_server, addr, "run_server", errno);
+	    break;
+	}
 	continue;
     }
     if (updating) config_cancel_update();
-    if (pagemap) munmap(pagemap, mapsize);
+    if (rfd >= 0) close(rfd);
     if (Dname) myfree(Dname);
 #if NOTIFY != NOTIFY_NONE
     if (get) store_finish(get);
@@ -1419,6 +1598,9 @@ void * run_server(void * _tp) {
 	error_report(info_count_watches, info.watches);
     }
 #endif /* NOTIFY != NOTIFY_NONE */
+#if THEY_HAVE_LIBRSYNC
+    pipe_close(&rdiff_pipe);
+#endif
     error_report(info_connection_close, user, addr);
     socket_disconnect(p);
     tp->completed = 1;

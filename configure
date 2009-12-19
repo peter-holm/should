@@ -257,6 +257,8 @@ fi
 check_extra libz '' -lz '#define THEY_HAVE_ZLIB 1' zlib 'void * ptr = deflate'
 check_extra libbz2 '' -lbz2 '#define THEY_HAVE_BZLIB 1' bzlib \
 	    'void * ptr = BZ2_bzCompress'
+check_extra librsync '' -lrsync '#define THEY_HAVE_LIBRSYNC 1' librsync \
+	    'void * ptr = rs_file_copy_cb'
 
 echo
 echo "Determining notify model to use"

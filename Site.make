@@ -32,5 +32,5 @@ INSTALLMAN = $(PREFIX)/share/man
 INSTALLMAN1 = $(INSTALLMAN)/man1
 
 # any arguments passed to Makefile.PL
-MAKEFILE_PL =
+MAKEFILE_PL = PREFIX=$(PREFIX)
 

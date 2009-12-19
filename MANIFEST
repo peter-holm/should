@@ -37,6 +37,8 @@ src/mymalloc.c
 src/mymalloc.h
 src/notify_thread.c
 src/notify_thread.h
+src/pipe.c
+src/pipe.h
 src/protocol.c
 src/protocol.h
 src/site.h

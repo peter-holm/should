@@ -1059,6 +1059,7 @@ const char * notify_init(void) {
     if (config_intval(cfg, cfg_event_create)) i_mask |= CREATE_EVENT;
     if (config_intval(cfg, cfg_event_delete)) i_mask |= DELETE_EVENT;
     if (config_intval(cfg, cfg_event_rename)) i_mask |= RENAME_EVENT;
+    if (config_intval(cfg, cfg_event_hardlink)) i_mask |= RENAME_EVENT;
 #endif
     config_put(cfg);
     /* set up root watch */
@@ -1080,24 +1081,15 @@ const char * notify_init(void) {
 
 /* queue a rename event */
 
-#if NOTIFY == NOTIFY_INOTIFY
-static void rename_event(EVENT * evp, notify_watch_t * evw,
+#if NOTIFY != NOTIFY_NONE
+static void queue_rename(EVENT * evp, notify_watch_t * evw,
 			 EVENT * destp, notify_watch_t * destw,
 			 int is_dir, int notify_max)
 {
-    /* make sure the rename is from evp to destp */
-#if NOTIFY == NOTIFY_INOTIFY
-    if (evp->mask & IN_MOVED_TO) {
-	EVENT * swp;
-	notify_watch_t * sww;
-	swp = destp; destp = evp; evp = swp;
-	sww = destw; destw = evw; evw = sww;
-    }
-#endif
     queue_event(notify_rename, is_dir, notify_max,
 		evw, evp->name, destw, destp->name, 1);
-    /* do we need to update our watch data? */
 #if NOTIFY == NOTIFY_INOTIFY
+    /* do we need to update our watch data? */
     if (evp->mask & IN_ISDIR) {
 	int dlen, namelen;
 	char * wname;
@@ -1165,6 +1157,7 @@ const char * notify_thread(void) {
 	config_filter_t filter[cfg_event_COUNT];
 	const config_data_t * cfg;
 	int buffer_start = 0, buffer_end = 0, errcode, i, skip_should;
+	int notify_max;
 #if NOTIFY == NOTIFY_INOTIFY
 	struct pollfd pfd;
 	pfd.fd = inotify_fd;
@@ -1182,6 +1175,7 @@ const char * notify_thread(void) {
 	for (i = 0; i < cfg_event_COUNT; i++)
 	    filter[i] = config_intval(cfg, i);
 	skip_should = config_intval(cfg, cfg_flags) & config_flag_skip_should;
+	notify_max = config_intval(cfg, cfg_notify_max);
 	config_put(cfg);
 	/* lock queue */
 	errcode = pthread_mutex_lock(&queue_lock);
@@ -1203,8 +1197,7 @@ const char * notify_thread(void) {
 	    /* handle all nameless events */
 #if NOTIFY == NOTIFY_INOTIFY
 	    if (evp->mask & IN_Q_OVERFLOW) {
-		queue_event(notify_overflow, 0,
-			    config_intval(cfg, cfg_notify_max),
+		queue_event(notify_overflow, 0, notify_max,
 			    NULL, NULL, NULL, NULL, 1);
 		overflow++;
 		continue;
@@ -1255,15 +1248,64 @@ const char * notify_thread(void) {
 		    EVENT * destp = (void *)&event_buffer[buffer_start];
 		    if (destp->mask & (IN_MOVED_FROM | IN_MOVED_TO)) {
 			if (destp->cookie == evp->cookie) {
-			    /* this is a rename event... */
+			    /* this is a rename or hardlink event... */
 			    notify_watch_t * destw =
 				find_watch_by_id(destp->wd);
 			    if (destw) {
+				int is_link = 0;
 				buffer_start += sizeof(EVENT) + destp->len;
-				if (filter[cfg_event_rename] & filter_mask)
-				    rename_event(evp, evw, destp, destw, is_dir,
-						 config_intval(cfg,
-							       cfg_notify_max));
+#if NOTIFY == NOTIFY_INOTIFY
+				/* make sure the rename is from evp to destp */
+				if (evp->mask & IN_MOVED_TO) {
+				    EVENT * swp;
+				    notify_watch_t * sww;
+				    swp = destp; destp = evp; evp = swp;
+				    sww = destw; destw = evw; evw = sww;
+				}
+#endif
+				/* is it rename or hardlink? the only way to
+				 * find out is to check if both source and
+				 * destination exist and they are the same
+				 * file; also, we don't hardlink to dirs,
+				 * and we only need to check the destination
+				 * if the source has link count > 1 */
+				if (! is_dir) {
+				    int evnlen = strlen(evp->name);
+				    int evplen = store_length(evw, evnlen);
+				    struct stat evstat;
+				    char evname[evplen + 1];
+				    store_name(evw, evp->name, evnlen, evname,
+					       evplen, 1);
+				    if (lstat(evname, &evstat) >= 0 &&
+					evstat.st_nlink > 1)
+				    {
+					int destnlen = strlen(destp->name);
+					int destplen =
+					    store_length(destw, destnlen);
+					struct stat deststat;
+					char destname[destplen + 1];
+					store_name(destw, destp->name,
+						   destnlen, destname,
+						   destplen, 1);
+					if (lstat(destname, &deststat) >= 0 &&
+					    deststat.st_ino == evstat.st_ino &&
+					    deststat.st_dev == evstat.st_dev)
+					{
+					    is_link = 1;
+					}
+				    }
+				}
+				if (is_link) {
+				    if (filter[cfg_event_hardlink] &
+					    filter_mask)
+					queue_event(notify_hardlink, is_dir,
+						    notify_max, evw, evp->name,
+						    destw, destp->name, 1);
+				} else {
+				    if (filter[cfg_event_rename] & filter_mask)
+					queue_rename(evp, evw, destp, destw,
+						     is_dir, notify_max);
+				}
 				continue;
 			    }
 			}
@@ -1334,8 +1376,8 @@ const char * notify_thread(void) {
 		continue;
 	    }
 #if NOTIFY == NOTIFY_INOTIFY
-	    if (filter_data & filter_mask)
-		queue_event(evtype, is_dir, config_intval(cfg, cfg_notify_max),
+	    if (filter[filter_data] & filter_mask)
+		queue_event(evtype, is_dir, notify_max,
 			    evw, evp->len > 0 ? evp->name : NULL,
 			    NULL, NULL, 1);
 #endif
@@ -1854,6 +1896,7 @@ int notify_get(notify_event_t * nev, int blocking, char * buffer, int * bsz) {
 	    statit = nev->from_name;
 	fill_stat:
 	    if (lstat(statit, &sbuff) >= 0) {
+	lstat_done:
 		nev->stat_valid = 1;
 		nev->file_type = notify_filetype(sbuff.st_mode);
 		nev->file_mode = sbuff.st_mode & 07777;
@@ -1877,6 +1920,10 @@ int notify_get(notify_event_t * nev, int blocking, char * buffer, int * bsz) {
 		}
 	    }
 	    break;
+	case notify_hardlink :
+	    if (lstat(statit, &sbuff) >= 0) goto lstat_done;
+	    statit = nev->to_name;
+	    goto fill_stat;
 	case notify_rename :
 	    statit = nev->to_name;
 	    goto fill_stat;

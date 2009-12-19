@@ -112,6 +112,10 @@ EXTENSIONS
     IGNORE
 	The server supports the IGNORE command.
 
+    RSYNC
+	The server is linked against librsync and provides the RSYNC,
+	SIGNATURE and DELTA commands.
+
     UPDATE
 	The server supports the UPDATE command.
 
@@ -180,6 +184,7 @@ STATUS
     version            server version
     memory             number of bytes or memory allocated dynamically
     events_copied      number of events copied since startup
+    event_time         time spent processing events
     read_file_num      event file number being processed
     read_file_pos      position in event file
     pending_dirsyncs   number of paths in the current dirsync queue
@@ -361,6 +366,58 @@ CHECKSUM start size
     This can be used to avoid transferring part of a file if it is already
     on the client. This option is only available if
 
+RSYNC start size
+(server, read)
+    This command is only available if the server lists RSYNC in reply to
+    the EXTENSIONS command.
+
+    The client wants to send a signature file and receive a delta file,
+    as produced by librsync or rdiff. The client must have selected a file
+    to operate against (using the OPEN) command. Start and size determine
+    the part of the file being considered.
+
+    If there is no error in the request, the server will reply with
+    "OK rsize bzise", where "rsize" is the actual size it is going to consider
+    (which may be smaller than the requested if the file is shorter than
+    start + size), and "bzise" is the server's buffer size (see the
+    SIGNATURE command).
+
+    The client will then send the signature using a sequence of SIGNATURE
+    commands, and retrieve the delta using the DELTA command repeatedly.
+
+SIGNATURE [csize] size
+(server, read)
+    This command is only available if the server lists RSYNC in reply to
+    the EXTENSIONS command.
+
+    The client is sending the next block of the "rdiff" signature. Before
+    sending this command, it must have used the "RSYNC" command to start
+    the procedure. The "size" argument must be less than or equal to
+    the server's buffer size, as returned by the "RSYNC" command.
+
+    If just one number is provided by the command, the server waits for
+    "size" bytes of data, then returns "OK" if they have been received
+    correctly.
+
+    If two numbers are provided by the client, "csize" must be less than
+    "size". The server waits for "csize" bytes of data and uncompresses
+    them; the uncompressed data must be of size "size" (or else the
+    server will produce an error). Again, the server returns "OK"  if the
+    data has been received and uncompressed correctly.
+
+DELTA size
+(server, read)
+    This command is only available if the server lists RSYNC in reply to
+    the EXTENSIONS command.
+
+    This command is only valid if the client has requested a delta file
+    using the RSYNC command, and has finished sending the signature. The
+    server will now send the next block of up to "size" bytes. The reply
+    will be similar to the DATA command: an OK with one or two numbers,
+    depending on whether compression was enabled and useful, then the
+    actual data block. An empty data block ("OK 0") indicates the end of
+    the delta file.
+
 SETCHECKSUM name
 (server, read)
     This command is only available if the server lists CHECKSUM in reply to
@@ -489,6 +546,7 @@ EVENT timeout max
     5            0      0    events were lost
     6            0      0    block size too small: event could not be stored
     7            0      1    tree was added to the watch list
+    8            1      1    new name was added to an existing file (hard link)
 
     The file type is one of:
 

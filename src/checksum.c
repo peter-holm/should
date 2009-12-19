@@ -20,6 +20,7 @@
  */
 
 #include "site.h"
+#include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
 #if THEY_HAVE_MD5

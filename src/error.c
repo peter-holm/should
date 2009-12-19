@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <errno.h>
 #include <time.h>
 #include <string.h>
@@ -37,6 +38,7 @@
 #include "config.h"
 #include "main_thread.h"
 #include "mymalloc.h"
+#include "pipe.h"
 
 #define LINE_SIZE 2048
 #define TIMESTAMP 32
@@ -137,6 +139,12 @@ static deferr_t deferr[error_MAX] = {
 	.argtype  = { arg_errno, arg_void, arg_void, arg_void, arg_void },
 	.name     = "wait",
     },
+    [error_pipe] = {
+	.level    = error_level_crit,
+	.defmsg   = "pipe(): %s",
+	.argtype  = { arg_errno, arg_void, arg_void, arg_void, arg_void },
+	.name     = "pipe",
+    },
     [error_badevent] = {
 	.level    = error_level_crit,
 	.defmsg   = "Bad event descriptor: %s",
@@ -167,8 +175,14 @@ static deferr_t deferr[error_MAX] = {
 	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
 	.name     = "getdir",
     },
+    [error_cleanup] = {
+	.level    = error_level_err,
+	.defmsg   = "cleanup: %s",
+	.argtype  = { arg_errno, arg_void, arg_void, arg_void, arg_void },
+	.name     = "cleanup",
+    },
     [error_accept] = {
-	.level    = error_level_crit,
+	.level    = error_level_err,
 	.defmsg   = "accept(): %s",
 	.argtype  = { arg_errno, arg_void, arg_void, arg_void, arg_void },
 	.name     = "accept",
@@ -340,6 +354,12 @@ static deferr_t deferr[error_MAX] = {
 	.defmsg   = "Error renaming %s to %s) %s",
 	.argtype  = { arg_string, arg_string, arg_errno, arg_void, arg_void },
 	.name     = "copy_rename",
+    },
+    [error_copy_hardlink] = {
+	.level    = error_level_err,
+	.defmsg   = "Error linking %s to %s) %s",
+	.argtype  = { arg_string, arg_string, arg_errno, arg_void, arg_void },
+	.name     = "copy_hardlink",
     },
     [error_copy_invalid] = {
 	.level    = error_level_err,
@@ -521,6 +541,12 @@ static deferr_t deferr[error_MAX] = {
 	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
 	.name     = "info_replication_rename",
     },
+    [info_replication_hardlink] = {
+	.level    = error_level_info,
+	.defmsg   = "replication: link(%s, %s)",
+	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
+	.name     = "info_replication_hardlink",
+    },
     [info_sched_dirsync] = {
 	.level    = error_level_info,
 	.defmsg   = "scheduling %s dirsync \"%s\"",
@@ -701,10 +727,35 @@ void error_report(error_message_t em, ...) {
     va_end(ap);
     set_timestamp(timestamp, time(NULL));
     if (dest & error_dest_email) {
-	if (config_strval(cfg, cfg_error_email) &&
-	    config_strarr(cfg, cfg_strarr_email_submit))
-	{
-	    /* XXX send email to config_strval(cfg, cfg_error_email) */
+	char * const * eptr = config_strarr(cfg, cfg_strarr_email_submit);
+	if (eptr && eptr[0] && config_strval(cfg, cfg_error_email)) {
+	    int nes = config_strarr_len(cfg, cfg_strarr_email_submit), i, ok;
+	    const char * command[2 + nes];
+	    pipe_t pipe;
+	    ok = 0;
+	    for (i = 0; i < nes; i++)
+		command[i] = eptr[i];
+	    command[nes] = config_strval(cfg, cfg_error_email);
+	    command[nes + 1] = NULL;
+	    if (pipe_opento((char * const *)command, &pipe)) {
+		FILE * F = fdopen(pipe.tochild, "w");
+		if (F) {
+		    pipe.tochild = -1;
+		    fprintf(F, "Error from %s (pid %d) at %s:\n",
+			    config_strval(cfg, cfg_error_ident),
+			    (int)getpid(),
+			    timestamp);
+		    fprintf(F, msg,
+			    bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]);
+		    fprintf(F, "\n");
+		    fclose(F);
+		}
+		pipe_close(&pipe);
+	    }
+	    if (! ok) {
+		/* cannot email, log it */
+		dest |= error_dest_file | error_dest_syslog;
+	    }
 	}
     }
     /* if we use a log file or stderr we lock stderr now: as a result:

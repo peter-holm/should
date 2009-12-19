@@ -24,6 +24,7 @@
 
 #include <time.h>
 #include "socket.h"
+#include "pipe.h"
 
 /* type used to return information about event processed */
 
@@ -32,6 +33,7 @@ typedef struct {
     int file_pos;      /* bytes in the current event file */
     int events;        /* events processed since startup */
     int dirsyncs;      /* dirsyncs currently pending */
+    struct timespec etime; /* time spent copying events */
     long long rbytes;  /* bytes read from server */
     long long wbytes;  /* bytes written to server */
     long long tbytes;  /* file data bytes (total) */
@@ -59,11 +61,12 @@ void copy_exit(void);
  * use to copy the file data; if checksum is nonnegative it identifies a
  * checksum method to use to avoid copying data already present in the client;
  * both compression and checksum must have already been set up on the server;
- * extcopy is an open file descriptor to the external copy program, or -1
- * to use the internal copy */
+ * extcopy is an open pipe descriptor to the external copy program, or
+ * leave closed to use the internal copy */
 
 void copy_file(socket_t * p, const char * from, const char * to, int tr_ids,
-	       int compression, int checksum, int extcopy);
+	       int compression, int checksum, pipe_t *  extcopy,
+	       int use_librsync);
 
 /* returns current event files information etc */
 

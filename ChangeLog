@@ -1,3 +1,28 @@
+Changes from 1.0.-4 to 1.0.-3:
+
+* Added a special check for hard links. Inotify reports them as renames!
+  (the documentation suggests that they are reported as inode changes,
+  reporting just the change in link count, which is useless to figure
+  out what was linked to what).
+
+* Added support for the rsync algorithm by linking against librsync
+  if available. It is not enabled by default, but enable_librsync on
+  the copy or copy setup command will enable it.
+
+* Added the option to request an extra fork, where the parent process
+  does nothing but wait for the child to finish, then do any cleanup
+  the child could not do (this would only happen if the child is killed
+  by a signal which could not be caught).
+
+* Added an extra copy configuration file, sourced by the copy state file,
+  so that can be edited by the user. Becuase they will edit it, even if
+  the manpage says to leave it alone and the file starts with a notice that
+  it must not be modified.
+
+* Finished some formerly unimplemented bits.
+
+* Some bugfixes. Probably new bugs introduced too.
+
 Changes from 1.0.-5 to 1.0.-4:
 
 * Added a mask of allowed operations to allow_unix and allow_tcp so that

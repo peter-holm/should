@@ -42,7 +42,8 @@ typedef enum {
     notify_overflow,          /* events were lost */
     notify_nospace,           /* block size too small: event could not be
 			       * stored */
-    notify_add_tree           /* tree was added to the watch list */
+    notify_add_tree,          /* tree was added to the watch list */
+    notify_hardlink           /* name was added to an existing file */
 } notify_event_type_t;
 
 /* file type, if known */

@@ -47,6 +47,18 @@
 #define IDENTIFY_COPY "# SHOULD STATE FILE %lf"
 #define IDENTIFY_VERSION (double)1.0
 #define IDENTIFY_MINIMUM (double)1.0
+#define INITIAL_COMMENTS_CONFIG \
+	"# Copy configuration file for \"should\"\n" \
+	"# This file is sourced by %s: use the command\n" \
+	"#     should copy=%s\n" \
+	"# to start the copy\n"
+#define INITIAL_COMMENTS_STATE \
+	"# Plese do not alter or delete the previous line\n" \
+	"# Plese do not modify this file while the program is running\n"
+#define CONFIG_COMMENTS_STATE \
+	"# See file %s for editable configuration\n"
+#define FINAL_COMMENTS \
+	"# Plese do not alter or delete anything after this line\n"
 
 #define UPDATE_COUNT 5
 #define LINE_SIZE 1024
@@ -88,12 +100,6 @@ typedef enum {
     locfl_has_socket  = 0x1000,
     locfl_NONE        = 0
 } locfl_t;
-
-typedef struct {
-    int mul;
-    const char * name_s;
-    const char * name_p;
-} unit_t;
 
 typedef enum {
     include_silent = 0x01,
@@ -144,8 +150,10 @@ static const int default_ints[cfg_int_COUNT] = {
     [cfg_event_create]             = config_file_all,
     [cfg_event_delete]             = config_file_all,
     [cfg_event_rename]             = config_file_all,
+    [cfg_event_hardlink]           = config_file_all,
     [cfg_flags]                    = config_flag_translate_ids
                                    | config_flag_skip_matching,
+                                   // | config_flag_use_librsync,
     [cfg_client_mode]              = config_client_NONE,
 #if USE_SHOULDBOX
     [cfg_server_mode]              = config_server_NONE,
@@ -172,7 +180,7 @@ static const int default_ints[cfg_int_COUNT] = {
 FILE * config_copy_file = NULL;
 long config_copy_start = -1;
 
-static unit_t intervals[] = {
+const config_unit_t config_intervals[] = {
     {      1,   "second",    "seconds" },
     {     60,   "minute",    "minutes" },
     {   3600,   "hour",      "hours"   },
@@ -181,7 +189,7 @@ static unit_t intervals[] = {
     {      0,   NULL,        NULL      }
 };
 
-static unit_t sizes[] = {
+const config_unit_t config_sizes[] = {
     {          1,   "byte",      "bytes"     },
     {       1024,   "kilobyte",  "kilobytes" },
     {    1048576,   "megabyte",  "megabytes" },
@@ -225,7 +233,7 @@ static void unquote_string(char * d) {
     *d = 0;
 }
 
-static int parse_units(const char * name, const unit_t * units,
+static int parse_units(const char * name, const config_unit_t * units,
 		       const char ** err)
 {
     char * ep;
@@ -247,13 +255,13 @@ static int parse_units(const char * name, const unit_t * units,
     if (*ep) {
 	int len = strlen(ep);
 	while (len > 1 && isspace((int)ep[len - 1])) len--;
-	while (units->name_s) {
-	    if ((len == strlen(units->name_p) &&
-		 strncmp(ep, units->name_p, len) == 0) ||
-		(len == strlen(units->name_s) &&
-		 strncmp(ep, units->name_s, len) == 0))
+	while (units->name_singular) {
+	    if ((len == strlen(units->name_plural) &&
+		 strncmp(ep, units->name_plural, len) == 0) ||
+		(len == strlen(units->name_singular) &&
+		 strncmp(ep, units->name_singular, len) == 0))
 	    {
-		lnum *= units->mul;
+		lnum *= units->multiply;
 		if (lnum <= 0) {
 		    snprintf(errbuff, LINE_SIZE, "Number too large (%s)", name);
 		    *err = errbuff;
@@ -263,7 +271,7 @@ static int parse_units(const char * name, const unit_t * units,
 	    }
 	    units++;
 	}
-	if (! units->name_p) {
+	if (! units->name_plural) {
 	    snprintf(errbuff, LINE_SIZE, "Invalid unit (%s)", name);
 	    *err = errbuff;
 	    return -1;
@@ -276,54 +284,35 @@ static int parse_units(const char * name, const unit_t * units,
     return -1;
 }
 
-static const char * encode_units(int num, const unit_t * units) {
+/* parse a number + unit and returns a plain number */
+
+int config_parse_units(const config_unit_t units[], const char * name) {
+    const char * err = NULL;
+    int rv = parse_units(name, units, &err);
+    if (err) fprintf(stderr, "%s\n", err);
+    return rv;
+}
+
+/* the opposite of the above */
+
+const char * config_print_unit(const config_unit_t units[], int num) {
     static char unitbuff[512];
-    const unit_t * found = NULL;
+    const config_unit_t * found = NULL;
     /* find the best unit */
-    while (units->name_s) {
-	if (num % units->mul == 0)
-	    if (! found || found->mul < units->mul)
+    while (units->name_singular) {
+	if (num % units->multiply == 0)
+	    if (! found || found->multiply < units->multiply)
 		found = units;
 	units++;
     }
     if (found) {
-	num /= found->mul;
+	num /= found->multiply;
 	snprintf(unitbuff, sizeof(unitbuff), "%d %s",
-		 num, num == 1 ? found->name_s : found->name_p);
+		 num, num == 1 ? found->name_singular : found->name_plural);
     } else {
 	snprintf(unitbuff, sizeof(unitbuff), "%d", num);
     }
     return unitbuff;
-}
-
-/* parse a time interval and returns a number of seconds */
-
-int config_parse_interval(const char * name) {
-    const char * err = NULL;
-    int rv = parse_units(name, intervals, &err);
-    if (err) fprintf(stderr, "%s\n", err);
-    return rv;
-}
-
-/* the opposite of the above */
-
-const char * config_print_interval(int num) {
-    return encode_units(num, intervals);
-}
-
-/* parse a size and returns a number of bytes */
-
-int config_parse_size(const char * name) {
-    const char * err = NULL;
-    int rv = parse_units(name, sizes, &err);
-    if (err) fprintf(stderr, "%s\n", err);
-    return rv;
-}
-
-/* the opposite of the above */
-
-const char * config_print_size(int num) {
-    return encode_units(num, sizes);
 }
 
 /* parse a day range (mon-fri or tue,sat or sun,tue-thu,sat etc); returns
@@ -490,7 +479,8 @@ static int assign_int(const char * line, const char * keyword,
 }
 
 static int assign_unit(const char * line, const char * keyword,
-		       const unit_t * units, int * result, const char ** err)
+		       const config_unit_t * units, int * result,
+		       const char ** err)
 {
     int len = strlen(keyword);
     if (strncmp(line, keyword, len) != 0) return 0;
@@ -1355,6 +1345,8 @@ static int convert_filters(const char * title, char * buffer, const int orig[])
 	      list[cfg_event_delete], "delete");
     add_event(buffer, &len, &sep, orig[cfg_event_rename],
 	      list[cfg_event_rename], "rename");
+    add_event(buffer, &len, &sep, orig[cfg_event_hardlink],
+	      list[cfg_event_rename], "hardlink");
     if (sep == '=')
 	add_string(buffer, &len, "none");
     return len;
@@ -1615,26 +1607,56 @@ static int print_userslist(int (*p)(void *, const char *), void * arg,
 int config_store_copy(int fnum, int fpos, const char * user, const char * pass)
 {
     config_strlist_t * l;
-    FILE * S = NULL;
-    int fd = open(configs[currnum].strval[cfg_copy_state],
-		  O_WRONLY|O_CREAT|O_EXCL, 0600);
-    if (fd < 0)
-	goto problem;
-    if (lseek(fd, (off_t)0, SEEK_SET) < 0)
-	goto problem;
-    if (lockf(fd, F_LOCK, (off_t)0) < 0)
-	goto problem;
-    S = fdopen(fd, "w");
-    if (! S)
-	goto problem;
-    if (fprintf(S, IDENTIFY_COPY "\n", IDENTIFY_VERSION) < 0)
-	goto problem;
-    if (! printname(sendout, S, "from = ",
+    FILE * SF = NULL, * CF = NULL;
+    int cfd = -1, sfd, use_extra = 0;
+    const char * sname, * cname;
+    sname = configs[currnum].strval[cfg_copy_state];
+    cname = configs[currnum].strval[cfg_copy_config];
+    sfd = open(sname, O_WRONLY|O_CREAT|O_EXCL, 0600);
+    if (sfd < 0)
+	goto problem_s;
+    if (lseek(sfd, (off_t)0, SEEK_SET) < 0)
+	goto problem_s;
+    if (lockf(sfd, F_LOCK, (off_t)0) < 0)
+	goto problem_s;
+    SF = fdopen(sfd, "w");
+    if (! SF)
+	goto problem_s;
+    if (cname) {
+	cfd = open(cname, O_WRONLY|O_CREAT|O_EXCL, 0600);
+	if (cfd < 0)
+	    goto problem_c;
+	if (lseek(cfd, (off_t)0, SEEK_SET) < 0)
+	    goto problem_c;
+	if (lockf(cfd, F_LOCK, (off_t)0) < 0)
+	    goto problem_c;
+	CF = fdopen(cfd, "w");
+	if (! CF)
+	    goto problem_c;
+	if (fprintf(CF, INITIAL_COMMENTS_CONFIG, sname, sname) < 0)
+	    goto problem_c;
+	use_extra = 1;
+    } else {
+	cfd = -1;
+	CF = SF;
+	cname = sname;
+    }
+    if (fprintf(SF, IDENTIFY_COPY "\n", IDENTIFY_VERSION) < 0)
+	goto problem_s;
+    if (fprintf(SF, INITIAL_COMMENTS_STATE) < 0)
+	goto problem_s;
+    if (use_extra) {
+	if (fprintf(SF, CONFIG_COMMENTS_STATE, cname) < 0)
+	    goto problem_s;
+	if (! printname(sendout, SF, "include = ", cname))
+	    goto problem_s;
+    }
+    if (! printname(sendout, CF, "from = ",
 		    configs[currnum].strval[cfg_from_prefix]))
-	goto problem;
-    if (! printname(sendout, S, "to = ",
+	goto problem_c;
+    if (! printname(sendout, CF, "to = ",
 		    configs[currnum].strval[cfg_to_prefix]))
-	goto problem;
+	goto problem_c;
     l = configs[currnum].strlist[cfg_listen];
     while (l) {
 	if (l->data[0] != '/') {
@@ -1644,20 +1666,20 @@ int config_store_copy(int fnum, int fpos, const char * user, const char * pass)
 	    int c = strchr(l->data, ':') != NULL;
 	    sprintf(lhost, "%s%s%s:%s",
 		    c ? "[" : "", l->data, c ? "]" : "", port);
-	    if (! printname(sendout, S, "listen = ", lhost))
-		goto problem;
+	    if (! printname(sendout, CF, "listen = ", lhost))
+		goto problem_c;
 	} else {
-	    if (! printname(sendout, S, "listen = ", l->data))
-		goto problem;
+	    if (! printname(sendout, CF, "listen = ", l->data))
+		goto problem_c;
 	}
 	l = l->next;
     }
-    if (! print_userslist(sendout, S,
+    if (! print_userslist(sendout, CF,
 			  configs[currnum].aclval[cfg_acl_local], 0, 0))
-	goto problem;
-    if (! print_userslist(sendout, S,
+	goto problem_c;
+    if (! print_userslist(sendout, CF,
 			  configs[currnum].aclval[cfg_acl_tcp], 1, 0))
-	goto problem;
+	goto problem_c;
     if (configs[currnum].intval[cfg_flags] & config_flag_socket_changed) {
 	if (configs[currnum].strval[cfg_server][0] != '/') {
 	    int hlen = strlen(configs[currnum].strval[cfg_server]);
@@ -1667,106 +1689,135 @@ int config_store_copy(int fnum, int fpos, const char * user, const char * pass)
 	    sprintf(lhost, "%s%s%s:%s",
 		    c ? "[" : "", configs[currnum].strval[cfg_server],
 		    c ? "]" : "", port);
-	    if (! printname(sendout, S, "server = ", lhost))
-		goto problem;
+	    if (! printname(sendout, CF, "server = ", lhost))
+		goto problem_c;
 	} else {
-	    if (! printname(sendout, S, "server = ",
+	    if (! printname(sendout, CF, "server = ",
 			    configs[currnum].strval[cfg_server]))
-		goto problem;
+		goto problem_c;
 	}
     }
     if (configs[currnum].strarrval[cfg_strarr_extcopy] &&
-	! print_command(sendout, S, "external_copy",
+	! print_command(sendout, CF, "external_copy",
 			configs[currnum].strarrval[cfg_strarr_extcopy]))
-	    goto problem;
+	    goto problem_c;
     if (configs[currnum].strarrval[cfg_strarr_tunnel] &&
-	! print_command(sendout, S, "tunnel",
+	! print_command(sendout, CF, "tunnel",
 			configs[currnum].strarrval[cfg_strarr_tunnel]))
-	    goto problem;
+	    goto problem_c;
     if (configs[currnum].strarrval[cfg_strarr_remote_should] &&
-	! print_command(sendout, S, "remote_should",
+	! print_command(sendout, CF, "remote_should",
 			configs[currnum].strarrval[cfg_strarr_remote_should]))
-	    goto problem;
-    if (user && ! printname(sendout, S, "user = ", user))
-	goto problem;
-    if (pass && ! printname(sendout, S, "password = ", pass))
-	goto problem;
-    if (fprintf(S,
+	    goto problem_c;
+    if (user && ! printname(sendout, CF, "user = ", user))
+	goto problem_c;
+    if (pass && ! printname(sendout, CF, "password = ", pass))
+	goto problem_c;
+    if (fprintf(CF,
 		(configs[currnum].intval[cfg_flags] & config_flag_translate_ids)
 		    ? "translate_ids\n" : "keep_ids\n") < 0)
-	goto problem;
-    if (fprintf(S,
+	goto problem_c;
+    if (fprintf(CF,
 		(configs[currnum].intval[cfg_flags] & config_flag_skip_matching)
 		    ? "skip_matching\n" : "copy_matching\n") < 0)
-	goto problem;
-    if (fprintf(S,
+	goto problem_c;
+    if (fprintf(CF,
+		(configs[currnum].intval[cfg_flags] & config_flag_use_librsync)
+		    ? "enable_librsync\n" : "disable_librsync\n") < 0)
+	goto problem_c;
+    if (fprintf(CF,
 		(configs[currnum].intval[cfg_flags] &
 			config_flag_initial_dirsync)
 		    ? "do_initial_dirsync\n" : "skip_initial_dirsync\n") < 0)
-	goto problem;
-    if (fprintf(S,
+	goto problem_c;
+    if (fprintf(CF,
 		(configs[currnum].intval[cfg_flags] &
 			config_flag_overflow_dirsync)
 		    ? "do_overflow_dirsync\n" : "skip_overflow_dirsync\n") < 0)
-	goto problem;
-    if (fprintf(S,
+	goto problem_c;
+    if (fprintf(CF,
 		(configs[currnum].intval[cfg_flags] &
 			config_flag_dirsync_delete)
 		    ? "dirsync_delete\n" : "no_dirsync_delete\n") < 0)
-	goto problem;
+	goto problem_c;
     if (configs[currnum]. intval[cfg_dirsync_interval] > 0 &&
-	! sendformat(sendout, S, "dirsync_interval = %s",
-		     config_print_interval(configs[currnum].
-					   intval[cfg_dirsync_interval])))
-	goto problem;
-    if (! sendformat(sendout, S, "bwlimit = %d",
+	! sendformat(sendout, CF, "dirsync_interval = %s",
+		     config_print_unit(config_intervals,
+			configs[currnum].intval[cfg_dirsync_interval])))
+	goto problem_c;
+    if (! sendformat(sendout, CF, "bwlimit = %d",
 		     configs[currnum].intval[cfg_bwlimit]))
-	goto problem;
-    if (! sendformat(sendout, S, "optimise_client = %d",
+	goto problem_c;
+    if (! sendformat(sendout, CF, "optimise_client = %d",
 		     configs[currnum].intval[cfg_optimise_client]))
-	goto problem;
-    if (! sendformat(sendout, S, "optimise_buffer = %s",
-		     config_print_size(configs[currnum].
-				       intval[cfg_optimise_buffer])))
-	goto problem;
-    if (! print_list(sendout, S, "compression", compress_name,
+	goto problem_c;
+    if (! sendformat(sendout, CF, "optimise_buffer = %s",
+		     config_print_unit(config_sizes,
+			configs[currnum].intval[cfg_optimise_buffer])))
+	goto problem_c;
+    if (! print_list(sendout, CF, "compression", compress_name,
 		     configs[currnum].intarrlen[cfg_compressions],
 		     configs[currnum].intarrval[cfg_compressions],
 		     ','))
-	goto problem;
-    if (! print_list(sendout, S, "checksum", checksum_name,
+	goto problem_c;
+    if (! print_list(sendout, CF, "checksum", checksum_name,
 		     configs[currnum].intarrlen[cfg_checksums],
 		     configs[currnum].intarrval[cfg_checksums],
 		     ','))
-	goto problem;
-    if (! print_list(sendout, S, "dirsync_timed", int_to_timed,
+	goto problem_c;
+    if (! print_list(sendout, CF, "dirsync_timed", int_to_timed,
 		      configs[currnum].intarrlen[cfg_dirsync_timed],
 		      configs[currnum].intarrval[cfg_dirsync_timed],
 		      ';'))
-	goto problem;
-    if (! print_filters(sendout, S, "filter", configs[currnum].intval))
-	goto problem;
-    if (fprintf(S, "end_state\n") < 0)
-	goto problem;
-    if (fprintf(S, "%d %d\n", fnum, fpos) < 0)
-	goto problem;
-    if (fflush(S) < 0)
-	goto problem;
-    if (lseek(fd, (off_t)0, SEEK_SET) < 0)
-	goto problem;
-    if (lockf(fd, F_ULOCK, (off_t)0) < 0)
-	goto problem;
-    if (fclose(S) < 0) {
-	S = NULL;
-	goto problem;
+	goto problem_c;
+    if (! print_filters(sendout, CF, "filter", configs[currnum].intval))
+	goto problem_c;
+    if (fprintf(SF, FINAL_COMMENTS) < 0)
+	goto problem_s;
+    if (fprintf(SF, "end_state\n") < 0)
+	goto problem_s;
+    if (fprintf(SF, "%d %d\n", fnum, fpos) < 0)
+	goto problem_s;
+    if (fflush(SF) < 0)
+	goto problem_s;
+    if (lseek(sfd, (off_t)0, SEEK_SET) < 0)
+	goto problem_s;
+    if (lockf(sfd, F_ULOCK, (off_t)0) < 0)
+	goto problem_s;
+    if (fclose(SF) < 0) {
+	SF = NULL;
+	goto problem_s;
+    }
+    sfd = -1;
+    if (use_extra) {
+	if (fflush(CF) < 0)
+	    goto problem_c;
+	if (lseek(cfd, (off_t)0, SEEK_SET) < 0)
+	    goto problem_c;
+	if (lockf(cfd, F_ULOCK, (off_t)0) < 0)
+	    goto problem_c;
+	if (fclose(CF) < 0) {
+	    CF = NULL;
+	    goto problem_c;
+	}
     }
     return 1;
-problem:
-    error_report(error_setup, configs[currnum].strval[cfg_copy_state], errno);
-    if (S)
-	fclose(S);
-    else if (fd >= 0)
-	close(fd);
+problem_s:
+    error_report(error_setup, sname, errno);
+    goto problem_both;
+problem_c:
+    error_report(error_setup, cname, errno);
+problem_both:
+    if (SF)
+	fclose(SF);
+    else if (sfd >= 0)
+	close(sfd);
+    if (use_extra) {
+	if (CF)
+	    fclose(CF);
+	else if (cfd >= 0)
+	    close(cfd);
+    }
     return 0;
 }
 
@@ -1783,7 +1834,8 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     p(arg, "");
     p(arg, "# Size of the notify queue allocation block");
     sendformat(p, arg, "queue_block = %s",
-	       config_print_size(configs[cn].intval[cfg_notify_queue_block]));
+	       config_print_unit(config_sizes,
+				 configs[cn].intval[cfg_notify_queue_block]));
     p(arg, "");
     p(arg, "# Number of blocks allocated when the notify thread initialises");
     sendformat(p, arg, "initial_blocks = %d",
@@ -1799,11 +1851,13 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     p(arg, "");
     p(arg, "# Size of a watch name block");
     sendformat(p, arg, "watch_name_block = %s",
-	       config_print_size(configs[cn].intval[cfg_notify_name_block]));
+	       config_print_unit(config_sizes,
+				 configs[cn].intval[cfg_notify_name_block]));
     p(arg, "");
     p(arg, "# Size of the buffer used to receive data from the kernel");
     sendformat(p, arg, "buffer = %s",
-	       config_print_size(configs[cn].intval[cfg_notify_buffer]));
+	       config_print_unit(config_sizes,
+				 configs[cn].intval[cfg_notify_buffer]));
     p(arg, "");
     p(arg, "# Do we consider should's temporary files?");
     if (configs[cn].intval[cfg_flags] & config_flag_skip_should) {
@@ -1951,7 +2005,8 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     p(arg, "");
     p(arg, "# Size of event file before it gets rotated");
     sendformat(p, arg, "eventfilesize = %s",
-	       config_print_size(configs[cn].intval[cfg_eventsize]));
+	       config_print_unit(config_sizes,
+				 configs[cn].intval[cfg_eventsize]));
     p(arg, "");
     p(arg, "# If nonzero, automatically purge log files older than that number of days");
     sendformat(p, arg, "autopurge = %d",
@@ -2068,7 +2123,8 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     p(arg, "");
     p(arg, "# Buffer used by the client to optimise events");
     sendformat(p, arg, "optimise_buffer = %s",
-	       config_print_size(configs[cn].intval[cfg_optimise_buffer]));
+	       config_print_unit(config_sizes,
+				 configs[cn].intval[cfg_optimise_buffer]));
     p(arg, "");
     p(arg, "# Bandwidth limit (KB/s) for copy mode, 0 == no limits imposed");
     sendformat(p, arg, "bwlimit = %d", configs[cn].intval[cfg_bwlimit]);
@@ -2120,8 +2176,8 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     p(arg, "# Do we do a periodic dirsync?");
     if (configs[cn].intval[cfg_dirsync_interval] > 0) {
 	sendformat(p, arg, "dirsync_interval = %s",
-		   config_print_interval(configs[cn].
-					 intval[cfg_dirsync_interval]));
+		   config_print_unit(config_intervals,
+		    configs[cn].intval[cfg_dirsync_interval]));
     } else {
 	p(arg, "#dirsync_interval = 2 hours");
     }
@@ -2152,6 +2208,17 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     else
 	p(arg, "#external_copy = rsync -aq0 --files-from - user@host:/from/ /to/");
     p(arg, "");
+#if THEY_HAVE_LIBRSYNC
+    p(arg, "# Use librsync for file copy?\n");
+    if (configs[cn].intval[cfg_flags] & config_flag_use_librsync) {
+	p(arg, "#disable_librsync");
+	p(arg, "enable_librsync");
+    } else {
+	p(arg, "disable_librsync");
+	p(arg, "#enable_librsync");
+    }
+    p(arg, "");
+#endif
     p(arg, HASH);
     p(arg, "# Copy mode");
     p(arg, "");
@@ -2167,7 +2234,8 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     p(arg, "");
     p(arg, "# Maximum time between checkpoints");
     sendformat(p, arg, "checkpoint_time = %s",
-	       config_print_interval(configs[cn].intval[cfg_checkpoint_time]));
+	       config_print_unit(config_intervals,
+				 configs[cn].intval[cfg_checkpoint_time]));
     p(arg, "");
     p(arg, "# One-shot mode: catch up with server and exit");
     p(arg, configs[cn].intval[cfg_flags] & config_flag_copy_oneshot
@@ -2366,6 +2434,8 @@ static int get_event_filter(const char * token, int * eventmap) {
 	*eventmap = 1 << cfg_event_delete;
     else if (strcmp(token, "rename") == 0)
 	*eventmap = 1 << cfg_event_rename;
+    else if (strcmp(token, "hardlink") == 0)
+	*eventmap = 1 << cfg_event_hardlink;
     else
 	return 0;
     return 1;
@@ -2571,7 +2641,7 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 	    }
 	    break;
 	case 'b' :
-	    if (assign_unit(line, "buffer", sizes, &configs[cn].
+	    if (assign_unit(line, "buffer", config_sizes, &configs[cn].
 			    intval[cfg_notify_buffer], &err))
 		return err;
 	    if (assign_int(line, "bwlimit",
@@ -2618,6 +2688,9 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 		myfree(st);
 		return err;
 	    }
+	    if (assign_strval(line, "copy_config", assign_nodups,
+			      cn, cfg_copy_config, &err))
+		return err;
 	    if (assign_strval(line, "copy", assign_nodups,
 			      cn, cfg_copy_state, &err))
 	    {
@@ -2951,7 +3024,7 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 		return "*Of course it shouldn't";
 	    break;
 	case 'o' :
-	    if (assign_unit(line, "optimise_buffer", sizes,
+	    if (assign_unit(line, "optimise_buffer", config_sizes,
 			    &configs[cn].intval[cfg_optimise_buffer], &err))
 		return err;
 	    if (assign_int(line, "optimise_client",
@@ -3021,7 +3094,7 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 	    }
 	    break;
 	case 'q' :
-	    if (assign_unit(line, "queue_block", sizes,
+	    if (assign_unit(line, "queue_block", config_sizes,
 			    &configs[cn].intval[cfg_notify_queue_block], &err))
 		return err;
 	    break;
@@ -3128,6 +3201,10 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 		*locfl |= locfl_notice;
 		return NULL;
 	    }
+	    if (strcmp(line, "skip_extra_fork") == 0) {
+		configs[cn].intval[cfg_flags] &= ~config_flag_extra_fork;
+		return NULL;
+	    }
 	    break;
 	case 't' :
 	    if (assign_strval(line, "to", assign_isdir,
@@ -3155,6 +3232,10 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 		configs[cn].intval[cfg_client_mode] |= config_client_update;
 		return err;
 	    }
+	    if (strcmp(line, "use_extra_fork") == 0) {
+		configs[cn].intval[cfg_flags] |= config_flag_extra_fork;
+		return NULL;
+	    }
 	    break;
 	case 'v' :
 	    if (strcmp(line, "version") == 0) {
@@ -3166,7 +3247,7 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 	    if (assign_int(line, "watch_block",
 			   &configs[cn].intval[cfg_notify_watch_block], &err))
 		return err;
-	    if (assign_unit(line, "watch_name_block", sizes,
+	    if (assign_unit(line, "watch_name_block", config_sizes,
 			    &configs[cn].intval[cfg_notify_name_block], &err))
 		return err;
 	    if (strcmp(line, "watches") == 0) {
@@ -3295,7 +3376,7 @@ static const char * parsearg(const char * line, locfl_t * locfl, int is_initial)
 	    if (assign_int(line, "checkpoint_events",
 			   &configs[cn].intval[cfg_checkpoint_events], &err))
 		return err;
-	    if (assign_unit(line, "checkpoint_time", intervals,
+	    if (assign_unit(line, "checkpoint_time", config_intervals,
 			    &configs[cn].intval[cfg_checkpoint_time], &err))
 		return err;
 	    if (strcmp(line, "copy_matching") == 0) {
@@ -3308,7 +3389,7 @@ static const char * parsearg(const char * line, locfl_t * locfl, int is_initial)
 	    }
 	    break;
 	case 'd' :
-	    if (assign_unit(line, "dirsync_interval", intervals,
+	    if (assign_unit(line, "dirsync_interval", config_intervals,
 			    &configs[cn].intval[cfg_dirsync_interval], &err))
 		return err;
 	    st = NULL;
@@ -3423,6 +3504,10 @@ static const char * parsearg(const char * line, locfl_t * locfl, int is_initial)
 		configs[cn].intval[cfg_flags] |= config_flag_dirsync_delete;
 		return NULL;
 	    }
+	    if (strcmp(line, "disable_librsync") == 0) {
+		configs[cn].intval[cfg_flags] &= ~config_flag_use_librsync;
+		return NULL;
+	    }
 	    if (assign_user(line, "disallow_unix", 0, 0, &udata, &err) ||
 		assign_user(line, "disallow_local", 0, 0, &udata, &err) ||
 		assign_user(line, "disallow_tcp", 1, 0, &udata, &err))
@@ -3469,9 +3554,10 @@ static const char * parsearg(const char * line, locfl_t * locfl, int is_initial)
 	    break;
 	case 'e' :
 	    if (assign_unit(line, "eventfilesize",
-			    sizes, &configs[cn].intval[cfg_eventsize], &err))
+			    config_sizes, &configs[cn].intval[cfg_eventsize],
+			    &err))
 		return err;
-	    if (assign_unit(line, "eventsize", sizes,
+	    if (assign_unit(line, "eventsize", config_sizes,
 			    &configs[cn].intval[cfg_eventsize], &err))
 		return err;
 	    if (assign_command(line, "email_submit",
@@ -3481,6 +3567,10 @@ static const char * parsearg(const char * line, locfl_t * locfl, int is_initial)
 	    if (assign_strval(line, "email", assign_none,
 			      cn, cfg_error_email, &err))
 		return err;
+	    if (strcmp(line, "enable_librsync") == 0) {
+		configs[cn].intval[cfg_flags] |= config_flag_use_librsync;
+		return NULL;
+	    }
 	    break;
 	case 'f' :
 	    st = NULL;
@@ -4629,6 +4719,15 @@ char * const * config_strarr(const config_data_t * cfg,
 			     config_strarr_names_t sv)
 {
     return sv < 0 || sv >= cfg_strarr_COUNT ? NULL : cfg->strarrval[sv];
+}
+
+int config_strarr_len(const config_data_t * cfg, config_strarr_names_t sv) {
+    int len = 0;
+    char * const * p;
+    if (sv < 0 || sv >= cfg_strarr_COUNT) return 0;
+    p = cfg->strarrval[sv];
+    while (p[len]) len++;
+    return len;
 }
 
 const config_strlist_t * config_strlist(const config_data_t * cfg,

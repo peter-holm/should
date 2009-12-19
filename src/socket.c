@@ -51,6 +51,7 @@
 #include "main_thread.h"
 #include "error.h"
 #include "usermap.h"
+#include "pipe.h"
 
 #define AUXSIZE 256
 #define PACKETSIZE 8192
@@ -119,6 +120,8 @@
 # endif
 #endif
 
+static int notify_fd = -1;
+
 /* used to represent a running connection */
 
 struct socket_s {
@@ -139,12 +142,27 @@ struct socket_s {
     int b_in;
     int r_in;
     int b_out;
-    int autoflush;
     long long recv;
     long long sent;
     char p_in[PACKETSIZE];
     char p_out[PACKETSIZE];
 };
+
+static void notify_cleanup(char how, const char * name) {
+    int namelen = strlen(name);
+    char namebuff[1 + sizeof(namelen) + namelen], * bptr = namebuff;
+    if (notify_fd < 0) return;
+    namebuff[0] = how;
+    memcpy(namebuff + 1, &namelen, sizeof(namelen));
+    strncpy(namebuff + 1 + sizeof(namelen), name, namelen);
+    namelen += 1 + sizeof(namelen);
+    while (namelen > 0) {
+	ssize_t nw = write(notify_fd, bptr, namelen);
+	if (nw <= 0) return;
+	bptr += nw;
+	namelen -= nw;
+    }
+}
 
 /* prepare a socket suitable for listening on a UNIX path */
 
@@ -166,6 +184,7 @@ static int listen_unix(socket_t * p, const char * path) {
 	return 0;
     bindaddr->sun_family = AF_UNIX;
     strcpy(bindaddr->sun_path, path);
+    notify_cleanup('C', path);
     if (bind(p->r_fd, (struct sockaddr *)bindaddr, sizeof(*bindaddr)) < 0)
 	return 0;
 #if defined SOCKMODE
@@ -179,7 +198,6 @@ static int listen_unix(socket_t * p, const char * path) {
     p->b_in = 0;
     p->r_in = 0;
     p->b_out = 0;
-    p->autoflush = 1;
     p->username = p->password = NULL;
     p->user = NULL;
     p->recv = 0;
@@ -209,7 +227,6 @@ static int listen_tcp(socket_t * p, const struct addrinfo * addr) {
     p->b_in = 0;
     p->r_in = 0;
     p->b_out = 0;
-    p->autoflush = 1;
     p->username = p->password = NULL;
     p->user = NULL;
     p->recv = 0;
@@ -331,6 +348,7 @@ socket_t * socket_listen(void) {
 			acount--;
 			if (r[acount].r_fd >= 0) close(r[acount].r_fd);
 			unlink(L->data);
+			notify_cleanup('D', L->data);
 		    }
 		    L = L->next;
 		}
@@ -368,6 +386,7 @@ socket_t * socket_listen(void) {
 		while (L) {
 		    if (L->data[0] == '/')
 			unlink(L->data);
+			notify_cleanup('D', L->data);
 		    L = L->next;
 		}
 		myfree(r);
@@ -680,7 +699,6 @@ socket_t * socket_accept(socket_t * p, int timeout) {
     c->type = TYPE_SERVER;
     c->count = 1;
     c->addr = addr;
-    c->autoflush = 1;
     c->b_in = 0;
     c->r_in = 0;
     c->b_out = 0;
@@ -769,106 +787,56 @@ static int get_user(socket_t * p, const config_data_t * cfg) {
 /* open a tunnel to another copy of should somewhere */
 
 static int connect_tunnel(const config_data_t * cfg, socket_t * p) {
-    int fromchild[2], tochild[2], cmdlen = 0, shouldlen = 0, connlen;
-    pid_t pid;
-    char * const * tptr = config_strarr(cfg, cfg_strarr_tunnel);
-    while (tptr[cmdlen]) cmdlen++;
+    int cmdlen = config_strarr_len(cfg, cfg_strarr_tunnel);
+    int shouldlen = config_strarr_len(cfg, cfg_strarr_remote_should);
+    int connlen = config_intval(cfg, cfg_flags) & config_flag_socket_changed
+		? 8 + config_strlen(cfg, cfg_server)
+		: 1;
+    int i, ptr;
+    char * const * tptr;
+    char * command[cmdlen + shouldlen + 7], conndata[connlen], * ecd = conndata;
+    pipe_t pipe;
+    ptr = 0;
+    tptr = config_strarr(cfg, cfg_strarr_tunnel);
+    for (i = 0; i < cmdlen; i++)
+	command[ptr++] = tptr[i];
     tptr = config_strarr(cfg, cfg_strarr_remote_should);
     if (tptr && tptr[0])
-	while (tptr[shouldlen]) shouldlen++;
-    else
-	shouldlen = 1;
-    if (config_intval(cfg, cfg_flags) & config_flag_socket_changed)
-	connlen = 8 + config_strlen(cfg, cfg_server);
-    else
-	connlen = 1;
-    if (pipe(fromchild) < 0) {
-	perror("pipe");
-	return 0;
-    }
-    if (pipe(tochild) < 0) {
-	perror("pipe");
-	close(fromchild[0]);
-	close(fromchild[1]);
-	return 0;
-    }
-    fflush(NULL);
-    pid = fork();
-    if (pid < 0) {
-	perror("fork");
-	close(fromchild[0]);
-	close(fromchild[1]);
-	close(tochild[0]);
-	close(tochild[1]);
-	return 0;
-    }
-    if (pid == 0) {
-	/* child process */
-	char * command[cmdlen + shouldlen + 6];
-	char conndata[connlen], * ecd;
-	int i, ptr;
-	close(fromchild[0]);
-	close(tochild[1]);
-	fclose(stdin);
-	if (dup2(tochild[0], 0) < 0) {
-	    perror("dup2");
-	    close(fromchild[1]);
-	    close(tochild[0]);
-	    exit(1);
-	}
-	fclose(stdout);
-	if (dup2(fromchild[1], 1) < 0) {
-	    perror("dup2");
-	    close(0);
-	    close(fromchild[1]);
-	    close(tochild[0]);
-	    exit(1);
-	}
-	ecd = conndata;
-	ptr = 0;
-	tptr = config_strarr(cfg, cfg_strarr_tunnel);
-	for (i = 0; i < cmdlen; i++)
+	for (i = 0; i < shouldlen; i++)
 	    command[ptr++] = tptr[i];
-	tptr = config_strarr(cfg, cfg_strarr_remote_should);
-	if (tptr && tptr[0])
-	    for (i = 0; i < shouldlen; i++)
-		command[ptr++] = tptr[i];
-	else
-	    command[ptr++] = "should";
-	if (config_intval(cfg, cfg_flags) & config_flag_socket_changed) {
-	    const char * sp = config_strval(cfg, cfg_server);
-	    if (sp[0] == '/') {
-		sprintf(ecd, "server=%s", sp);
-	    } else {
-		const char * pn = sp + 1 + strlen(sp);
-		sprintf(ecd, "server=%s:%s", sp, pn);
-	    }
-	    command[ptr++] = ecd;
-	    ecd += 1 + strlen(ecd);
+    else
+	command[ptr++] = "should";
+    if (config_intval(cfg, cfg_flags) & config_flag_socket_changed) {
+	const char * sp = config_strval(cfg, cfg_server);
+	if (sp[0] == '/') {
+	    sprintf(ecd, "server=%s", sp);
+	} else {
+	    const char * pn = sp + 1 + strlen(sp);
+	    sprintf(ecd, "server=%s:%s", sp, pn);
 	}
-	if (p->username) {
-	    sprintf(ecd, "user=%s", p->username);
-	    command[ptr++] = ecd;
-	    ecd += 1 + strlen(ecd);
-	}
-	if (p->password) {
-	    sprintf(ecd, "password_from_stdin=%d", (int)strlen(p->password));
-	    command[ptr++] = ecd;
-	    ecd += 1 + strlen(ecd);
-	}
-	command[ptr++] = "skip_notice";
-	command[ptr++] = "telnet";
-	command[ptr++] = NULL;
-	execvp(command[0], command);
-	perror(command[0]);
-	exit(2);
+	command[ptr++] = ecd;
+	ecd += 1 + strlen(ecd);
     }
-    /* parent */
-    close(fromchild[1]);
-    close(tochild[0]);
-    p->r_fd = fromchild[0];
-    p->w_fd = tochild[1];
-    p->pid = pid;
+    if (p->username) {
+	sprintf(ecd, "user=%s", p->username);
+	command[ptr++] = ecd;
+	ecd += 1 + strlen(ecd);
+    }
+    if (p->password) {
+	sprintf(ecd, "password_from_stdin=%d", (int)strlen(p->password));
+	command[ptr++] = ecd;
+	ecd += 1 + strlen(ecd);
+    }
+    command[ptr++] = "skip_notice";
+    command[ptr++] = "telnet";
+    command[ptr++] = NULL;
+    if (! pipe_openfromto(command, &pipe)) {
+	perror("tunnel");
+	return 0;
+    }
+    p->r_fd = pipe.fromchild;
+    p->w_fd = pipe.tochild;
+    p->pid = pipe.pid;
     if (p->password && ! socket_put(p, p->password, strlen(p->password)))
 	return 0;
     return 1;
@@ -1133,7 +1101,6 @@ socket_t * socket_connect(void) {
     p->b_in = 0;
     p->r_in = 0;
     p->b_out = 0;
-    p->autoflush = 1;
     p->pid = -1;
     p->username = p->password = NULL;
     p->user = NULL;
@@ -1245,6 +1212,7 @@ void socket_disconnect(socket_t * p) {
 	    struct sockaddr_un * bindaddr;
 	    bindaddr = (struct sockaddr_un *)&p[i].addr;
 	    unlink(bindaddr[i].sun_path);
+	    notify_cleanup('D', bindaddr[i].sun_path);
 	}
 	if (p[i].username) myfree(p[i].username);
 	if (p[i].password) myfree(p[i].password);
@@ -1259,10 +1227,11 @@ int socket_poll(socket_t * p) {
     return p->r_fd;
 }
 
-/* send data on the socket: socket_put sends binary data, socket_puts
- * sends a line of text, terminated by CRLF */
+/* flush pending output to the socket; unlike previous versions of should,
+ * this no longer happens automatically (although a socket_get* will force
+ * output flush */
 
-static int flushit(socket_t * p) {
+int socket_flush(socket_t * p) {
     const char * s = p->p_out;
     int n = p->b_out;
     while (n > 0) {
@@ -1280,11 +1249,14 @@ static int flushit(socket_t * p) {
     return 1;
 }
 
+/* send data on the socket: socket_put sends binary data, socket_puts
+ * sends a line of text, terminated by CRLF */
+
 static int putout(socket_t * p, const char * s, int l) {
     while (l > 0) {
 	int d = PACKETSIZE - p->b_out;
 	if (d == 0) {
-	    if (! flushit(p)) return 0;
+	    if (! socket_flush(p)) return 0;
 	    d = PACKETSIZE;
 	}
 	if (d > l) d = l;
@@ -1308,23 +1280,13 @@ int socket_put(socket_t * p, const void * s, int l) {
 	else
 	    fprintf(stderr, "  > #%d\n", l);
     }
-    if (! putout(p, s, l)) return 0;
-    if (! p->autoflush) return 1;
-    return flushit(p);
+    return putout(p, s, l);
 }
 
 int socket_puts(socket_t * p, const char * s) {
     if (p->debug) fprintf(stderr, ">>> %s\n", s);
     if (! putout(p, s, strlen(s))) return 0;
-    if (! putout(p, "\015\012", 2)) return 0;
-    if (! p->autoflush) return 1;
-    return flushit(p);
-}
-
-/* enable/disable autoflush by socket_put/socket_puts */
-
-void socket_autoflush(socket_t * p, int af) {
-    p->autoflush = af;
+    return putout(p, "\015\012", 2);
 }
 
 /* receive data from the socket: socket_get receives binary data,
@@ -1333,10 +1295,22 @@ void socket_autoflush(socket_t * p, int af) {
  * socket_getdata returns up to the required amount of data, but may
  * return less depending on what is available */
 
-static int getin(socket_t * p) {
+static inline int getin(socket_t * p) {
     ssize_t nr;
     struct pollfd pfd;
     int nfd;
+    /* if there is data immediately, take it */
+    fcntl(p->r_fd, F_SETFL, O_NONBLOCK);
+    nr = read(p->r_fd, p->p_in, PACKETSIZE);
+    fcntl(p->r_fd, F_SETFL, 0L);
+    if (nr > 0) {
+	p->recv += nr;
+	p->b_in = nr;
+	p->r_in = 0;
+	return 1;
+    }
+    /* maybe they are waiting for us to speak */
+    if (! socket_flush(p)) return 0;
     /* wait for data or a signal */
     while (main_running) {
 	pfd.fd = p->r_fd;
@@ -1467,5 +1441,18 @@ int socket_getdata(socket_t * p, void * d, int l) {
 
 void socket_setdebug(socket_t * p, int d) {
     if (p) p->debug = d;
+}
+
+/* globally set a file descriptor which will receive notification of all
+ * local (Unix domain) sockets created so another process can clean up */
+
+void socket_setnotify(int fd) {
+    notify_fd = fd;
+}
+
+/* gets the notification file set by socket_notify */
+
+int socket_getnotify(void) {
+    return notify_fd;
 }
 

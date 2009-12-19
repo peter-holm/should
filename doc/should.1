@@ -26,6 +26,7 @@ should \- directory replication daemon
 [config=\fIFILE\fR]
 [\fICLIENT_OPTIONS\fR]
 setup=[\fISTATE_FILE\fR]
+[copy_config=[\fICONFIG_FILE\fR]]
 from=[\fIPATH\fR]
 to=[\fIPATH\fR]
 .br
@@ -98,33 +99,35 @@ Once the server is running, log in to the system which will be
 receiving the updates and issue the copy setup command:
 .PP
 .Vb 1
-\&    should setup=/etc/should-copy.conf server=\fIhostname\fR:1234 \\
+\&    mkdir -p /var/spool/should
+\&    should setup=/var/spool/should/copy \\
+\&           copy_config=/etc/should-copy.conf \\
+\&           server=\fIhostname\fR:1234 \\
 \&           from=\fI/from\fR to=\fI/to\fR
 .Ve
 .PP
-This will prompt for a username and password, connect to the server,
-then create a file /etc/should-copy.conf which can be used to start
-the actual copy.
+This will prompt for a username and password, connect to the server, then
+create a file /var/spool/should/copy which can be used to start the actual
+copy. It will also create a configuration file, /etc/should-copy.conf,
+containing configuration data for the copy: this file will be automatically
+read by the copy (the path to this file is stored in /var/spool/should/copy).
+It is possible to edit /etc/should-copy.conf, however the spool file,
+/var/spool/should/copy must not be modified or the program may stop working.
 .PP
 To start the copy, issue the command:
 .PP
 .Vb 1
-\&    should copy=/etc/should-copy.conf
+\&    should copy=/var/spool/should/copy
 .Ve
 .PP
-Just one more note, if network connectivity between the two systems
-is not very fast, it may help to enable link compression. To do
-this, add the option \fIcompression=gzip\fR to the copy setup command:
+The program uses link compression by default (if a compression method
+was discovered by "configure" when the package was built). If network
+connectivity between the two systems is very fast, it may be more efficient
+to disable this, by adding the option \fIcompression=null\fR to the copy
+setup command:
 .PP
 .Vb 1
-\&    should setup=/etc/should-copy.conf compression=gzip
-.Ve
-.PP
-It may also help to use checksums to avoid sending data which can be
-already found on the client, for example:
-.PP
-.Vb 1
-\&    should setup=/etc/should-copy.conf checksum=SHA1
+\&    should setup=/var/spool/should/copy [...] compression=null
 .Ve
 .SH CONFIGURATION FILES
 All forms of the command accept one (or more) configuration files
@@ -484,7 +487,8 @@ cp=\fI/path\fR
 Copies a file from the server. This command must be repeated at least
 twice (source, destination), and can be repeated more times (list
 of sources, destination), in which case the last one must be a directory
-on the client's host.
+on the client's host. ost of the copy setup options can be provided to
+control how the copy works.
 The server must allow the "read" action for this to work.
 .TP
 df=\fI/path\fR
@@ -502,6 +506,14 @@ for subsequent copy operations. The file contains information on
 how to connect to the server as well as the current event file
 number and the position within that file. The server must grant the
 "read" and "status" actions to the client for copy mode to work.
+.PP
+Although a copy setup file looks like a normal configuration file, and it
+is possible to edit it to change the options, there are some limitations.
+In particular, the initial comment must be present, and the line containing
+"end_state" as well as anything following it must be left unchanged as it
+contains the program's checkpoint data. Also, the file should never be
+modified with the program running. Since should 1.0.-3, the program will
+add comments to this effect to the file.
 .PP
 The following options must always be specified:
 .TP
@@ -586,6 +598,16 @@ The nondefault opposite of skip_matching: if a file change event
 arrives, the client will always copy the file, even if it looks
 like it already has it.
 .TP
+enable_librsync
+If both server and copy are linked against librsync, use it to copy
+files instead of the built-in copy function. This is not enable by
+default. Depending on your data, using librsync can make things
+faster or slower: test with and without and compare the results.
+.TP
+disable_librsync
+The default opposite of enable_librsync: always use the built-in copy
+function.
+.TP
 tunnel="\fIcommand and arguments\fR"
 See
 .SM
@@ -649,6 +671,16 @@ copy_matching
 The nondefault opposite of skip_matching: if a file change event
 arrives, the client will always copy the file, even if it looks
 like it already has it.
+.TP
+enable_librsync
+If both server and copy are linked against librsync, use it to copy
+files instead of the built-in copy function. This is not enable by
+default. Depending on your data, using librsync can make things
+faster or slower: test with and without and compare the results.
+.TP
+disable_librsync
+The default opposite of enable_librsync: always use the built-in copy
+function.
 .TP
 filter=\fIevents\fR
 Only consider events which match: see
@@ -884,8 +916,8 @@ file). Such changes are collected and processed after the file is closed.
 .TP
 create
 A new object is being created inside the directory tree being watched
-(or an object has been renamed from outside the directory tree being
-watched).
+(or an object has been renamed or hardlinked from outside the directory
+tree being watched).
 .TP
 delete
 An object has been removed from the filesystem (or renamed outside the
@@ -894,7 +926,12 @@ directory tree being watched).
 rename
 An object has been renamed. This event can be automatically changed to
 a delete if the destination is outside the directory tree being watched;
-or to a create if the source is outside the directory tree being watched).
+or to a create if the source is outside the directory tree being watched.
+.TP
+hardlink
+An object has been hadr linked to another one. This event can be automatically
+changed to a create if the existing object is outside the directory tree being
+watched.
 .PP
 A "rename" event can become a create or a delete at various points during
 the processing. If the server notices that the source or destination of
