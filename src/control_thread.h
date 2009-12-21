@@ -44,7 +44,7 @@ void control_initial_thread(void);
  * an error message; stores the number of watches added in the second
  * argument */
 
-const char * control_add_tree(const config_dir_t *, int *);
+const char * control_add_tree(const config_strlist_t *, int *);
 
 /* ask the control thread to remove a directory tree; returns NULL if OK or
  * an error message */

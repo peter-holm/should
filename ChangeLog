@@ -1,10 +1,5 @@
 Changes from 1.0.-4 to 1.0.-3:
 
-* Added a special check for hard links. Inotify reports them as renames!
-  (the documentation suggests that they are reported as inode changes,
-  reporting just the change in link count, which is useless to figure
-  out what was linked to what).
-
 * Added support for the rsync algorithm by linking against librsync
   if available. It is not enabled by default, but enable_librsync on
   the copy or copy setup command will enable it.
@@ -18,6 +13,18 @@ Changes from 1.0.-4 to 1.0.-3:
   so that can be edited by the user. Becuase they will edit it, even if
   the manpage says to leave it alone and the file starts with a notice that
   it must not be modified.
+
+* Added a new protocol extension, "EVBATCH", which allows batching of
+  events during replication. It does improve performance, particularly
+  on slow networks / WAN operation.
+
+* Rewritten the control thread to use a table of commands instead of the
+  huge switch(). This also makes each operation into a separate function
+  and so easier to read.
+
+* Rewritten the watch structure and associated functions in notify thread;
+  at the same time, added locks where there may be the possibility of race
+  conditions.
 
 * Finished some formerly unimplemented bits.
 

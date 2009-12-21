@@ -355,17 +355,23 @@ static deferr_t deferr[error_MAX] = {
 	.argtype  = { arg_string, arg_string, arg_errno, arg_void, arg_void },
 	.name     = "copy_rename",
     },
-    [error_copy_hardlink] = {
-	.level    = error_level_err,
-	.defmsg   = "Error linking %s to %s) %s",
-	.argtype  = { arg_string, arg_string, arg_errno, arg_void, arg_void },
-	.name     = "copy_hardlink",
-    },
     [error_copy_invalid] = {
 	.level    = error_level_err,
 	.defmsg   = "Invalid reply while copying %s: %s",
 	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
 	.name     = "copy_invalid",
+    },
+    [error_copy_librsync] = {
+	.level    = error_level_err,
+	.defmsg   = "Unknown librsync error copying %s",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "copy_librsync",
+    },
+    [error_copy_librsync_sys] = {
+	.level    = error_level_err,
+	.defmsg   = "Librsync error while copying %s: %s",
+	.argtype  = { arg_string, arg_errno, arg_void, arg_void, arg_void },
+	.name     = "copy_librsync_sys",
     },
     [error_copy_short] = {
 	.level    = error_level_err,
@@ -540,12 +546,6 @@ static deferr_t deferr[error_MAX] = {
 	.defmsg   = "replication: rename(%s, %s)",
 	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
 	.name     = "info_replication_rename",
-    },
-    [info_replication_hardlink] = {
-	.level    = error_level_info,
-	.defmsg   = "replication: link(%s, %s)",
-	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
-	.name     = "info_replication_hardlink",
     },
     [info_sched_dirsync] = {
 	.level    = error_level_info,

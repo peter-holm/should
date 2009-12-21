@@ -250,6 +250,8 @@ client_extensions_t client_get_extensions(socket_t * p) {
 	    case 'E' : case 'e' :
 		if (rlen == 7 && strcasecmp(repl, "ENCRYPT") == 0)
 		    result |= client_ext_encrypt;
+		if (rlen == 7 && strcasecmp(repl, "EVBATCH") == 0)
+		    result |= client_ext_evbatch;
 		break;
 	    case 'I' : case 'i' :
 		if (rlen == 6 && strcasecmp(repl, "IGNORE") == 0)
@@ -961,36 +963,39 @@ int client_run(void) {
 	    goto out;
     extensions = client_get_extensions(p);
     if (cm & config_client_remove) {
-	const config_dir_t * d = config_treeval(cfg, cfg_tree_remove);
+	const config_strlist_t * d = config_strlist(cfg, cfg_remove_path);
 	while (d) {
-	    if (! client_send_command(p, "REMOVE %", d->path, NULL))
+	    if (! client_send_command(p, "REMOVE %", d->data, NULL))
 		goto out;
 	    d = d->next;
 	}
     }
     if (cm & config_client_add) {
-	const config_dir_t * d = config_treeval(cfg, cfg_tree_add);
+	const config_strlist_t * d = config_strlist(cfg, cfg_add_path);
 	while (d) {
 	    char repl[REPLSIZE];
-	    if (! client_send_command(p, "ADD %", d->path, NULL))
+	    const config_add_t * av = d->privdata;
+	    if (! client_send_command(p, "ADD %", d->data, NULL))
 		goto out;
-	    if (! send_list(p, "EXCL", d->exclude))
+	    if (! send_list(p, "EXCL", av->exclude))
 		goto out;
-	    if (! send_list(p, "FIND", d->find))
+	    if (! send_list(p, "FIND", av->find))
 		goto out;
-	    if (! client_send_command(p, d->crossmount ? "CROSS" : "NOCROSS",
-			       NULL, repl))
+	    if (! client_send_command(p, av->crossmount ? "CROSS" : "NOCROSS",
+				      NULL, repl))
 		goto out;
-	    printf("Added %d watches under %s\n", atoi(repl + 2), d->path);
+	    printf("Added %d watches under %s\n", atoi(repl + 2), d->data);
 	    d = d->next;
 	}
     }
     if (cm & config_client_closelog)
 	if (! client_send_command(p, "CLOSELOG", NULL, NULL))
 	    goto out;
-    if (cm & config_client_purge)
-	if (! client_send_command(p, "PURGE %", NULL, NULL))
+    if (cm & config_client_purge) {
+	sprintf(repl, "PURGE %d", config_intval(cfg, cfg_purge_days));
+	if (! client_send_command(p, repl, NULL, NULL))
 	    goto out;
+    }
     if (cm & config_client_setup)
 	if (! setup_client(p))
 	    goto out;

@@ -431,9 +431,6 @@ static const char * logfile_process(const notify_event_t * ev) {
 	case notify_rename :
 	    evtype ="RENAME";
 	    break;
-	case notify_hardlink :
-	    evtype ="LINK";
-	    break;
 	case notify_overflow :
 	case notify_nospace :
 	case notify_add_tree :
@@ -507,9 +504,6 @@ static const char * syslog_process(const notify_event_t * ev) {
 	    break;
 	case notify_rename :
 	    evtype = "RENAME";
-	    break;
-	case notify_hardlink :
-	    evtype ="LINK";
 	    break;
 	case notify_overflow :
 	case notify_nospace :
@@ -659,9 +653,6 @@ const char * store_thread(void) {
 	    case notify_rename :
 		filter = config_intval(cfg, cfg_event_rename);
 		break;
-	    case notify_hardlink :
-		filter = config_intval(cfg, cfg_event_hardlink);
-		break;
 	    case notify_overflow :
 	    case notify_nospace :
 	    case notify_add_tree :
@@ -796,10 +787,10 @@ static int is_inside(const char * name, const char * tree) {
  * "fd". Returns 0 if OK, -1 if timeout, -2 if other error: in this case,
  * the error fields are filled with the message; if there is an event but its
  * variable part is larger than "size" bytes, returns the actual size of the
- * event */
+ * event; if evsize is not NULL the variable size is also stored there */
 
 int store_get(store_get_t * sg, notify_event_t * nev, int timeout, int size,
-	      int wfd, char * errmsg, int errsize)
+	      int wfd, char * errmsg, int errsize, int * evsize)
 {
     int try_reread = 1;
     while (main_running) {
@@ -827,13 +818,14 @@ int store_get(store_get_t * sg, notify_event_t * nev, int timeout, int size,
 	    /* get this event */
 	    nev->from_length = decode_32(sev.from_length);
 	    nev->to_length = decode_32(sev.to_length);
-	    if (size >= 0) {
+	    if (size >= 0 || evsize) {
 		/* is this too big? */
-		int evsize = 0;
-		if (nev->from_length > 0) evsize += nev->from_length;
-		if (nev->to_length > 0) evsize += nev->to_length;
-		if (evsize > size)
-		    return evsize;
+		int req = 0;
+		if (nev->from_length > 0) req += nev->from_length;
+		if (nev->to_length > 0) req += nev->to_length;
+		if (evsize) *evsize = req;
+		if (size >= 0 && req > size)
+		    return req;
 	    }
 	    fp += sizeof(event_t);
 	    nev->event_type = sev.event_type;
@@ -935,9 +927,7 @@ int store_get(store_get_t * sg, notify_event_t * nev, int timeout, int size,
 		    nev->from_length = strlen(sg->root);
 		    return 0;
 		}
-	    } else if (nev->event_type == notify_rename ||
-		       nev->event_type == notify_hardlink)
-	    {
+	    } else if (nev->event_type == notify_rename) {
 		int ok_from = is_inside(nev->from_name, sg->root);
 		int ok_to = is_inside(nev->to_name, sg->root);
 		if (ok_from && ok_to)
@@ -1025,6 +1015,12 @@ int store_get(store_get_t * sg, notify_event_t * nev, int timeout, int size,
 	    snprintf(errmsg, errsize, "Interrupt");
 	    return -2;
 	}
+#if NOTIFY == NOTIFY_INOTIFY
+	if (nfd > 1 && (pfd[1].revents & POLLIN)) {
+	    char buffer[64 * sizeof(struct inotify_event)];
+	    nfd = read(sg->iwatch, buffer, sizeof(buffer));
+	}
+#endif
 	if (pfd[0].revents) {
 	    snprintf(errmsg, errsize, "Client closed connection");
 	    return -2;
@@ -1110,9 +1106,6 @@ void store_printevent(const notify_event_t * ev,
 	    break;
 	case notify_rename :
 	    evtype = "RENAME";
-	    break;
-	case notify_hardlink :
-	    evtype = "LINK";
 	    break;
 	case notify_overflow :
 	    evtype = "OVERFLOW";

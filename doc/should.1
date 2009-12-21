@@ -927,11 +927,6 @@ rename
 An object has been renamed. This event can be automatically changed to
 a delete if the destination is outside the directory tree being watched;
 or to a create if the source is outside the directory tree being watched.
-.TP
-hardlink
-An object has been hadr linked to another one. This event can be automatically
-changed to a create if the existing object is outside the directory tree being
-watched.
 .PP
 A "rename" event can become a create or a delete at various points during
 the processing. If the server notices that the source or destination of

@@ -42,8 +42,7 @@ typedef enum {
     notify_overflow,          /* events were lost */
     notify_nospace,           /* block size too small: event could not be
 			       * stored */
-    notify_add_tree,          /* tree was added to the watch list */
-    notify_hardlink           /* name was added to an existing file */
+    notify_add_tree           /* tree was added to the watch list */
 } notify_event_type_t;
 
 /* file type, if known */
@@ -126,14 +125,18 @@ void notify_exit(void);
 /* look up a directory by name and return the corresponding watch, if
  * found; if not found, return NULL if addit is NULL, otherwise it will
  * try to add it: returns NULL if that is not possible; the value
- * of addit is the same as for notify_add */
+ * of addit is the same as for notify_add; the returned watch is left in
+ * a "locked" state and cannot be removed until the caller calls
+ * notify_unlock_watch() */
 
 notify_watch_t * notify_find_bypath(const char * path,
-				    const config_dir_t * addit);
+				    const config_add_t * addit);
+
+void notify_unlock_watch(notify_watch_t *);
 
 /* remove a watch and all its subdirectories */
 
-void notify_remove_under(notify_watch_t *);
+const char * notify_remove_under(const char *);
 
 /* adds a directory watch; returns NULL, and sets errno, on error;
  * parent is an existing directory watch; name is relative to that
@@ -142,13 +145,7 @@ void notify_remove_under(notify_watch_t *);
  * be required when new directories are created inside this one */
 
 notify_watch_t * notify_add(notify_watch_t * parent, const char * name,
-			    const config_dir_t * how);
-
-/* removes a directory watch; returns 1 if found, 0 if not found,
- * -1 if found but has children; parent and name are the same as
- * notify_add */
-
-int notify_remove(notify_watch_t * parent, const char * name, int recurse);
+			    const config_add_t * how);
 
 /* returns root watch */
 

@@ -64,6 +64,55 @@
 #error DATA_BLOCKSIZE must be at least 8192
 #endif
 
+/* control thread's state */
+
+typedef struct {
+    char cblock[DATA_BLOCKSIZE];
+    char ublock[DATA_BLOCKSIZE];
+    struct sockaddr_storage * peer;
+    socket_t * p;
+    int poll_fd;
+    int running;
+    long bwlimit;
+    int csum_n;
+    int compression;
+    int rfd;
+    int updating;
+    long long block_start;
+    long long block_size;
+    char * Dname;
+#if NOTIFY != NOTIFY_NONE
+    config_strlist_t * add;
+    store_get_t * get;
+    char * rootdir;
+    int translate_ids;
+    int changes;
+#endif
+#if THEY_HAVE_LIBRSYNC
+    int has_signatures;
+    off_t delta_pos;
+    long long rdiff_start;
+    long long rdiff_end;
+    rs_signature_t * rs_signature;
+    rs_job_t * rs_job;
+#endif
+} state_t;
+
+/* commands from a client */
+
+typedef enum {
+    cm_server = 0x01,
+    cm_copy   = 0x02,
+    cm_any    = cm_server | cm_copy
+} cmdmode_t;
+
+typedef struct {
+    const char * keyword;
+    config_userop_t opclass;
+    cmdmode_t mode;
+    const char * (*op)(char *, state_t *);
+} command_t;
+
 /* to wait for threads... */
 
 typedef struct thlist_s thlist_t;
@@ -136,17 +185,15 @@ static const char * send_status(socket_t * p) {
 /* send watch name */
 
 static int send_watch(const char * name, void * _VP) {
-    socket_t * p = _VP;
+    state_t * state = _VP;
     char buffer[32];
     sprintf(buffer, "%d", (int)strlen(name));
-    if (! socket_puts(p, buffer)) {
-	struct sockaddr_storage * addr = socket_addr(p);
-	error_report(error_server, addr, "send_watch", errno);
+    if (! socket_puts(state->p, buffer)) {
+	error_report(error_server, state->peer, "send_watch", errno);
 	return 0;
     }
-    if (! socket_put(p, name, strlen(name))) {
-	struct sockaddr_storage * addr = socket_addr(p);
-	error_report(error_server, addr, "send_watch", errno);
+    if (! socket_put(state->p, name, strlen(name))) {
+	error_report(error_server, state->peer, "send_watch", errno);
 	return 0;
     }
     return 1;
@@ -213,17 +260,25 @@ static int send_stat(socket_t * p, const char * path, int trans,
     return 1;
 }
 
+static void skip_data(socket_t * p, int len) {
+    char block[256];
+    while (len > 0) {
+	int nl = len > sizeof(block) ? sizeof(block) : len;
+	if (! socket_get(p, block, nl))
+	    return;
+	len -= nl;
+    }
+}
+
 #if NOTIFY != NOTIFY_NONE
-static const char * handle_excl_find(socket_t * p, char * lptr, int is_excl,
-				     config_dir_t * add, char cblock[])
-{
+static const char * handle_excl_find(state_t * state, char * lptr, int excl) {
     int match, how, namelen = atoi(lptr);
     config_acl_cond_t * item;
+    config_add_t * av;
     const char * rep, * kw;
-    char line[LINESIZE];
     if (namelen < 1)
 	return "EINVAL Invalid name";
-    if (! add) {
+    if (! state->add) {
 	rep = "ENOADD Pattern match outside add request";
 	goto skip_report;
     }
@@ -271,35 +326,30 @@ static const char * handle_excl_find(socket_t * p, char * lptr, int is_excl,
     }
     item = mymalloc(sizeof(config_acl_cond_t) + 1 + namelen);
     if (! item) {
-	rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-			  "run_server", "malloc");
+	rep = error_sys_r(state->cblock, DATA_BLOCKSIZE, "ADD", "malloc");
 	goto skip_report;
     }
-    if (! socket_get(p, item->pattern, namelen)) {
-	rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-			  "run_server", "malloc");
+    if (! socket_get(state->p, item->pattern, namelen)) {
+	rep = error_sys_r(state->cblock, DATA_BLOCKSIZE, "ADD", "malloc");
 	myfree(item);
 	return rep;
     }
     item->pattern[namelen] = 0;
-    if (is_excl) {
-	item->next = add->exclude;
-	add->exclude = item;
+    av = state->add->privdata;
+    if (excl) {
+	item->next = av->exclude;
+	av->exclude = item;
     } else {
-	item->next = add->find;
-	add->find = item;
+	item->next = av->find;
+	av->find = item;
     }
     return "OK added";
 skip_report:
-    while (namelen > 0) {
-	int sz = namelen > LINESIZE ? LINESIZE : namelen;
-	socket_get(p, line, LINESIZE);
-	namelen -= sz;
-    }
+    skip_data(state->p, namelen);
     return rep;
 }
 
-static const char * finish_add(config_dir_t * add, int * changes,
+static const char * finish_add(config_strlist_t * add, int * changes,
 			       char cblock[])
 {
     const char * rep;
@@ -307,7 +357,8 @@ static const char * finish_add(config_dir_t * add, int * changes,
     if (! add)
 	return "EINVAL Add request was never prepared";
     rep = control_add_tree(add, &count);
-    config_dir_free(add);
+    config_free_add(add->privdata);
+    myfree(add);
     if (rep)
 	return rep;
     *changes = 1;
@@ -321,78 +372,1087 @@ static int sendlines(void * _p, const char * l) {
     return socket_puts(p, l);
 }
 
-static void skip_data(socket_t * p, int len) {
-    char block[256];
-    while (len > 0) {
-	int nl = len > sizeof(block) ? sizeof(block) : len;
-	if (! socket_get(p, block, nl))
-	    return;
-	len -= nl;
-    }
-}
-
-static inline char * get_block(int fd, long long start, long long *size,
-			       char * block, long long * block_start, 
-			       long long * block_size)
+static inline char * get_block(state_t * state,
+			       long long start, long long *size)
 {
     ssize_t nr;
-    if (*size < 1) return block;
-    if (*block_start >= 0 && *block_size >= 0) {
-	if (*block_start <= start &&
-	    *block_start + *block_size >= start + *size)
-		return block + (start - *block_start);
+    if (*size < 1) return state->ublock;
+    if (state->block_start >= 0 && state->block_size >= 0) {
+	if (state->block_start <= start &&
+	    state->block_start + state->block_size >= start + *size)
+		return state->ublock + (start - state->block_start);
     }
-    if (lseek(fd, (off_t)start, SEEK_SET) < 0)
+    if (lseek(state->rfd, (off_t)start, SEEK_SET) < 0)
 	return NULL;
     if (*size > DATA_BLOCKSIZE)
 	*size = DATA_BLOCKSIZE;
-    nr = read(fd, block, *size);
+    nr = read(state->rfd, state->ublock, *size);
     if (nr < 0)
 	return NULL;
-    *size = *block_size = nr;
-    *block_start = start;
-    return block;
+    *size = state->block_size = nr;
+    state->block_start = start;
+    return state->ublock;
 }
+
+#if NOTIFY != NOTIFY_NONE
+static int send_event(const notify_event_t * ev, state_t * state) {
+    sprintf(state->cblock, "OK EV %d %d %d %d %d %d %d %d",
+	    store_get_file(state->get), store_get_pos(state->get),
+	    ev->event_type, ev->file_type, ev->stat_valid,
+	    ev->stat_valid || ev->event_type == notify_add_tree,
+	    ev->from_length, ev->to_length);
+    if (! socket_puts(state->p, state->cblock)) {
+	error_report(error_server, state->peer, "send_event", errno);
+	return 0;
+    }
+    if (ev->from_length &&
+	! socket_put(state->p, ev->from_name, ev->from_length))
+    {
+	error_report(error_server, state->peer, "send_event", errno);
+	return 0;
+    }
+    if (ev->to_length &&
+	! socket_put(state->p, ev->to_name, ev->to_length))
+    {
+	error_report(error_server, state->peer, "send_event", errno);
+	return 0;
+    }
+    if (ev->stat_valid) {
+	if (state->translate_ids) {
+	    char uname[64], gname[64];
+	    if (usermap_fromid(ev->file_user, uname, sizeof(uname)) <= 0)
+		strcpy(uname, "?");
+	    if (groupmap_fromid(ev->file_group, gname, sizeof(gname)) <= 0)
+		strcpy(gname, "?");
+	    sprintf(state->cblock, "NSTAT 0%o %s %d %s %d %lld %d %d",
+		    ev->file_mode, uname, ev->file_user,
+		    gname, ev->file_group, ev->file_size,
+		    major(ev->file_device),
+		    minor(ev->file_device));
+	} else {
+	    sprintf(state->cblock, "STAT 0%o %d %d %lld %d %d",
+		    ev->file_mode, ev->file_user,
+		    ev->file_group, ev->file_size,
+		    major(ev->file_device),
+		    minor(ev->file_device));
+	}
+	if (! socket_puts(state->p, state->cblock)) {
+	    error_report(error_server, state->peer, "send_event", errno);
+	    return 0;
+	}
+    }
+    if (ev->stat_valid || ev->event_type == notify_add_tree) {
+	char mtime[64];
+	struct tm tm;
+	gmtime_r(&ev->file_mtime, &tm);
+	strftime(mtime, sizeof(mtime), "%Y-%m-%d:%H:%M:%S", &tm);
+	sprintf(state->cblock, "MTIME %s", mtime);
+	if (! socket_puts(state->p, state->cblock)) {
+	    error_report(error_server, state->peer, "send_event", errno);
+	    return 0;
+	}
+    }
+    return 1;
+}
+#endif
+
+static const char * send_data(state_t * state,
+			      const char * udata, long long usize)
+{
+    long long csize, dsize;
+    const char * dptr;
+    if (state->compression >= 0 && usize > 0)
+	csize = compress_data(state->compression, udata,
+			      usize, state->cblock);
+    else
+	csize = -1;
+    if (csize <= 0) {
+	char tmpbuff[64];
+	sprintf(tmpbuff, "OK %lld", usize);
+	if (! socket_puts(state->p, tmpbuff)) {
+	    error_report(error_server, state->peer, "send_data", errno);
+	    state->running = 0;
+	    return NULL;
+	}
+	dptr = udata;
+	dsize = usize;
+    } else {
+	char tmpbuff[64];
+	sprintf(tmpbuff, "OK %lld %lld", csize, usize);
+	if (! socket_puts(state->p, tmpbuff)) {
+	    error_report(error_server, state->peer, "send_data", errno);
+	    state->running = 0;
+	    return NULL;
+	}
+	dptr = state->cblock;
+	dsize = csize;
+    }
+    if (state->bwlimit > 0) {
+	while (dsize > 0) {
+	    long diff = dsize;
+	    if (diff > state->bwlimit) diff = state->bwlimit;
+	    if (! socket_put(state->p, dptr, diff)) {
+		error_report(error_server, state->peer, "send_data", errno);
+		state->running = 0;
+		return NULL;
+	    }
+	    dptr += diff;
+	    dsize -= diff;
+	    socket_flush(state->p);
+	    sleep(1);
+	}
+    } else {
+	if (! socket_put(state->p, dptr, dsize)) {
+	    error_report(error_server, state->peer, "send_data", errno);
+	    state->running = 0;
+	    return NULL;
+	}
+    }
+    return NULL;
+}
+
+static const char * list_items(state_t * state, int max,
+			       const char * (*name)(int), const char * func)
+{
+    int n;
+    if (! socket_puts(state->p, "OK")) {
+	error_report(error_server, state->peer, "list_items", errno);
+	state->running = 0;
+	return NULL;
+    }
+    for (n = 0; n < max; n++) {
+	const char * c = name(n);
+#if USE_SHOULDBOX
+	if (! c) {
+	    error_report(error_shouldbox_null, "list_items", func);
+	    break;
+	}
+#endif
+	if (! socket_puts(state->p, c)) {
+	    error_report(error_server, state->peer, "list_items", errno);
+	    state->running = 0;
+	    break;
+	}
+    }
+    if (! socket_puts(state->p, "__END__")) {
+	error_report(error_server, state->peer, "list_items", errno);
+	state->running = 0;
+    }
+    return NULL;
+}
+
+/* client commands */
+
+#if NOTIFY != NOTIFY_NONE
+static const char * op_add(char * lptr, state_t * state) {
+    int namelen = atoi(lptr);
+    const char * rep = NULL;
+    config_add_t * av;
+    if (namelen < 1)
+	return "EINVAL Invalid name";
+    if (state->add)
+	return "EINVAL Add already in progress";
+    state->add = mymalloc(sizeof(config_strlist_t) + 1 + namelen);
+    if (! state->add) {
+	rep = error_sys_r(state->cblock, DATA_BLOCKSIZE, "ADD", "malloc");
+	goto skip_report;
+    }
+    av = mymalloc(sizeof(config_add_t));
+    if (! av) {
+	rep = error_sys_r(state->cblock, DATA_BLOCKSIZE, "ADD", "malloc");
+	myfree(state->add);
+	state->add = NULL;
+	goto skip_report;
+    }
+    state->add->privdata = av;
+    state->add->next = NULL;
+    state->add->datalen = namelen;
+    state->add->data[namelen] = 0;
+    av->crossmount = 1;
+    av->exclude = NULL;
+    av->find = NULL;
+    if (! socket_get(state->p, state->add->data, namelen))
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE, "ADD", "malloc");
+    return "OK added";
+skip_report:
+    skip_data(state->p, namelen);
+    return rep;
+}
+#endif
+
+static const char * op_bwlimit(char * lptr, state_t * state) {
+    long limit = atol(lptr);
+    if (limit < 0 || limit >= LONG_MAX / 1024L)
+	return "EINVAL bandwidth limit";
+    state->bwlimit = limit * 1024L;
+    return "OK limit changed";
+}
+
+static const char * op_checksum(char * lptr, state_t * state) {
+    long long start, size;
+    int i, wp, clen = checksum_size(state->csum_n);
+    unsigned char hash[clen < 0 ? 0 : clen];
+    char * block;
+    if (state->csum_n < 0)
+	return "ENOSYS No checksums available";
+    if (state->rfd < 0)
+	return "EBADF File not opened";
+    if (sscanf(lptr, "%lld %lld", &start, &size) < 2)
+	return "EINVAL Invalid request";
+    if (start < 0 || size < 0) 
+	return "EINVAL Invalid request";
+    block = get_block(state, start, &size);
+    if (! block)
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+			   "CHECKSUM", "get_block");
+    if (! checksum_data(state->csum_n, block, size, hash))
+	return "Error calculating checksum";
+    wp = sprintf(state->cblock, "OK %lld ", size);
+    for (i = 0; i < clen; i++)
+	wp += sprintf(state->cblock + wp, "%02X",
+		      (unsigned int)hash[i]);
+    return state->cblock;
+}
+
+static const char * op_closelog(char * lptr, state_t * state) {
+    error_closelog();
+    return "OK closed";
+}
+
+static const char * op_compress(char * lptr, state_t * state) {
+    int num;
+    char * kw = lptr;
+    while (*lptr && ! isspace((int)*lptr)) lptr++;
+    if (lptr == kw)
+	return "EINVAL Invalid empty compression method";
+    if (*lptr)
+	*lptr++ = 0;
+    num = compress_byname(kw);
+    if (num < 0)
+	return "EINVAL Unknown compression method";
+    state->compression = num;
+    return "OK compression selected";
+}
+
+static const char * op_closefile(char * lptr, state_t * state) {
+    if (state->rfd < 0)
+	return "EBADF File not opened";
+    if (state->Dname) myfree(state->Dname);
+    state->Dname = NULL;
+    close(state->rfd);
+    state->rfd = -1;
+    return "OK file closed";
+}
+
+static const char * op_config(char * lptr, state_t * state) {
+    if (! socket_puts(state->p, "OK")) {
+	error_report(error_server, state->peer, "CONFIG", errno);
+	state->running = 0;
+	return NULL;
+    }
+    config_print(sendlines, state->p);
+    if (! socket_puts(state->p, "__END__")) {
+	error_report(error_server, state->peer, "CONFIG", errno);
+	state->running = 0;
+	return NULL;
+    }
+    return NULL;
+}
+
+#if NOTIFY != NOTIFY_NONE
+static const char * op_cross(char * lptr, state_t * state) {
+    const char * rep;
+    config_add_t * av;
+    if (! state->add)
+	return "EINVAL Need ADD command first";
+    av = state->add->privdata;
+    av->crossmount = 1;
+    rep = finish_add(state->add, &state->changes, state->cblock);
+    state->add = NULL;
+    return rep;
+}
+#endif /* NOTIFY != NOTIFY_NONE */
+
+static const char * op_data(char * lptr, state_t * state) {
+    long long start, usize;
+    const char * udata;
+    if (state->rfd < 0)
+	return "EBADF File not opened";
+    if (sscanf(lptr, "%lld %lld", &start, &usize) < 2)
+	return "EINVAL Invalid request";
+    udata = get_block(state, start, &usize);
+    if (! udata)
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE, "DATA", "get_block");
+    return send_data(state, udata, usize);
+}
+
+static const char * op_debug(char * lptr, state_t * state) {
+    socket_setdebug(state->p, 1);
+    return "OK";
+}
+
+#if THEY_HAVE_LIBRSYNC
+static const char * op_delta(char * lptr, state_t * state) {
+    long long msize;
+    ssize_t nr;
+    rs_buffers_t rs_buf;
+    rs_result rs_res;
+    if (state->rfd < 0)
+	return "EBADF File not opened";
+    if (! state->has_signatures)
+	return "EINVAL Did not see a SIGNATURE command";
+    if (sscanf(lptr, "%lld", &msize) < 1)
+	return "EINVAL Invalid request";
+    if (msize > DATA_BLOCKSIZE)
+	msize = DATA_BLOCKSIZE;
+    if (state->delta_pos < 0) {
+	/* first time after reading signatures */
+	rs_buf.next_in = rs_buf.next_out = NULL;
+	rs_buf.avail_in = rs_buf.avail_out = 0;
+	rs_buf.eof_in = 1;
+	rs_res = rs_job_iter(state->rs_job, &rs_buf);
+	if (rs_res != RS_DONE)
+	    return "EBADF Error from librsync";
+	rs_job_free(state->rs_job);
+	state->rs_job = NULL;
+	rs_res = rs_build_hash_table(state->rs_signature);
+	if (rs_res != RS_DONE)
+	    return "EBADF Error from librsync";
+	state->rs_job = rs_delta_begin(state->rs_signature);
+	state->delta_pos = state->rdiff_start;
+    }
+    /* read more file data and get some more deltas */
+    while (1) {
+	int todo = state->rdiff_end - state->delta_pos;
+	long long usize;
+	if (lseek(state->rfd, state->delta_pos, SEEK_SET) < 0)
+	    return error_sys_r(state->cblock, DATA_BLOCKSIZE, "DELTA", "delta");
+	if (todo > DATA_BLOCKSIZE)
+	    todo = DATA_BLOCKSIZE;
+	nr = read(state->rfd, state->cblock, todo);
+	if (nr < 0)
+	    return error_sys_r(state->cblock, DATA_BLOCKSIZE, "DELTA", "delta");
+	rs_buf.next_in = state->cblock;
+	rs_buf.avail_in = nr;
+	rs_buf.eof_in = nr == 0;
+	rs_buf.next_out = state->ublock;
+	rs_buf.avail_out = msize;
+	rs_res = rs_job_iter(state->rs_job, &rs_buf);
+	if (rs_res != RS_BLOCKED && rs_res != RS_DONE)
+	    return "EBADF Error from librsync";
+	/* send this delta back */
+	state->delta_pos += nr - rs_buf.avail_in;
+	usize = msize - rs_buf.avail_out;
+	if (usize > 0)
+	    return send_data(state, state->ublock, usize);
+    }
+}
+#endif
+
+static const char * op_dirsync(char * lptr, state_t * state) {
+    char * path;
+    int ok, namelen = atoi(lptr);
+    if (namelen < 1)
+	return "EINVAL Invalid name";
+    path = mymalloc(1 + namelen);
+    if (! path) {
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE, "DIRSYNC", "malloc");
+    if (! socket_get(state->p, path, namelen)) {
+	const char * rep = error_sys_r(state->cblock, DATA_BLOCKSIZE,
+				       "DIRSYNC", "malloc");
+	myfree(path);
+	return rep;
+    }
+    path[namelen] = 0;
+    ok = copy_dirsync("user", path);
+    myfree(path);
+    if (ok)
+	return "OK scheduled";
+    }
+    return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+		      "DIRSYNC", "schedule_dirsync");
+}
+
+static const char * op_extensions(char * lptr, state_t * state) {
+    if (! socket_puts(state->p, "OK sending extensions list")) {
+	error_report(error_server, state->peer, "EXTENSIONS", errno);
+	state->running = 0;
+	return NULL;
+    }
+    // XXX ENCRYPT
+    if (! socket_puts(state->p, "UPDATE")) {
+	error_report(error_server, state->peer, "EXTENSIONS", errno);
+	state->running = 0;
+	return NULL;
+    }
+    if (! client_mode) {
+	if (state->csum_n >= 0 && ! socket_puts(state->p, "CHECKSUM")) {
+	    error_report(error_server, state->peer, "EXTENSIONS", errno);
+	    state->running = 0;
+	    return NULL;
+	}
+	// XXX IGNORE (! client_mode)
+	if (! socket_puts(state->p, "EVBATCH")) {
+	    error_report(error_server, state->peer, "EXTENSIONS", errno);
+	    state->running = 0;
+	    return NULL;
+	}
+#if THEY_HAVE_LIBRSYNC
+	if (! socket_puts(state->p, "RSYNC")) {
+	    error_report(error_server, state->peer, "EXTENSIONS", errno);
+	    state->running = 0;
+	    return NULL;
+	}
+#endif
+    } else {
+	if (! socket_puts(state->p, "DIRSYNC")) {
+	    error_report(error_server, state->peer, "EXTENSIONS", errno);
+	    state->running = 0;
+	    return NULL;
+	}
+    }
+    if (! socket_puts(state->p, ".")) {
+	error_report(error_server, state->peer, "EXTENSIONS", errno);
+	state->running = 0;
+	return NULL;
+    }
+    return NULL;
+}
+
+#if NOTIFY != NOTIFY_NONE
+static const char * op_evbatch(char * lptr, state_t * state) {
+    notify_event_t ev;
+    int count, size, avail, used = 0;
+    if (! state->get)
+	return "EINVAL no root dir";
+    if (sscanf(lptr, "%d %d", &count, &size) < 2)
+	return "EINVAL Invalid request";
+    avail = store_get(state->get, &ev, -1, -1, state->poll_fd,
+		      state->cblock, DATA_BLOCKSIZE, &used);
+    if (avail == -2)
+	return state->cblock;
+    if (! send_event(&ev, state)) {
+	state->running = 0;
+	return NULL;
+    }
+    count--;
+    while (count > 0 && used <= size) {
+	int nu = 0;
+	avail = store_get(state->get, &ev, 0, size - used,
+			  state->poll_fd, state->cblock,
+			  DATA_BLOCKSIZE, &nu);
+	if (avail != 0) break;
+	used += nu;
+	count --;
+	if (! send_event(&ev, state))
+	    break;
+    }
+    return "OK NO";
+}
+#endif
+
+#if NOTIFY != NOTIFY_NONE
+static const char * op_event(char * lptr, state_t * state) {
+    notify_event_t ev;
+    int timeout, size, avail;
+    if (! state->get)
+	return "EINVAL no root dir";
+    if (sscanf(lptr, "%d %d", &timeout, &size) < 2)
+	return "EINVAL Invalid request";
+    avail = store_get(state->get, &ev, timeout, size, state->poll_fd,
+		      state->cblock, DATA_BLOCKSIZE, NULL);
+    if (avail == -2)
+	return state->cblock;
+    if (avail < 0)
+	/* no event available */
+	return "OK NO";
+    if (avail > 0) {
+	/* event too big */
+	sprintf(state->cblock, "OK BIG %d", avail);
+	if (! socket_puts(state->p, state->cblock)) {
+	    error_report(error_server, state->peer, "EVENT", errno);
+	    state->running = 0;
+	}
+	return NULL;
+    }
+    /* an event is available */
+    if (! send_event(&ev, state))
+	state->running = 0;
+    return NULL;
+}
+#endif
+
+#if NOTIFY != NOTIFY_NONE
+static const char * op_excl(char * lptr, state_t * state) {
+    return handle_excl_find(state, lptr, 1);
+}
+#endif
+
+#if NOTIFY != NOTIFY_NONE
+static const char * op_find(char * lptr, state_t * state) {
+    return handle_excl_find(state, lptr, 0);
+}
+#endif
+
+static const char * op_getdir(char * lptr, state_t * state) {
+    int len, trans;
+    DIR * dp;
+    struct dirent * ent;
+    const config_data_t * cfg = config_get();
+    int skip_should = config_intval(cfg, cfg_flags) & config_flag_skip_should;
+    config_put(cfg);
+    if (sscanf(lptr, "%d %d", &len, &trans) < 2)
+	return "EINVAL Invalid request";
+    if (len >= DATA_BLOCKSIZE - NAME_MAX - 2) {
+	skip_data(state->p, len);
+	return "EINVAL name too long";
+    }
+    if (! socket_get(state->p, state->cblock, len))
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+			   "GETDIR", "socket_get");
+    state->cblock[len] = 0;
+    dp = opendir(state->cblock);
+    if (! dp) {
+	strcpy(state->ublock, state->cblock);
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+			   "GETDIR", state->ublock);
+    }
+    if (! socket_puts(state->p, "OK")) {
+	error_report(error_server, state->peer, "GETDIR", errno);
+	closedir(dp);
+	state->running = 0;
+	return NULL;
+    }
+    state->cblock[len++] = '/';
+    while ((ent = readdir(dp)) != NULL) {
+	int nl = strlen(ent->d_name), el;
+	if (ent->d_name[0] == '.') {
+	    if (ent->d_name[1] == 0) continue;
+	    if (ent->d_name[1] == '.' && ent->d_name[2] == 0)
+		continue;
+	    /* skip should's temporary files, if required */
+	    if (skip_should && nl == 14 &&
+		strncmp(ent->d_name, ".should.", 8) == 0)
+		    continue;
+	}
+	el = len + nl;
+	if (nl >= DATA_BLOCKSIZE)
+	    /* not supposed to happen but you never know */
+	    continue;
+	strcpy(state->cblock + len, ent->d_name);
+	if (send_stat(state->p, state->cblock, trans, "", ent->d_name))
+	    continue;
+	error_report(error_server, state->peer, "GETDIR", errno);
+	state->running = 0;
+	closedir(dp);
+	return NULL;
+    }
+    closedir(dp);
+    if (! socket_puts(state->p, ".")) {
+	error_report(error_server, state->peer, "GETDIR", errno);
+	state->running = 0;
+    }
+    return NULL;
+}
+
+static const char * op_listchecksum(char * lptr, state_t * state) {
+    return list_items(state, checksum_count(), checksum_name, "checksum_name");
+}
+
+static const char * op_listcompress(char * lptr, state_t * state) {
+    return list_items(state, compress_count(), compress_name, "compress_name");
+}
+
+#if NOTIFY != NOTIFY_NONE
+static const char * op_nocross(char * lptr, state_t * state) {
+    const char * rep;
+    config_add_t * av;
+    if (! state->add)
+	return "EINVAL Need ADD command first";
+    av = state->add->privdata;
+    av->crossmount = 0;
+    rep = finish_add(state->add, &state->changes, state->cblock);
+    state->add = NULL;
+    return rep;
+}
+#endif /* NOTIFY != NOTIFY_NONE */
+
+static const char * op_nodebug(char * lptr, state_t * state) {
+    socket_setdebug(state->p, 0);
+    return "OK";
+}
+
+static const char * op_open(char * lptr, state_t * state) {
+    struct stat sbuff;
+    int namelen = atoi(lptr);
+    if (namelen < 1)
+	return "EINVAL Invalid name";
+    if (state->Dname) myfree(state->Dname);
+    if (state->rfd >= 0) close(state->rfd);
+    state->rfd = -1;
+    state->Dname = mymalloc(1 + namelen);
+    if (! state->Dname) {
+	const char * rep = error_sys_r(state->cblock, DATA_BLOCKSIZE,
+				       "OPEN", "malloc");
+	skip_data(state->p, namelen);
+	return rep;
+    }
+    if (! socket_get(state->p, state->Dname, namelen))
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE, "OPEN", "socket_get");
+    state->Dname[namelen] = 0;
+    /* don't wait on a named pipe or similar thing */
+    if (lstat(state->Dname, &sbuff) < 0)
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE, "OPEN", state->Dname);
+    if (! S_ISREG(sbuff.st_mode))
+	return "EBADF not a regular file";
+    if (sbuff.st_size == 0)
+	return "File has zero size, no need to OPEN it...";
+    /* there's a chance somebody will rename a pipe into Dname just right now.
+     * Nothing we can do about it, but we open the file in nonblocking mode
+     * and then re-check with fstat that it's still a regular file */
+    state->rfd = open(state->Dname, O_RDONLY|O_NONBLOCK);
+    if (state->rfd < 0)
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE, "OPEN", state->Dname);
+    if (fstat(state->rfd, &sbuff) < 0) {
+	const char * rep = error_sys_r(state->cblock, DATA_BLOCKSIZE,
+				       "OPEN", state->Dname);
+	close(state->rfd);
+	state->rfd = -1;
+	return rep;
+    }
+    if (! S_ISREG(sbuff.st_mode)) {
+	close(state->rfd);
+	state->rfd = -1;
+	return "EBADF not a regular file";
+    }
+    if (sbuff.st_size == 0) {
+	close(state->rfd);
+	state->rfd = -1;
+	return "File has zero size, no need to OPEN it...";
+    }
+    /* reset O_NONBLOCK */
+    fcntl(state->rfd, F_SETFL, 0L);
+    return "OK file opened";
+}
+
+#if NOTIFY != NOTIFY_NONE
+static const char * op_purge(char * lptr, state_t * state) {
+    int days = atoi(lptr);
+    if (days < 2)
+	return "EINVAL Invalid number of days";
+    if (! store_purge(days))
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+			   "PURGE", "store_purge");
+    return "OK purged";
+}
+#endif /* NOTIFY != NOTIFY_NONE */
+
+static const char * op_quit(char * lptr, state_t * state) {
+    state->running = 0;
+    return "OK bye then";
+}
+
+#if NOTIFY != NOTIFY_NONE
+static const char * op_remove(char * lptr, state_t * state) {
+    char * path;
+    int namelen = atoi(lptr);
+    const char * rep;
+    if (namelen < 1)
+	return "EINVAL Invalid name";
+    path = mymalloc(1 + namelen);
+    if (! path) {
+	rep = error_sys_r(state->cblock, DATA_BLOCKSIZE, "REMOVE", "malloc");
+	skip_data(state->p, namelen);
+	return rep;
+    }
+    if (! socket_get(state->p, path, namelen)) {
+	rep = error_sys_r(state->cblock, DATA_BLOCKSIZE, "REMOVE", "malloc");
+	myfree(path);
+	return rep;
+    }
+    path[namelen] = 0;
+    rep = control_remove_tree(path);
+    myfree(path);
+    if (rep) return rep;
+    state->changes = 1;
+    return "OK removed";
+}
+#endif /* NOTIFY != NOTIFY_NONE */
+
+#if THEY_HAVE_LIBRSYNC
+static const char * op_rsync(char * lptr, state_t * state) {
+    long long start, usize;
+    if (state->rfd < 0)
+	return "EBADF File not opened";
+    if (sscanf(lptr, "%lld %lld", &start, &usize) < 2)
+	return "EINVAL Invalid request";
+    if (start < 0 || usize < 0)
+	return "EINVAL Invalid request";
+    state->delta_pos = -1;
+    state->has_signatures = 0;
+    state->rdiff_start = state->rdiff_end = -1;
+    if (state->rs_signature) rs_free_sumset(state->rs_signature);
+    state->rs_signature = NULL;
+    if (state->rs_job) rs_job_free(state->rs_job);
+    state->rs_job = NULL;
+    state->rs_job = rs_loadsig_begin(&state->rs_signature);
+    state->rdiff_start = start;
+    state->rdiff_end = start + usize;
+    snprintf(state->cblock, DATA_BLOCKSIZE, "OK %lld %d",
+	     usize, DATA_BLOCKSIZE);
+    return state->cblock;
+}
+#endif /* THEY_HAVE_LIBRSYNC */
+
+static const char * op_setchecksum(char * lptr, state_t * state) {
+    int num;
+    char * kw = lptr;
+    while (*lptr && ! isspace((int)*lptr)) lptr++;
+    if (lptr == kw)
+	return "EINVAL Invalid empty checksum method";
+    if (*lptr)
+	*lptr++ = 0;
+    num = checksum_byname(kw);
+    if (num < 0)
+	return "EINVAL Unknown checksum method";
+    state->csum_n = num;
+    return "OK checksum method selected";
+}
+
+#if NOTIFY != NOTIFY_NONE
+static const char * op_setroot(char * lptr, state_t * state) {
+    int pos, file, namelen;
+    if (sscanf(lptr, "%d %d %d %d",
+	       &file, &pos, &namelen, &state->translate_ids) < 4)
+	return "EINVAL Invalid data";
+    if (namelen < 1)
+	return "EINVAL invalid name";
+    if (state->rootdir) myfree(state->rootdir);
+    if (state->get) store_finish(state->get);
+    state->get = NULL;
+    state->rootdir = mymalloc(1 + namelen);
+    if (! state->rootdir) {
+	const char * rep = error_sys_r(state->cblock, DATA_BLOCKSIZE,
+				       "SETROOT", "malloc");
+	skip_data(state->p, namelen);
+	return rep;
+    }
+    if (! socket_get(state->p, state->rootdir, namelen))
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+			   "SETROOT", "malloc");
+    state->rootdir[namelen] = 0;
+    state->get = store_prepare(file, pos, state->rootdir);
+    if (! state->get)
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+			   "SETROOT", "store_prepare");
+    return "OK root changed";
+}
+#endif /* NOTIFY != NOTIFY_NONE */
+
+#if THEY_HAVE_LIBRSYNC
+static const char * op_signature(char * lptr, state_t * state) {
+    long long csize, usize;
+    int dcount;
+    rs_result rs_res;
+    rs_buffers_t rs_buf;
+    if (state->rfd < 0)
+	return "EBADF File not opened";
+    if (state->rdiff_start < 0 || ! state->rs_signature || ! state->rs_job)
+	return "EINVAL Did not see an RSYNC command";
+    dcount = sscanf(lptr, "%lld %lld", &csize, &usize);
+    if (dcount < 1)
+	return "EINVAL Invalid request";
+    if (dcount < 2)
+	usize = csize;
+    else if (state->compression < 0)
+	return "EINVAL no compression selected";
+    if (csize < 0 || usize < 0 || usize < csize)
+	return "EINVAL Invalid request";
+    if (usize > DATA_BLOCKSIZE) {
+	skip_data(state->p, usize);
+	return "EINVAL Buffer overflow";
+    }
+    if (! socket_puts(state->p, "OK send the data"))
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+			   "SIGNATURE", "socket_put");
+    if (! socket_get(state->p, state->cblock, csize))
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+			   "SIGNATURE", "socket_get");
+    rs_buf.next_in = state->cblock;
+    if (dcount >= 2) {
+	int bsize = DATA_BLOCKSIZE;
+	const char * rep;
+	state->block_start = state->block_size = -1;
+	rep = uncompress_data(state->compression, state->cblock, csize,
+			      state->ublock, &bsize);
+	if (rep) return rep;
+	if (bsize != usize)
+	    return "EBADF Uncompressed data has wrong size";
+	rs_buf.next_in = state->ublock;
+    }
+    rs_buf.avail_in = usize;
+    rs_buf.eof_in = 0;
+    rs_buf.avail_out = 0;
+    rs_buf.next_out = NULL;
+    rs_res = rs_job_iter(state->rs_job, &rs_buf);
+    if (rs_res != RS_BLOCKED && rs_res != RS_DONE)
+	return "EBADF Error from librsync";
+    if (rs_buf.avail_in > 0) {
+	// XXX uhm, need to store this somewhere?
+	error_report(error_internal, "signature", "avail>0");
+    }
+    state->has_signatures = 1;
+    return "OK";
+}
+#endif
+
+static const char * op_stat(char * lptr, state_t * state) {
+    int len, trans, s;
+    if (sscanf(lptr, "%d %d", &len, &trans) < 2)
+	return "EINVAL Invalid request";
+    if (len >= DATA_BLOCKSIZE - NAME_MAX - 2) {
+	skip_data(state->p, len);
+	return "EINVAL name too long";
+    }
+    if (! socket_get(state->p, state->cblock, len))
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE, "STAT", "socket_get");
+    state->cblock[len] = 0;
+    s = send_stat(state->p, state->cblock, trans, "OK ", NULL);
+    if (s > 0)
+	return NULL;
+    if (s < 0)
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE, "STAT", "stat");
+    error_report(error_server, state->peer, "STAT", errno);
+    state->running = 0;
+    return NULL;
+}
+
+const char * op_statfs(char * lptr, state_t * state) {
+    int len;
+    struct statvfs sbuff;
+    if (sscanf(lptr, "%d", &len) < 1)
+	return "EINVAL Invalid request";
+    if (len >= DATA_BLOCKSIZE - 2) {
+	skip_data(state->p, len);
+	return "EINVAL name too long";
+    }
+    if (! socket_get(state->p, state->cblock, len))
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+			   "STATFS", "socket_get");
+    state->cblock[len] = 0;
+    if (statvfs(state->cblock, &sbuff) < 0)
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+			   "STATFS", "statfs");
+    sprintf(state->cblock, "OK %llu %llu %llu %llu %llu %llu %llu %d",
+	    (unsigned long long)sbuff.f_bsize,
+	    (unsigned long long)sbuff.f_blocks,
+	    (unsigned long long)sbuff.f_bfree,
+	    (unsigned long long)sbuff.f_bavail,
+	    (unsigned long long)sbuff.f_files,
+	    (unsigned long long)sbuff.f_ffree,
+	    (unsigned long long)sbuff.f_favail,
+	    ! (sbuff.f_flag & ST_RDONLY));
+    if (! socket_puts(state->p, state->cblock)) {
+	error_report(error_server, state->peer, "STATFS", errno);
+	state->running = 0;
+    }
+    return NULL;
+}
+
+static const char * op_status(char * lptr, state_t * state) {
+    const char * rep;
+    if (! socket_puts(state->p, "OK sending status")) {
+	error_report(error_server, state->peer, "STATUS", errno);
+	state->running = 0;
+	return NULL;
+    }
+    rep = send_status(state->p);
+    if (rep) {
+	error_report(error_server_msg, state->peer, "STATUS", rep);
+	state->running = 0;
+    }
+    return NULL;
+}
+
+static const char * op_stop(char * lptr, state_t * state) {
+    main_running = 0;
+    error_report(info_user_stop);
+    return "OK stopping";
+}
+
+static const char * op_update(char * lptr, state_t * state) {
+    const char * rep;
+    int len = atoi(lptr);
+    if (len < 1)
+	return "EINVAL Invalid update";
+    if (len >= DATA_BLOCKSIZE - 2) {
+	skip_data(state->p, len);
+	return "EINVAL update too long";
+    }
+    if (! socket_get(state->p, state->cblock, len))
+	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
+			   "UPDATE", "socket_get");
+    state->cblock[len] = 0;
+    if (! state->updating) {
+	rep = config_start_update();
+	if (rep) return rep;
+	state->updating = 1;
+    }
+    if (strcasecmp(state->cblock, "commit") == 0) {
+	if (state->updating != 1)
+	    return "Previous update failed, cannot commit";
+	rep = config_commit_update();
+	state->updating = 0;
+	if (rep) return rep;
+	return "OK committed";
+    }
+    if (strcasecmp(state->cblock, "rollback") == 0) {
+	config_cancel_update();
+	state->updating = 0;
+	return "OK rolled back";
+    }
+    rep = config_do_update(state->cblock);
+    if (rep) {
+	state->updating = 2;
+	return rep;
+    }
+    return "OK updated";
+}
+
+#if NOTIFY != NOTIFY_NONE
+static const char * op_watches(char * lptr, state_t * state) {
+    if (! socket_puts(state->p, "OK")) {
+	error_report(error_server, state->peer, "WATCHES", errno);
+	state->running = 0;
+	return NULL;
+    }
+    if (! notify_forall_watches(send_watch, state)) {
+	state->running = 0;
+	return NULL;
+    }
+    if (! socket_puts(state->p, "0")) {
+	error_report(error_server, state->peer, "WATCHES", errno);
+	state->running = 0;
+    }
+    return NULL;
+}
+#endif /* NOTIFY != NOTIFY_NONE */
+
+const static command_t commands[] = {
+    /* keep commands grouped by letter and in upper case */
+#if NOTIFY != NOTIFY_NONE
+    { "ADD",          config_op_add,      cm_server,  op_add },
+#endif
+    { "BWLIMIT",      config_op_read,     cm_server,  op_bwlimit },
+    { "CHECKSUM",     config_op_read,     cm_server,  op_checksum },
+    { "CLOSELOG",     config_op_closelog, cm_any,     op_closelog },
+    { "COMPRESS",     config_op_read,     cm_server,  op_compress },
+    { "CLOSEFILE",    config_op_read,     cm_server,  op_closefile },
+    { "CONFIG",       config_op_getconf,  cm_any,     op_config },
+#if NOTIFY != NOTIFY_NONE
+    { "CROSS",        config_op_add,      cm_server,  op_cross },
+#endif
+    { "DATA",         config_op_read,     cm_server,  op_data },
+    { "DEBUG",        config_op_debug,    cm_any,     op_debug },
+#if THEY_HAVE_LIBRSYNC
+    { "DELTA",        config_op_read,     cm_server,  op_delta },
+#endif
+    { "DIRSYNC",      config_op_dirsync,  cm_copy,    op_dirsync },
+#if 0 // XXX ENCRYPT
+    { "ENCRYPT",      config_op_read,     cm_server,  op_encrypt },
+#endif
+#if NOTIFY != NOTIFY_NONE
+    { "EVBATCH",      config_op_read,     cm_server,  op_evbatch },
+    { "EVENT",        config_op_read,     cm_server,  op_event },
+    { "EXCL",         config_op_add,      cm_server,  op_excl },
+#endif
+    { "EXTENSIONS",   ~0,                 cm_any,     op_extensions },
+#if NOTIFY != NOTIFY_NONE
+    { "FIND",         config_op_add,      cm_server,  op_find },
+#endif
+    { "GETDIR",       config_op_read,     cm_server,  op_getdir },
+#if 0 // XXX IGNORE
+    { "IGNORE",       config_op_ignore,   cm_server,  op_ignore },
+#endif
+    { "LISTCHECKSUM", config_op_read |
+		      config_op_getconf,  cm_server,  op_listchecksum },
+    { "LISTCOMPRESS", config_op_read |
+		      config_op_getconf,  cm_server,  op_listcompress },
+#if NOTIFY != NOTIFY_NONE
+    { "NOCROSS",      config_op_add,      cm_server,  op_nocross },
+#endif
+    { "NODEBUG",      config_op_debug,    cm_any,     op_nodebug },
+    { "OPEN",         config_op_read,     cm_server,  op_open },
+#if NOTIFY != NOTIFY_NONE
+    { "PURGE",        config_op_purge,    cm_server,  op_purge },
+#endif
+    { "QUIT",         ~0,                 cm_any,     op_quit },
+#if NOTIFY != NOTIFY_NONE
+    { "REMOVE",       config_op_remove,   cm_server,  op_remove },
+#endif
+    { "RSYNC",        config_op_read,     cm_server,  op_rsync },
+    { "SETCHECKSUM",  config_op_read,     cm_server,  op_setchecksum },
+#if NOTIFY != NOTIFY_NONE
+    { "SETROOT",      config_op_read,     cm_server,  op_setroot },
+#endif
+    { "SIGNATURE",    config_op_read,     cm_server,  op_signature },
+    { "STAT",         config_op_read,     cm_server,  op_stat },
+    { "STATFS",       config_op_read,     cm_server,  op_statfs },
+    { "STATUS",       config_op_status,   cm_any,     op_status },
+    { "STOP",         config_op_stop,     cm_any,     op_stop },
+    { "UPDATE",       config_op_setconf,  cm_any,     op_update },
+#if NOTIFY != NOTIFY_NONE
+    { "WATCHES",      config_op_watches,  cm_server,  op_watches },
+#endif
+};
+#define NR_COMMANDS (sizeof(commands) / sizeof(command_t))
+
+static int cmdindex[27];
 
 /* talks to a client */
 
 void * run_server(void * _tp) {
     thlist_t * tp = _tp;
-    socket_t * p = tp->p;
-    struct sockaddr_storage * addr = socket_addr(p);
-    int ov, running = 1, csum_n, is_server = ! client_mode, updating = 0;
-    int compression = -1, rfd = -1;
-    char * Dname = NULL;
-    char cblock[DATA_BLOCKSIZE], ublock[DATA_BLOCKSIZE];
-    const char * user = socket_user(p), * udata;
-    long long usize, block_start = -1, block_size = -1;
-#if THEY_HAVE_LIBRSYNC
-    long long rdiff_start = -1, rdiff_size = -1;
-    pipe_t rdiff_pipe; // XXX replace with librsync
-    int has_signatures = 0;
-#endif
-#if NOTIFY != NOTIFY_NONE
-    store_get_t * get = NULL;
-    config_dir_t * add = NULL;
-    char * rootdir = NULL;
-    int changes = 0, translate_ids = 1;
-#endif /* NOTIFY != NOTIFY_NONE */
-    long bwlimit = 0L;
-    config_userop_t allowed = socket_actions(p);
+    state_t state;
+    int ov;
+    const char * user;
+    config_userop_t allowed;
+    cmdmode_t mode = client_mode ? cm_copy : cm_server;
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &ov);
-    error_report(info_connection_open, user, addr);
-    csum_n = checksum_byname("md5");
-#if THEY_HAVE_LIBRSYNC
-    rdiff_pipe.pid = -1;
-    rdiff_pipe.fromchild = rdiff_pipe.tochild = -1;
+    state.p = tp->p;
+    state.poll_fd = socket_poll(state.p);
+    state.peer = socket_addr(state.p);
+    state.running = 1;
+    state.updating = 0;
+    state.bwlimit = 0L;
+    state.csum_n = checksum_byname("md5");
+    state.compression = state.rfd = -1;
+    state.block_start = state.block_size = -1;
+    state.Dname = NULL;
+#if NOTIFY != NOTIFY_NONE
+    state.add = NULL;
+    state.get = NULL;
+    state.rootdir = NULL;
+    state.translate_ids = 1;
+    state.changes = 0;
 #endif
-    while (main_running && running) {
+#if THEY_HAVE_LIBRSYNC
+    state.has_signatures = 0;
+    state.delta_pos = -1;
+    state.rdiff_start = state.rdiff_end = -1;
+    state.rs_signature = NULL;
+    state.rs_job = NULL;
+#endif
+    user = socket_user(state.p);
+    allowed = socket_actions(state.p);
+    error_report(info_connection_open, user, state.peer);
+    while (main_running && state.running) {
 	char line[LINESIZE], * lptr, * kw;
 	const char * rep;
-	int namelen = 0;
-	if (! socket_gets(p, line, LINESIZE)) {
+	int cmdi, cmde;
+	if (! socket_gets(state.p, line, LINESIZE)) {
 	    if (errno != EINTR && errno != EPIPE)
-		error_report(error_server, addr, "run_server", errno);
+		error_report(error_server, state.peer, "run_server", errno);
 	    break;
 	}
 	lptr = line;
@@ -407,1202 +1467,69 @@ void * run_server(void * _tp) {
 	    *lptr++ = 0;
 	    while (*lptr && isspace((int)*lptr)) lptr++;
 	}
-	switch (kw[0]) {
-#if NOTIFY != NOTIFY_NONE
-	    case 'A' : case 'a' :
-		if (is_server && strcasecmp(kw, "ADD") == 0) {
-		    if (! (allowed & config_op_add)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    namelen = atoi(lptr);
-		    if (namelen < 1) {
-			rep = "EINVAL Invalid name";
-			goto report;
-		    }
-		    add = mymalloc(sizeof(config_dir_t));
-		    if (! add) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			goto skip_report;
-		    }
-		    add->next = NULL;
-		    add->crossmount = 1;
-		    add->exclude = NULL;
-		    add->find = NULL;
-		    add->path = mymalloc(1 + namelen);
-		    if (! add->path) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			goto skip_report;
-		    }
-		    if (! socket_get(p, add->path, namelen)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			goto report;
-		    }
-		    add->path[namelen] = 0;
-		    rep = "OK added";
-		    goto report;
-		}
-		break;
-#endif /* NOTIFY != NOTIFY_NONE */
-	    case 'B' : case 'b' :
-		if (is_server && strcasecmp(kw, "BWLIMIT") == 0) {
-		    long limit;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    limit = atol(lptr);
-		    if (limit < 0 || limit >= LONG_MAX / 1024L) {
-			rep = "EINVAL bandwidth limit";
-		    } else {
-			bwlimit = limit * 1024L;
-			rep = "OK limit changed";
-		    }
-		    goto report;
-		}
-		break;
-	    case 'C' : case 'c' :
-		if (is_server && csum_n >= 0 && strcasecmp(kw, "CHECKSUM") == 0)
-		{
-		    long long start;
-		    int i, wp, clen = checksum_size(csum_n);
-		    unsigned char hash[clen];
-		    char * block;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (rfd < 0) {
-			rep = "EBADF File not opened";
-			goto report;
-		    }
-		    if (sscanf(lptr, "%lld %lld", &start, &usize) < 2) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    if (start < 0 || usize < 0) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    block = get_block(rfd, start, &usize, ublock,
-				      &block_start, &block_size);
-		    if (! block) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "get_block");
-			goto report;
-		    }
-		    if (! checksum_data(csum_n, block, usize, hash)) {
-			rep = "Error calculating checksum";
-			goto report;
-		    }
-		    wp = sprintf(cblock, "OK %lld ", usize);
-		    for (i = 0; i < clen; i++)
-			wp += sprintf(cblock + wp, "%02X",
-				      (unsigned int)hash[i]);
-		    rep = cblock;
-		    goto report;
-		}
-		if (strcasecmp(kw, "CLOSELOG") == 0) {
-		    if (! (allowed & config_op_closelog)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    error_closelog();
-		    rep = "OK closed";
-		    goto report;
-		}
-		if (is_server && strcasecmp(kw, "COMPRESS") == 0) {
-		    int num;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    kw = lptr;
-		    while (*lptr && ! isspace((int)*lptr)) lptr++;
-		    if (lptr == kw) {
-			rep = "EINVAL Invalid empty compression method";
-			goto report;
-		    }
-		    if (*lptr)
-			*lptr++ = 0;
-		    num = compress_byname(kw);
-		    if (num < 0) {
-			rep = "EINVAL Unknown compression method";
-			goto report;
-		    }
-		    compression = num;
-		    rep = "OK compression selected";
-		    goto report;
-		}
-		if (is_server && strcasecmp(kw, "CLOSEFILE") == 0) {
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (rfd < 0) {
-			rep = "EBADF File not opened";
-			goto report;
-		    }
-		    if (Dname) myfree(Dname);
-		    Dname = NULL;
-		    close(rfd);
-		    rfd = -1;
-		    rep = "OK file closed";
-		    goto report;
-		}
-		if (strcasecmp(kw, "CONFIG") == 0) {
-		    if (! (allowed & config_op_getconf)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (! socket_puts(p, "OK")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    config_print(sendlines, p);
-		    if (! socket_puts(p, "__END__")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    goto noreport;
-		}
-#if NOTIFY != NOTIFY_NONE
-		if (is_server && strcasecmp(kw, "CROSS") == 0) {
-		    if (! (allowed & config_op_add)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    add->crossmount = 1;
-		    rep = finish_add(add, &changes, cblock);
-		    add = NULL;
-		    goto report;
-		}
-#endif /* NOTIFY != NOTIFY_NONE */
-		break;
-	    case 'D' : case 'd' :
-		if (is_server && strcasecmp(kw, "DATA") == 0) {
-		    long long start, csize, dsize;
-		    const char * dptr;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (rfd < 0) {
-			rep = "EBADF File not opened";
-			goto report;
-		    }
-		    if (sscanf(lptr, "%lld %lld", &start, &usize) < 2) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    udata = get_block(rfd, start, &usize, ublock,
-				      &block_start, &block_size);
-		    if (! udata) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "get_block");
-			goto report;
-		    }
-#if THEY_HAVE_LIBRSYNC
-		send_data:
-#endif
-		    if (compression >= 0 && usize > 0)
-			csize = compress_data(compression, udata,
-					      usize, cblock);
-		    else
-			csize = -1;
-		    if (csize <= 0) {
-			char tmpbuff[64];
-			sprintf(tmpbuff, "OK %lld", usize);
-			if (! socket_puts(p, tmpbuff)) {
-			    error_report(error_server, addr,
-					 "run_server", errno);
-			    break;
-			}
-			dptr = udata;
-			dsize = usize;
-		    } else {
-			char tmpbuff[64];
-			sprintf(tmpbuff, "OK %lld %lld", csize, usize);
-			if (! socket_puts(p, tmpbuff)) {
-			    error_report(error_server, addr,
-					 "run_server", errno);
-			    break;
-			}
-			dptr = cblock;
-			dsize = csize;
-		    }
-		    if (bwlimit > 0) {
-			while (dsize > 0) {
-			    long diff = dsize;
-			    if (diff > bwlimit) diff = bwlimit;
-			    if (! socket_put(p, dptr, diff)) {
-				error_report(error_server, addr,
-					     "run_server", errno);
-				break;
-			    }
-			    dptr += diff;
-			    dsize -= diff;
-			    sleep(1);
-			}
-		    } else {
-			if (! socket_put(p, dptr, dsize)) {
-			    error_report(error_server, addr,
-					 "run_server", errno);
-			    break;
-			}
-		    }
-		    goto noreport;
-		}
-#if THEY_HAVE_LIBRSYNC
-		if (is_server && strcasecmp(kw, "DELTA") == 0) {
-		    long long msize;
-		    ssize_t nr;
-		    if (rfd < 0) {
-			rep = "EBADF File not opened";
-			goto report;
-		    }
-		    if (! has_signatures) {
-			rep = "EINVAL Did not see a SIGNATURE command";
-			goto report;
-		    }
-		    if (rdiff_pipe.tochild >= 0) {
-			close(rdiff_pipe.tochild);
-			rdiff_pipe.tochild = -1;
-		    }
-		    if (sscanf(lptr, "%lld", &msize) < 1) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    if (msize > DATA_BLOCKSIZE)
-			msize = DATA_BLOCKSIZE;
-		    // XXX replace following with librsync
-		    block_start = block_size = -1;
-		    nr = read(rdiff_pipe.fromchild, ublock, msize);
-		    if (nr < 0) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "rdiff");
-			goto report;
-		    }
-		    usize = nr;
-		    udata = ublock;
-		    goto send_data;
-		}
-#endif
-		if (strcasecmp(kw, "DEBUG") == 0) {
-		    if (! (allowed & config_op_debug)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    socket_setdebug(p, 1);
-		    rep = "OK";
-		    goto report;
-		}
-		if (! is_server && strcasecmp(kw, "DIRSYNC") == 0) {
-		    char * path;
-		    int ok;
-		    if (! (allowed & config_op_dirsync)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    namelen = atoi(lptr);
-		    if (namelen < 1) {
-			rep = "EINVAL Invalid name";
-			goto report;
-		    }
-		    path = mymalloc(1 + namelen);
-		    if (! path) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			goto skip_report;
-		    }
-		    if (! socket_get(p, path, namelen)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			myfree(path);
-			goto report;
-		    }
-		    path[namelen] = 0;
-		    ok = copy_dirsync("user", path);
-		    myfree(path);
-		    if (ok) {
-			rep = "OK scheduled";
-		    } else {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "schedule_dirsync");
-		    }
-		    goto report;
-		}
-		break;
-	    case 'E' : case 'e' :
-		if (strcasecmp(kw, "EXTENSIONS") == 0) {
-		    if (! socket_puts(p, "OK sending extensions list")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    // XXX ENCRYPT
-		    if (! socket_puts(p, "UPDATE")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    if (is_server) {
-			if (csum_n >= 0 &&
-			    ! socket_puts(p, "CHECKSUM"))
-			{
-			    error_report(error_server, addr,
-					 "run_server", errno);
-			    break;
-			}
-			// XXX IGNORE (is_server)
-#if THEY_HAVE_LIBRSYNC
-			if (! socket_puts(p, "RSYNC")) {
-			    error_report(error_server, addr,
-					 "run_server", errno);
-			    break;
-			}
-#endif
-		    } else {
-			if (! socket_puts(p, "DIRSYNC")) {
-			    error_report(error_server, addr,
-					 "run_server", errno);
-			    break;
-			}
-		    }
-		    if (! socket_puts(p, ".")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    continue;
-		}
-		// XXX ENCRYPT [config_op_read]
-#if NOTIFY != NOTIFY_NONE
-		if (is_server && strcasecmp(kw, "EXCL") == 0) {
-		    if (! (allowed & config_op_add)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    rep = handle_excl_find(p, lptr, 1, add, cblock);
-		    goto report;
-		}
-		if (is_server && strcasecmp(kw, "EVENT") == 0) {
-		    notify_event_t ev;
-		    int timeout, size, avail;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (! get) {
-			rep = "EINVAL no root dir";
-			goto report;
-		    }
-		    if (sscanf(lptr, "%d %d", &timeout, &size) < 2) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    avail = store_get(get, &ev, timeout, size, socket_poll(p),
-				      cblock, DATA_BLOCKSIZE);
-		    if (avail == -2) {
-			rep = cblock;
-			goto report;
-		    }
-		    if (avail < 0) {
-			/* no event available */
-			rep = "OK NO";
-			goto report;
-		    }
-		    if (avail > 0) {
-			/* event too big */
-			sprintf(cblock, "OK BIG %d", avail);
-			if (! socket_puts(p, cblock)) {
-			    error_report(error_server, addr,
-					 "run_server", errno);
-			    break;
-			}
-			goto noreport;
-		    }
-		    /* an event is available */
-		    sprintf(cblock, "OK EV %d %d %d %d %d %d %d %d",
-			    store_get_file(get), store_get_pos(get),
-			    ev.event_type, ev.file_type, ev.stat_valid,
-			    ev.stat_valid || ev.event_type == notify_add_tree,
-			    ev.from_length, ev.to_length);
-		    if (! socket_puts(p, cblock)) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    if (ev.from_length &&
-			! socket_put(p, ev.from_name, ev.from_length))
-		    {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    if (ev.to_length &&
-			! socket_put(p, ev.to_name, ev.to_length))
-		    {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    if (ev.stat_valid) {
-			if (translate_ids) {
-			    char uname[64], gname[64];
-			    if (usermap_fromid(ev.file_user, uname,
-					       sizeof(uname)) <= 0)
-				strcpy(uname, "?");
-			    if (groupmap_fromid(ev.file_group, gname,
-					        sizeof(gname)) <= 0)
-				strcpy(gname, "?");
-			    sprintf(cblock, "NSTAT 0%o %s %d %s %d %lld %d %d",
-				    ev.file_mode, uname, ev.file_user,
-				    gname, ev.file_group, ev.file_size,
-				    major(ev.file_device),
-				    minor(ev.file_device));
-			} else {
-			    sprintf(cblock, "STAT 0%o %d %d %lld %d %d",
-				    ev.file_mode, ev.file_user,
-				    ev.file_group, ev.file_size,
-				    major(ev.file_device),
-				    minor(ev.file_device));
-			}
-			if (! socket_puts(p, cblock)) {
-			    error_report(error_server, addr,
-					 "run_server", errno);
-			    break;
-			}
-		    }
-		    if (ev.stat_valid || ev.event_type == notify_add_tree) {
-			char mtime[64];
-			struct tm tm;
-			gmtime_r(&ev.file_mtime, &tm);
-			strftime(mtime, sizeof(mtime),
-				 "%Y-%m-%d:%H:%M:%S", &tm);
-			sprintf(cblock, "MTIME %s", mtime);
-			if (! socket_puts(p, cblock)) {
-			    error_report(error_server, addr,
-					 "run_server", errno);
-			    break;
-			}
-		    }
-		    goto noreport;
-		}
-#endif /* NOTIFY != NOTIFY_NONE */
-		break;
-#if NOTIFY != NOTIFY_NONE
-	    case 'F' : case 'f' :
-		if (is_server && strcasecmp(kw, "FIND") == 0) {
-		    if (! (allowed & config_op_add)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    rep = handle_excl_find(p, lptr, 0, add, cblock);
-		    goto report;
-		}
-		break;
-#endif /* NOTIFY != NOTIFY_NONE */
-	    case 'G' : case 'g' :
-		if (is_server && strcasecmp(kw, "GETDIR") == 0) {
-		    int len, trans, skip_should;
-		    DIR * dp;
-		    struct dirent * ent;
-		    const config_data_t * cfg;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    cfg = config_get();
-		    skip_should =
-			config_intval(cfg, cfg_flags) & config_flag_skip_should;
-		    config_put(cfg);
-		    if (sscanf(lptr, "%d %d", &len, &trans) < 2) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    if (len >= DATA_BLOCKSIZE - NAME_MAX - 2) {
-			skip_data(p, len);
-			rep = "EINVAL name too long";
-			goto report;
-		    }
-		    if (! socket_get(p, cblock, len)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "socket_get");
-			goto report;
-		    }
-		    cblock[len] = 0;
-		    dp = opendir(cblock);
-		    if (! dp) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "opendir", cblock);
-			goto report;
-		    }
-		    if (! socket_puts(p, "OK")) {
-			error_report(error_server, addr, "run_server", errno);
-			closedir(dp);
-			break;
-		    }
-		    cblock[len++] = '/';
-		    while ((ent = readdir(dp)) != NULL) {
-			int nl = strlen(ent->d_name), el;
-			if (ent->d_name[0] == '.') {
-			    if (ent->d_name[1] == 0) continue;
-			    if (ent->d_name[1] == '.' && ent->d_name[2] == 0)
-				continue;
-			    /* skip should's temporary files, if required */
-			    if (skip_should && nl == 14 &&
-				strncmp(ent->d_name, ".should.", 8) == 0)
-				    continue;
-			}
-			el = len + nl;
-			if (nl >= DATA_BLOCKSIZE)
-			    /* not supposed to happen but you never know */
-			    continue;
-			strcpy(cblock + len, ent->d_name);
-			if (send_stat(p, cblock, trans, "", ent->d_name))
-			    continue;
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    closedir(dp);
-		    if (! socket_puts(p, ".")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    goto noreport;
-		}
-		break;
-	    case 'I' : case 'i' :
-		// XXX IGNORE (is_server) [config_op_ignore]
-		break;
-	    case 'L' : case 'l' :
-		if (is_server && strcasecmp(kw, "LISTCOMPRESS") == 0) {
-		    int n, max = compress_count(), err = 0;
-		    if (! (allowed & (config_op_read | config_op_getconf))) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (! socket_puts(p, "OK")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    for (n = 0; n < max; n++) {
-			const char * c = compress_name(n);
-#if USE_SHOULDBOX
-			if (! c) {
-			    error_report(error_shouldbox_null,
-					 "run_server", "compression");
-			    err = 1;
-			    break;
-			}
-#endif
-			if (! socket_puts(p, c)) {
-			    error_report(error_server, addr,
-					 "run_server", errno);
-			    err = 1;
-			    break;
-			}
-		    }
-		    if (err) break;
-		    if (! socket_puts(p, "__END__")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    goto noreport;
-		}
-		if (is_server && strcasecmp(kw, "LISTCHECKSUM") == 0) {
-		    int n, max = checksum_count(), err = 0;
-		    if (! (allowed & (config_op_read | config_op_getconf))) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (! socket_puts(p, "OK")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    for (n = 0; n < max; n++) {
-			const char * c = checksum_name(n);
-#if USE_SHOULDBOX
-			if (! c) {
-			    error_report(error_shouldbox_null,
-					 "run_server", "compression");
-			    err = 1;
-			    break;
-			}
-#endif
-			if (! socket_puts(p, c)) {
-			    error_report(error_server, addr,
-					 "run_server", errno);
-			    err = 1;
-			    break;
-			}
-		    }
-		    if (err) break;
-		    if (! socket_puts(p, "__END__")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    goto noreport;
-		}
-		break;
-	    case 'N' : case 'n' :
-#if NOTIFY != NOTIFY_NONE
-		if (is_server && strcasecmp(kw, "NOCROSS") == 0) {
-		    if (! (allowed & config_op_add)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    add->crossmount = 0;
-		    rep = finish_add(add, &changes, cblock);
-		    add = NULL;
-		    goto report;
-		}
-#endif /* NOTIFY != NOTIFY_NONE */
-		if (strcasecmp(kw, "NODEBUG") == 0) {
-		    if (! (allowed & config_op_debug)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    socket_setdebug(p, 0);
-		    rep = "OK";
-		    goto report;
-		}
-		break;
-	    case 'O' : case 'o' :
-		if (is_server && strcasecmp(kw, "OPEN") == 0) {
-		    struct stat sbuff;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    namelen = atoi(lptr);
-		    if (namelen < 1) {
-			rep = "EINVAL Invalid name";
-			goto report;
-		    }
-		    if (Dname) myfree(Dname);
-		    if (rfd >= 0) close(rfd);
-		    rfd = -1;
-		    Dname = mymalloc(1 + namelen);
-		    if (! Dname) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			goto skip_report;
-		    }
-		    if (! socket_get(p, Dname, namelen)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "socket_get");
-			goto report;
-		    }
-		    Dname[namelen] = 0;
-		    /* don't wait on a named pipe or similar thing */
-		    if (lstat(Dname, &sbuff) < 0) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", Dname);
-			goto report;
-		    }
-		    if (! S_ISREG(sbuff.st_mode)) {
-			rep = "EBADF not a regular file";
-			goto report;
-		    }
-		    if (sbuff.st_size == 0) {
-			rep = "File has zero size, no need to OPEN it...";
-			goto report;
-		    }
-		    /* there's a chance somebody will rename a pipe into Dname
-		     * just right now. Nothing we can do about it, but we open
-		     * the file in nonblocking mode and then re-check with
-		     * fstat that it's still a regular file */
-		    rfd = open(Dname, O_RDONLY|O_NONBLOCK);
-		    if (rfd < 0) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", Dname);
-			goto report;
-		    }
-		    if (fstat(rfd, &sbuff) < 0) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", Dname);
-			close(rfd);
-			rfd = -1;
-			goto report;
-		    }
-		    if (! S_ISREG(sbuff.st_mode)) {
-			rep = "EBADF not a regular file";
-			close(rfd);
-			rfd = -1;
-			goto report;
-		    }
-		    if (sbuff.st_size == 0) {
-			rep = "File has zero size, no need to OPEN it...";
-			close(rfd);
-			rfd = -1;
-			goto report;
-		    }
-		    /* reset O_NONBLOCK */
-		    fcntl(rfd, F_SETFL, 0L);
-		    rep = "OK file opened";
-		    goto report;
-		}
-		break;
-#if NOTIFY != NOTIFY_NONE
-	    case 'P' : case 'p' :
-		if (is_server && strcasecmp(kw, "PURGE") == 0) {
-		    int days;
-		    if (! (allowed & config_op_purge)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    days = atoi(lptr);
-		    if (days < 2) {
-			rep = "EINVAL number of days";
-		    } else {
-			if (! store_purge(days))
-			    rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					      "run_server", "store_purge");
-			else
-			    rep = "OK purged";
-		    }
-		    goto report;
-		}
-		break;
-#endif /* NOTIFY != NOTIFY_NONE */
-	    case 'Q' : case 'q' :
-		if (strcasecmp(kw, "QUIT") == 0) {
-		    running = 0;
-		    rep = "OK bye then";
-		    goto report;
-		}
-		break;
-	    case 'R' : case 'r' :
-#if THEY_HAVE_LIBRSYNC
-		if (is_server && strcasecmp(kw, "RSYNC") == 0) {
-		    long long start;
-		    const char * command[6];
-		    if (rfd < 0) {
-			rep = "EBADF File not opened";
-			goto report;
-		    }
-		    if (sscanf(lptr, "%lld %lld", &start, &usize) < 2) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    if (start < 0 || usize < 0) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    // XXX replace following with librsync
-		    pipe_close(&rdiff_pipe);
-		    rdiff_start = rdiff_size = -1;
-		    has_signatures = 0;
-		    command[0] = "rdiff";
-		    command[1] = "delta";
-		    command[2] = "-";
-		    command[3] = Dname;
-		    command[4] = "-";
-		    command[5] = NULL;
-		    if (! pipe_openfromto((char * const *)command, &rdiff_pipe))
-		    {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "rdiff");
-			goto report;
-		    }
-		    rdiff_start = start;
-		    rdiff_size = usize;
-		    snprintf(cblock, DATA_BLOCKSIZE, "OK %lld %d",
-			     usize, DATA_BLOCKSIZE);
-		    rep = cblock;
-		    goto report;
-		}
-#endif /* THEY_HAVE_LIBRSYNC */
-#if NOTIFY != NOTIFY_NONE
-		if (is_server && strcasecmp(kw, "REMOVE") == 0) {
-		    char * path;
-		    if (! (allowed & config_op_remove)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    namelen = atoi(lptr);
-		    if (namelen < 1) {
-			rep = "EINVAL Invalid name";
-			goto report;
-		    }
-		    path = mymalloc(1 + namelen);
-		    if (! path) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			goto skip_report;
-		    }
-		    if (! socket_get(p, path, namelen)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			myfree(path);
-			goto report;
-		    }
-		    path[namelen] = 0;
-		    rep = control_remove_tree(path);
-		    myfree(path);
-		    if (! rep) {
-			changes = 1;
-			rep = "OK removed";
-		    }
-		    goto report;
-		}
-#endif /* NOTIFY != NOTIFY_NONE */
-		break;
-	    case 'S' : case 's' :
-#if THEY_HAVE_LIBRSYNC
-		if (is_server && strcasecmp(kw, "SIGNATURE") == 0) {
-		    long long csize;
-		    int dcount;
-		    const char * dptr;
-		    if (rfd < 0) {
-			rep = "EBADF File not opened";
-			goto report;
-		    }
-		    if (rdiff_start < 0) {
-			rep = "EINVAL Did not see an RSYNC command";
-			goto report;
-		    }
-		    dcount = sscanf(lptr, "%lld %lld", &csize, &usize);
-		    if (dcount < 1) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    if (dcount < 2) {
-			usize = csize;
-		    } else if ( compression < 0) {
-			rep = "EINVAL no compression selected";
-			goto report;
-		    }
-		    if (csize < 0 || usize < 0 || usize < csize) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    if (usize > DATA_BLOCKSIZE) {
-			skip_data(p, usize);
-			rep = "EINVAL Buffer overflow";
-			goto report;
-		    }
-		    if (! socket_puts(p, "OK send the data")) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "socket_put");
-			goto report;
-		    }
-		    // XXX replace following with librsync
-		    if (! socket_get(p, cblock, csize)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "socket_get");
-			goto report;
-		    }
-		    dptr = cblock;
-		    if (dcount >= 2) {
-			int bsize = DATA_BLOCKSIZE;
-			block_start = block_size = -1;
-			rep = uncompress_data(compression, cblock, csize,
-					      ublock, &bsize);
-			if (rep) goto report;
-			if (bsize != usize) {
-			    rep = "EBADF Uncompressed data has wrong size";
-			    goto report;
-			}
-			dptr = ublock;
-		    }
-		    while (usize > 0) {
-			ssize_t nw = write(rdiff_pipe.tochild, dptr, usize);
-			if (nw < 0) {
-			    rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					      "run_server", "delta");
-			    goto report;
-			}
-			if (nw == 0) {
-			    rep = "EINVAL short write";
-			    goto report;
-			}
-			usize -= nw;
-			dptr += nw;
-		    }
-		    has_signatures = 1;
-		    rep = "OK";
-		    goto report;
-		}
-#endif
-		if (is_server && strcasecmp(kw, "STAT") == 0) {
-		    int len, trans, s;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (sscanf(lptr, "%d %d", &len, &trans) < 2) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    if (len >= DATA_BLOCKSIZE - NAME_MAX - 2) {
-			skip_data(p, len);
-			rep = "EINVAL name too long";
-			goto report;
-		    }
-		    if (! socket_get(p, cblock, len)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "socket_get");
-			goto report;
-		    }
-		    cblock[len] = 0;
-		    s = send_stat(p, cblock, trans, "OK ", NULL);
-		    if (s > 0)
-			goto noreport;
-		    if (s < 0) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "stat");
-			goto report;
-		    }
-		    error_report(error_server, addr, "run_server", errno);
-		    break;
-		}
-		if (strcasecmp(kw, "STOP") == 0) {
-		    if (! (allowed & config_op_stop)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    main_running = 0;
-		    error_report(info_user_stop);
-		    rep = "OK stopping";
-		    goto report;
-		}
-		if (strcasecmp(kw, "STATUS") == 0) {
-		    if (! (allowed & config_op_status)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (! socket_puts(p, "OK sending status")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    rep = send_status(p);
-		    if (rep) {
-			error_report(error_server_msg, addr, "run_server", rep);
-			break;
-		    }
-		    continue;
-		}
-		if (is_server && strcasecmp(kw, "STATFS") == 0) {
-		    int len;
-		    struct statvfs sbuff;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (sscanf(lptr, "%d", &len) < 1) {
-			rep = "EINVAL Invalid request";
-			goto report;
-		    }
-		    if (len >= DATA_BLOCKSIZE - 2) {
-			skip_data(p, len);
-			rep = "EINVAL name too long";
-			goto report;
-		    }
-		    if (! socket_get(p, cblock, len)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "socket_get");
-			goto report;
-		    }
-		    cblock[len] = 0;
-		    if (statvfs(cblock, &sbuff) < 0) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "statfs");
-			goto report;
-		    }
-		    sprintf(cblock, "OK %llu %llu %llu %llu %llu %llu %llu %d",
-			    (unsigned long long)sbuff.f_bsize,
-			    (unsigned long long)sbuff.f_blocks,
-			    (unsigned long long)sbuff.f_bfree,
-			    (unsigned long long)sbuff.f_bavail,
-			    (unsigned long long)sbuff.f_files,
-			    (unsigned long long)sbuff.f_ffree,
-			    (unsigned long long)sbuff.f_favail,
-			    ! (sbuff.f_flag & ST_RDONLY));
-		    if (! socket_puts(p, cblock)) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    goto noreport;
-		}
-#if NOTIFY != NOTIFY_NONE
-		if (is_server && strcasecmp(kw, "SETROOT") == 0) {
-		    int pos, file;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (sscanf(lptr, "%d %d %d %d",
-			       &file, &pos, &namelen, &translate_ids) < 4)
-		    {
-			rep = "EINVAL Invalid data";
-			goto report;
-		    }
-		    if (namelen < 1) {
-			rep = "EINVAL invalid name";
-			goto report;
-		    }
-		    if (rootdir) myfree(rootdir);
-		    if (get) store_finish(get);
-		    get = NULL;
-		    rootdir = mymalloc(1 + namelen);
-		    if (! rootdir) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			goto skip_report;
-		    }
-		    if (! socket_get(p, rootdir, namelen)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "malloc");
-			goto report;
-		    }
-		    rootdir[namelen] = 0;
-		    get = store_prepare(file, pos, rootdir);
-		    if (! get) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "store_prepare");
-			goto report;
-		    }
-		    rep = "OK root changed";
-		    goto report;
-		}
-#endif /* NOTIFY != NOTIFY_NONE */
-		if (is_server && strcasecmp(kw, "SETCHECKSUM") == 0) {
-		    int num;
-		    if (! (allowed & config_op_read)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    kw = lptr;
-		    while (*lptr && ! isspace((int)*lptr)) lptr++;
-		    if (lptr == kw) {
-			rep = "EINVAL Invalid empty checksum method";
-			goto report;
-		    }
-		    if (*lptr)
-			*lptr++ = 0;
-		    num = checksum_byname(kw);
-		    if (num < 0) {
-			rep = "EINVAL Unknown checksum method";
-			goto report;
-		    }
-		    csum_n = num;
-		    rep = "OK checksum method selected";
-		    goto report;
-		}
-		break;
-	    case 'U' : case 'u' :
-		if (strcasecmp(kw, "UPDATE") == 0) {
-		    int len;
-		    if (! (allowed & config_op_setconf)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    len = atoi(lptr);
-		    if (len < 1) {
-			rep = "EINVAL Invalid update";
-			goto report;
-		    }
-		    if (len >= DATA_BLOCKSIZE - 2) {
-			skip_data(p, len);
-			rep = "EINVAL update too long";
-			goto report;
-		    }
-		    if (! socket_get(p, cblock, len)) {
-			rep = error_sys_r(cblock, DATA_BLOCKSIZE,
-					  "run_server", "socket_get");
-			goto report;
-		    }
-		    cblock[len] = 0;
-		    if (! updating) {
-			rep = config_start_update();
-			if (rep) goto report;
-			updating = 1;
-		    }
-		    if (strcasecmp(cblock, "commit") == 0) {
-			if (updating != 1) {
-			    rep = "Previous update failed, cannot commit";
-			    goto report;
-			}
-			rep = config_commit_update();
-			updating = 0;
-			if (! rep) rep = "OK committed";
-			goto report;
-		    }
-		    if (strcasecmp(cblock, "rollback") == 0) {
-			config_cancel_update();
-			rep = "OK rolled back";
-			updating = 0;
-			goto report;
-		    }
-		    rep = config_do_update(cblock);
-		    if (rep)
-			updating = 2;
-		    else
-			rep = "OK updated";
-		    goto report;
-		}
-#if NOTIFY != NOTIFY_NONE
-	    case 'W' : case 'w' :
-		if (is_server && strcasecmp(kw, "WATCHES") == 0) {
-		    if (! (allowed & config_op_watches)) {
-			rep = "EPERM Operation not permitted";
-			goto report;
-		    }
-		    if (! socket_puts(p, "OK")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    if (! notify_forall_watches(send_watch, p))
-			break;
-		    if (! socket_puts(p, "0")) {
-			error_report(error_server, addr, "run_server", errno);
-			break;
-		    }
-		    goto noreport;
-		}
-		break;
-#endif /* NOTIFY != NOTIFY_NONE */
+	if (isupper((int)kw[0])) {
+	    cmdi = kw[0] - 'A';
+	} else if (islower((int)kw[0])) {
+	    cmdi = kw[0] - 'a';
+	} else {
+	    goto not_found;
 	}
-	goto not_found;
-    skip_report:
-	while (namelen > 0) {
-	    int sz = namelen > LINESIZE ? LINESIZE : namelen;
-	    socket_get(p, line, LINESIZE);
-	    namelen -= sz;
+	cmde = cmdindex[cmdi + 1];
+	cmdi = cmdindex[cmdi];
+	while (cmdi < cmde) {
+	    if (strcasecmp(kw, commands[cmdi].keyword) == 0) {
+		if (! (mode & commands[cmdi].mode)) {
+		    rep = client_mode
+			? "ENOSYS Operation not supported in copy mode"
+			: "ENOSYS Operation not supported in server mode";
+		    goto report;
+		}
+		if (! (allowed & commands[cmdi].opclass)) {
+		    rep = "EPERM Operation not permitted";
+		    goto report;
+		}
+		rep = commands[cmdi].op(lptr, &state);
+		if (! rep) goto noreport;
+		goto report;
+	    }
+	    cmdi++;
 	}
-	goto report;
     not_found:
 	rep = "Invalid request";
     report:
-	if (! socket_puts(p, rep)) {
-	    error_report(error_server, addr, "run_server", errno);
+	if (! socket_puts(state.p, rep)) {
+	    error_report(error_server, state.peer, "run_server", errno);
+	    state.running = 0;
 	    break;
 	}
     noreport:
-	if (! socket_flush(p)) {
-	    error_report(error_server, addr, "run_server", errno);
-	    break;
+	if (! socket_flush(state.p)) {
+	    error_report(error_server, state.peer, "run_server", errno);
+	    state.running = 0;
 	}
-	continue;
     }
-    if (updating) config_cancel_update();
-    if (rfd >= 0) close(rfd);
-    if (Dname) myfree(Dname);
+    if (state.updating) config_cancel_update();
+    if (state.rfd >= 0) close(state.rfd);
+    if (state.Dname) myfree(state.Dname);
 #if NOTIFY != NOTIFY_NONE
-    if (get) store_finish(get);
-    if (rootdir) myfree(rootdir);
-    if (add) config_dir_free(add);
-    if (changes) {
+    if (state.get) store_finish(state.get);
+    if (state.rootdir) myfree(state.rootdir);
+    if (state.add) {
+	config_free_add(state.add->privdata);
+	myfree(state.add);
+    }
+    if (state.changes) {
 	notify_status_t info;
 	notify_status(&info);
 	error_report(info_count_watches, info.watches);
     }
 #endif /* NOTIFY != NOTIFY_NONE */
 #if THEY_HAVE_LIBRSYNC
-    pipe_close(&rdiff_pipe);
+    if (state.rs_signature) rs_free_sumset(state.rs_signature);
+    if (state.rs_job) rs_job_free(state.rs_job);
 #endif
-    error_report(info_connection_close, user, addr);
-    socket_disconnect(p);
+    error_report(info_connection_close, user, state.peer);
+    socket_disconnect(state.p);
     tp->completed = 1;
     return NULL;
 }
@@ -1611,7 +1538,14 @@ void * run_server(void * _tp) {
  * or an error message */
 
 const char * control_thread(void) {
-    int ov;
+    int ov, inum, pos;
+    for (pos = inum = 0; pos < 27; pos++) {
+	char letter = pos + 'A';
+	cmdindex[pos] = inum;
+	while (inum < NR_COMMANDS && commands[inum].keyword[0] == letter)
+	    inum++;
+    }
+    cmdindex[26] = NR_COMMANDS;
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &ov);
     while (main_running) {
 	int errcode;
@@ -1747,7 +1681,7 @@ void control_initial_thread(void) {
     if (! client_mode) {
 	notify_status_t info;
 	const config_data_t * cfg = config_get();
-	const config_dir_t * d = config_treeval(cfg, cfg_tree_add);
+	const config_strlist_t * d = config_strlist(cfg, cfg_add_path);
 	if (! d) {
 	    config_put(cfg);
 	    return;
@@ -1756,7 +1690,7 @@ void control_initial_thread(void) {
 	    int count;
 	    const char * err = control_add_tree(d, &count);
 	    if (err)
-		error_report(error_control, d->path, err);
+		error_report(error_control, d->data, err);
 	    d = d->next;
 	}
 	notify_status(&info);
@@ -1772,7 +1706,7 @@ void control_initial_thread(void) {
 
 static void scan_dir(notify_watch_t * parent,
 		     const char * path, int pathlen,
-		     const config_dir_t * how,
+		     const config_add_t * how,
 		     const dev_t * dev,
 		     const dev_t * ev, ino_t evino,
 		     int * count)
@@ -1787,8 +1721,6 @@ static void scan_dir(notify_watch_t * parent,
 	error_report(error_scan_dir, buffer, errno);
 	return;
     }
-    if (ev && sbuff.st_dev == *ev && sbuff.st_ino == evino)
-	return;
     dp = opendir(buffer);
     if (! dp) {
 	error_report(error_scan_dir, buffer, errno);
@@ -1825,6 +1757,8 @@ static void scan_dir(notify_watch_t * parent,
 	    notify_watch_t * watch;
 	    if (dev && sbuff.st_dev != *dev)
 		continue;
+	    if (ev && sbuff.st_dev == *ev && sbuff.st_ino == evino)
+		continue;
 	    watch = notify_add(parent, ent->d_name, how);
 	    if (! watch) {
 		error_report(error_scan_dir, buffer, errno);
@@ -1839,7 +1773,7 @@ static void scan_dir(notify_watch_t * parent,
 
 /* scan a single root tree */
 
-static const char * scan_root(const config_dir_t * d,
+static const char * scan_root(const config_add_t * d,
 			      const char * rootpath,
 			      const dev_t * dev,
 			      const dev_t * ev, ino_t evino,
@@ -1857,12 +1791,13 @@ static const char * scan_root(const config_dir_t * d,
 	return error_sys("scan_root", "notify_find_bypath");
     (*count)++;
     scan_dir(root, rootpath, strlen(rootpath), d, dev, ev, evino, count);
+    notify_unlock_watch(root);
     return NULL;
 }
 
 /* find all matching directories, and scan them as separate roots */
 
-static const char * scan_find(const config_dir_t * d, const char * path,
+static const char * scan_find(const config_add_t * d, const char * path,
 			      int pathlen, const dev_t * dev,
 			      const dev_t * ev, ino_t evino, int * count)
 {
@@ -1916,8 +1851,7 @@ static const char * scan_find(const config_dir_t * d, const char * path,
 	    if (config_check_acl_cond(d->find, 0, data, cfg_dacl_COUNT))
 		err = scan_root(d, buffer, dev, ev, evino, count);
 	    else
-		err = scan_find(d, buffer, entlen,
-				dev, ev, evino, count);
+		err = scan_find(d, buffer, entlen, dev, ev, evino, count);
 	    if (err) {
 		closedir(dp);
 		return err;
@@ -1931,18 +1865,22 @@ static const char * scan_find(const config_dir_t * d, const char * path,
 /* ask the control thread to add a directory tree; returns NULL if OK or
  * an error message */
 
-const char * control_add_tree(const config_dir_t * d, int * count) {
+const char * control_add_tree(const config_strlist_t * d, int * count) {
     struct stat sbuff;
     dev_t devbuff, * dev = NULL, evbuff, * ev = NULL;
     ino_t evino = (ino_t)0;
     const config_data_t * cfg;
-    if (d->path[0] != '/')
+    const config_add_t * av;
+    if (d->data[0] != '/')
 	return "Tree is not an absolute path";
-    if (stat(d->path, &sbuff) < 0)
+    if (stat(d->data, &sbuff) < 0)
 	return error_sys("control_add_tree", "stat");
     if (! S_ISDIR(sbuff.st_mode))
 	return "Path is not a directory";
-    if (! d->crossmount) {
+    av = d->privdata;
+    if (! av)
+	return "Invalid data";
+    if (! av->crossmount) {
 	devbuff = sbuff.st_dev;
 	dev = &devbuff;
     }
@@ -1955,25 +1893,22 @@ const char * control_add_tree(const config_dir_t * d, int * count) {
     config_put(cfg);
     *count = 0;
     /* make sure we identify this as a rootpoint */
-    if (d->find)
-	return scan_find(d, d->path, strlen(d->path),
-			 dev, ev, evino, count);
+    if (av->find)
+	return scan_find(av, d->data, d->datalen, dev, ev, evino, count);
     else
-	return scan_root(d, d->path, dev, ev, evino, count);
+	return scan_root(av, d->data, dev, ev, evino, count);
 }
 
 /* ask the control thread to remove a directory tree; returns NULL if OK or
  * an error message */
 
 const char * control_remove_tree(const char * path) {
-    notify_watch_t * root;
+    const char * res;
     if (path[0] != '/')
 	return "Tree is not an absolute path";
-    root = notify_find_bypath(path, 0);
-    if (! root)
-	return "No such tree";
+    res = notify_remove_under(path);
+    if (res) return res;
     error_report(info_removing_watch, path);
-    notify_remove_under(root);
     return NULL;
 }
 #endif /* NOTIFY != NOTIFY_NONE */

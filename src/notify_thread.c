@@ -88,66 +88,57 @@ typedef struct watch_block_s watch_block_t;
 /* used to store one watch */
 
 struct notify_watch_s {
-    notify_watch_t * next_name, * prev_name;
+    notify_watch_t * sibling;
     notify_watch_t * parent;
     notify_watch_t * subdir[NAME_HASH];
-    const config_dir_t * how;
+    notify_watch_t * next_by_id;
+    notify_watch_t * next_by_inode;
+    const config_add_t * how;
     watch_block_t * block_ptr;
-    int valid;
-    int name_hash;
-    int watch_id;
-    dev_t device;
     ino_t inode;
+    dev_t device;
+    int forward;
+    int watch_id;
+    int locked;
     int name_length;
-    union {
-	char name_short[NAME_LIMIT];
-	char * name_long;
-    };
+    int name_hash;
+    char name[0];
 };
 
 /* used to store a block of watches */
 
 struct watch_block_s {
     watch_block_t * next, * prev;
-    unsigned int block_num;
+    int used;
+    int unused;
     notify_watch_t w[0];
 };
 
-/* used to find watches by ID */
+/* used to find watches by device and inode */
 
-typedef struct watch_by_id_s watch_by_id_t;
-struct watch_by_id_s {
-    watch_by_id_t * next, * prev;
-    unsigned int block_num;
-    notify_watch_t * w[0];
+typedef struct watch_by_device_s watch_by_device_t;
+struct watch_by_device_s {
+    watch_by_device_t * next;
+    dev_t device;
+    notify_watch_t * w[WATCH_HASH];
 };
 
-/* used to store watch names */
+/* used to cache a copy of the "how" (crossmount, exclude) information-
+ * so we do not need to keep a pointer to configuration data which then
+ * cannot be freed */
 
-typedef union {
-    struct {
-	short int length;
-	short int next_free;
-    };
-    char name[0];
-} free_name_t;
-
-typedef struct name_block_s name_block_t;
-struct name_block_s {
-    name_block_t * next_name;
-    int free;
-    union {
-	free_name_t f_names[0];
-	char c_names[0];
-    };
+typedef struct how_cache_s how_cache_t;
+struct how_cache_s {
+    how_cache_t * next;
+    config_add_t how;
 };
 
 static queue_block_t * first_block, * write_block, * read_block;
 static int notify_queue_block, overflow, too_big;
 static int event_count, watch_count, max_events, max_bytes;
 static int queue_events, queue_bytes, queue_blocks;
-static int notify_initial, watch_memory, watch_active, name_block;
-static config_dir_t * how_cache = NULL;
+static int notify_initial, watch_memory, watch_active;
+static how_cache_t * how_cache = NULL;
 
 #if NOTIFY == NOTIFY_INOTIFY
 static int inotify_fd = -1;
@@ -156,19 +147,18 @@ static int i_mask = IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE |
 		    IN_UNMOUNT | IN_Q_OVERFLOW | IN_IGNORED;
 #endif
 
-static watch_block_t * watches_by_inode;
-static watch_by_id_t * watches_by_id;
+static watch_block_t * all_watches;
+static notify_watch_t * id_to_watch[WATCH_HASH];
+static watch_by_device_t * dev_to_watch = NULL;
 static unsigned int notify_watch_block;
 
 static pthread_mutex_t queue_lock, how_lock;
 static pthread_cond_t queue_read_cond, queue_write_cond;
 
-static notify_watch_t ** watch_by_id, * root_watch;
+static notify_watch_t * root_watch;
 
 static char * event_buffer;
 static int buffer_size, buffer_extra;
-
-static name_block_t * first_name;
 
 /* used to store events in the queue */
 
@@ -178,161 +168,6 @@ typedef struct {
     int to_length;
     int is_dir;
 } queue_event_t;
-
-/* watch name */
-
-static inline const char * watch_dir_name(notify_watch_t * nw) {
-    return nw->name_length < NAME_LIMIT
-	? nw->name_short
-	: nw->name_long;
-}
-
-/* allocates space for watch name and returns it */
-
-static char * allocate_watch_name(notify_watch_t * nw, int len) {
-    int lblocks;
-    name_block_t * b;
-    if (len < NAME_LIMIT)
-	return nw->name_short;
-    /* do we have a block with space? */
-    lblocks = (len + sizeof(free_name_t) - 1) / sizeof(free_name_t);
-    if (lblocks > name_block) {
-	errno = ENAMETOOLONG;
-	return NULL;
-    }
-    b = first_name;
-    while (b) {
-	int f = b->free, pf = -1;
-	while (f >= 0) {
-	    if (b->f_names[f].length == lblocks) {
-		/* use this block */
-		if (pf >= 0)
-		    b->f_names[pf].next_free = b->f_names[f].next_free;
-		else
-		    b->free = b->f_names[f].next_free;
-		nw->name_long = b->f_names[f].name;
-		return b->f_names[f].name;
-	    }
-	    if (b->f_names[f].length > lblocks) {
-		/* use the end of this block */
-		b->f_names[f].length -= lblocks;
-		f += b->f_names[f].length;
-		nw->name_long = b->f_names[f].name;
-		return b->f_names[f].name;
-	    }
-	    pf = f;
-	    f = b->f_names[f].next_free;
-	}
-	b = b->next_name;
-    }
-    /* no block found, allocate a new one */
-    b = mymalloc(sizeof(name_block_t) + name_block * sizeof(free_name_t));
-    if (! b) return NULL;
-    b->next_name = first_name;
-    first_name = b;
-    watch_memory += sizeof(name_block_t) + name_block * sizeof(free_name_t);
-    if (lblocks == name_block) {
-	b->free = -1;
-    } else {
-	b->free = lblocks;
-	b->f_names[lblocks].length = name_block - lblocks;
-	b->f_names[lblocks].next_free = -1;
-    }
-    nw->name_long = b->c_names;
-    return b->c_names;
-}
-
-/* free space for watch name */
-
-static inline void free_watch_name(notify_watch_t * nw) {
-    int lblocks;
-    name_block_t * b, * c = NULL;
-    if (nw->name_length < NAME_LIMIT)
-	return;
-    lblocks = (nw->name_length + sizeof(free_name_t) - 1) / sizeof(free_name_t);
-#if USE_SHOULDBOX
-    if (lblocks > name_block) {
-	/* log this in the shouldbox */
-	error_report(error_shouldbox_more, "free_watch_name",
-		     "lblocks", lblocks, name_block);
-	main_shouldbox++;
-	return;
-    }
-#endif
-    b = first_name;
-    while (b) {
-	if (nw->name_long >= b->c_names) {
-	    int f = nw->name_long - b->c_names;
-	    if (f < name_block * sizeof(free_name_t)) {
-#if USE_SHOULDBOX
-		if (f % sizeof(free_name_t)) {
-		    /* log this in the shouldbox */
-		    error_report(error_shouldbox_mod, "free_watch_name",
-				 "f", f, (int)sizeof(free_name_t),
-				 (int)(f % sizeof(free_name_t)));
-		    main_shouldbox++;
-		    return;
-		}
-#endif
-		f /= sizeof(free_name_t);
-		/* add this to b's free list */
-		if (f > 0) {
-		    /* see if we can extend a previous block */
-		    int p = b->free;
-		    while (p >= 0) {
-			if (p + b->f_names[p].length == f) {
-			    b->f_names[p].length += lblocks;
-			    f = p;
-			    lblocks = b->f_names[0].length;
-			    break;
-			}
-			p = b->f_names[p].next_free;
-		    }
-		} else {
-		    b->f_names[f].length = lblocks;
-		    b->f_names[f].next_free = b->free;
-		    b->free = f;
-		}
-		if (f + lblocks < name_block) {
-		    /* see if we can join with next block */
-		    int q = b->free, r = -1, e = f + lblocks;
-		    while (q >= 0) {
-			if (e == q) {
-			    b->f_names[f].length += b->f_names[q].length;
-			    if (r >= 0)
-				b->f_names[r].next_free = b->f_names[q].next_free;
-			    else
-				b->free = b->f_names[q].next_free;
-			    break;
-			}
-			r = q;
-			q = b->f_names[q].next_free;
-		    }
-		}
-		if (f == 0 && lblocks == name_block) {
-		    /* this whole block can be freed */
-		    if (c)
-			c->next_name = b->next_name;
-		    else
-			first_name = b->next_name;
-		    myfree(b);
-		    watch_memory -=
-			sizeof(name_block_t) + name_block * sizeof(free_name_t);
-		}
-		return;
-	    }
-	}
-	c = b;
-	b = b->next_name;
-    }
-#if USE_SHOULDBOX
-    /* not found? log it in the shouldbox! */
-    error_report(error_shouldbox_notfound, "free_watch_name", "nw");
-    main_shouldbox++;
-#endif
-    return;
-}
-
 
 /* determines how much space needs to be allocated to an event */
 
@@ -380,11 +215,6 @@ static void deallocate_queue(void) {
 	first_block = first_block->next;
 	myfree(this);
     }
-    while (first_name) {
-	name_block_t * this = first_name;
-	first_name = first_name->next_name;
-	myfree(this);
-    }
     pthread_cond_destroy(&queue_write_cond);
     pthread_cond_destroy(&queue_read_cond);
     pthread_mutex_destroy(&queue_lock);
@@ -395,8 +225,6 @@ static void deallocate_queue(void) {
 
 static const char * initialise_queue(const config_data_t * cfg) {
     int code;
-    name_block = 1 + config_intval(cfg, cfg_notify_name_block) /
-		     sizeof(free_name_t);
     notify_queue_block = config_intval(cfg, cfg_notify_queue_block);
     notify_initial = config_intval(cfg, cfg_notify_initial);
     code = pthread_mutex_init(&queue_lock, NULL);
@@ -434,43 +262,46 @@ static const char * initialise_queue(const config_data_t * cfg) {
     read_block = write_block = first_block;
     event_count = watch_count = watch_active = queue_bytes = queue_events =
 	max_events = max_bytes = overflow = too_big = watch_memory = 0;
-    first_name = NULL;
     return NULL;
 }
 
 /* allocates space for one watch block */
 
-static watch_block_t * allocate_watch_block(int block) {
-    int i;
+static watch_block_t * allocate_watch_block(int leave) {
     watch_block_t * b = mymalloc(sizeof(watch_block_t) +
 				 notify_watch_block * sizeof(notify_watch_t));
     if (! b)
 	return NULL;
-    for (i = 0; i < notify_watch_block; i++) {
-	b->w[i].valid = 0;
-	b->w[i].block_ptr = b;
+    if (leave < notify_watch_block) {
+	b->unused = leave;
+	b->w[leave].forward = -1;
+	b->w[leave].name_length = notify_watch_block - leave;
+    } else {
+	b->unused = -1;
     }
-    b->block_num = block;
-    b->next = watches_by_inode;
+    b->used = -1;
+    b->next = all_watches;
     b->prev = NULL;
-    if (watches_by_inode) watches_by_inode->prev = b;
-    watches_by_inode = b;
+    if (all_watches) all_watches->prev = b;
+    all_watches = b;
     watch_memory += notify_watch_block * sizeof(notify_watch_t);
     return b;
 }
 
 /* simple hash function on names; it's not meant to be exciting */
 
-static int name_hash(const char * name) {
-    int num = 0, len = 0;
-    while (name[len] && len < sizeof(int)) len++;
-    memcpy(&num, name, len);
+static int name_hash(const char * name, int len) {
+    int num = len, i;
+    for (i = 0; i < len; i++) num += (unsigned char)name[i];
     return num % NAME_HASH;
 }
 
-static const config_dir_t * copy_how(const config_dir_t * how) {
+/* make a copy of the how (exclude, crossmount) data so we don't need to
+ * keep a reference to iive configuration */
+
+static const config_add_t * copy_how(const config_add_t * how) {
     /* see if we already have one of them */
-    config_dir_t * c;
+    how_cache_t * c;
     int code = pthread_mutex_lock(&how_lock);
     if (code) {
 	errno = code;
@@ -478,8 +309,8 @@ static const config_dir_t * copy_how(const config_dir_t * how) {
     }
     c = how_cache;
     while (c) {
-	if (c->crossmount == how->crossmount) {
-	    const config_acl_cond_t * cm = c->exclude, * hm = how->exclude;
+	if (c->how.crossmount == how->crossmount) {
+	    const config_acl_cond_t * cm = c->how.exclude, * hm = how->exclude;
 	    while (cm && hm) {
 		if (cm->data_index != hm->data_index) break;
 		if (cm->how != hm->how) break;
@@ -489,23 +320,23 @@ static const config_dir_t * copy_how(const config_dir_t * how) {
 	    }
 	    if (! cm && ! hm) {
 		pthread_mutex_unlock(&how_lock);
-		return c;
+		return &c->how;
 	    }
 	}
 	c = c->next;
     }
     /* need to allocate a new one */
-    c = mymalloc(sizeof(config_dir_t));
+    c = mymalloc(sizeof(how_cache_t));
     if (! c) {
 	int e = errno;
 	pthread_mutex_unlock(&how_lock);
 	errno = e;
 	return NULL;
     }
-    c->exclude = NULL;
+    c->how.exclude = c->how.find = NULL;
     if (how->exclude) {
-	c->exclude = config_copy_acl_cond(how->exclude);
-	if (! c->exclude) {
+	c->how.exclude = config_copy_acl_cond(how->exclude);
+	if (! c->how.exclude) {
 	    int e = errno;
 	    myfree(c);
 	    pthread_mutex_unlock(&how_lock);
@@ -513,32 +344,35 @@ static const config_dir_t * copy_how(const config_dir_t * how) {
 	    return NULL;
 	}
     }
+    c->how.crossmount = how->crossmount;
     c->next = how_cache;
     how_cache = c;
     pthread_mutex_unlock(&how_lock);
-    return c;
+    return &c->how;
 }
 
 /* store watch in a block */
 
-static inline notify_watch_t * store_watch(dev_t device,
-					   ino_t inode,
-					   const char * name,
+static inline notify_watch_t * store_watch(dev_t device, ino_t inode,
+					   const char * name, int len,
 					   notify_watch_t * parent,
 					   watch_block_t * wb,
 					   int offset,
-					   const config_dir_t * how)
+					   const config_add_t * how,
+					   watch_by_device_t * wdev)
 {
-    int hash = name_hash(name), len = strlen(name), j;
-    char * wname = allocate_watch_name(&wb->w[offset], len);
-    if (! wname) return NULL;
+    int hash = name_hash(name, len), j;
     watch_count++;
-    wb->w[offset].valid = 1;
     wb->w[offset].name_hash = hash;
     wb->w[offset].name_length = len;
     wb->w[offset].watch_id = -1;
     wb->w[offset].device = device;
     wb->w[offset].inode = inode;
+    wb->w[offset].block_ptr = wb;
+    wb->w[offset].next_by_id = NULL;
+    wb->w[offset].forward = wb->used;
+    wb->w[offset].locked = 0;
+    wb->used = offset;
     if (how) {
 	wb->w[offset].how = copy_how(how);
 	if (! wb->w[offset].how)
@@ -547,127 +381,145 @@ static inline notify_watch_t * store_watch(dev_t device,
 	wb->w[offset].how = NULL;
     }
     if (parent) {
-	wb->w[offset].next_name = parent->subdir[hash];
-	if (parent->subdir[hash])
-	    parent->subdir[hash]->prev_name = &wb->w[offset];
+	wb->w[offset].sibling = parent->subdir[hash];
 	parent->subdir[hash] = &wb->w[offset];
 	wb->w[offset].parent = parent;
     } else {
-	wb->w[offset].next_name = NULL;
+	wb->w[offset].sibling = NULL;
 	wb->w[offset].parent = NULL;
     }
-    wb->w[offset].prev_name = NULL;
     for (j = 0; j < NAME_HASH; j++)
 	wb->w[offset].subdir[j] = NULL;
-    strncpy(wname, name, len);
+    strncpy(wb->w[offset].name, name, len);
+    hash = inode % WATCH_HASH;
+    wb->w[offset].next_by_inode = wdev->w[hash];
+    wdev->w[hash] = &wb->w[offset];
     return &wb->w[offset];
+}
+
+/* number of blocks we need to allocate to a watch, based on the name length */
+
+static int watch_size(int len) {
+    return 1 + ((len + sizeof(notify_watch_t) - 1) / sizeof(notify_watch_t));
 }
 
 /* find watch given its dev/inode, optionally allocates space for it */
 
-static notify_watch_t * find_watch_by_inode(dev_t device,
-					    ino_t inode,
+static notify_watch_t * find_watch_by_inode(dev_t device, ino_t inode,
 					    const char * name,
 					    notify_watch_t * parent,
-					    const config_dir_t * how)
+					    const config_add_t * how)
 {
-    unsigned int id = (unsigned int)device + (unsigned int)inode;
-    unsigned int block = id / notify_watch_block;
-    unsigned int offset = id % notify_watch_block;
+    watch_by_device_t * wbdev = dev_to_watch;
+    notify_watch_t * nw;
     watch_block_t * wb;
-    wb = watches_by_inode;
+    int hash = inode % WATCH_HASH, len, blocks, j;
+    while (wbdev && wbdev->device != device) wbdev = wbdev->next;
+    if (! wbdev) {
+	/* device not found, add it? */
+	if (! name) return NULL;
+	wbdev = mymalloc(sizeof(watch_by_device_t));
+	if (! wbdev) return NULL;
+	wbdev->device = device;
+	wbdev->next = dev_to_watch;
+	for (j = 0; j < WATCH_HASH; j++)
+	    wbdev->w[j] = NULL;
+	dev_to_watch = wbdev;
+    }
+    nw = wbdev->w[hash];
+    while (nw) {
+	if (nw->inode == inode)
+	    return nw;
+	nw = nw->next_by_inode;
+    }
+    /* inode not found */
+    if (! name) return NULL;
+    /* first look for something with the exact space */
+    len = strlen(name);
+    blocks = watch_size(len);
+    if (blocks > notify_watch_block) {
+	errno = ENAMETOOLONG;
+	return NULL;
+    }
+    wb = all_watches;
     while (wb) {
-	if (wb->block_num == block) {
-	    if (wb->w[offset].valid) {
-		if (wb->w[offset].device == device &&
-		    wb->w[offset].inode == inode)
-			return &wb->w[offset];
-	    } else if (name) {
-		/* we can allocate it here */
-		return store_watch(device, inode, name, parent,
-				   wb, offset, how);
+	int u = wb->unused, p = -1;
+	while (u >= 0) {
+	    int nl = wb->w[u].name_length;
+	    if (nl == blocks) {
+		/* use this */
+		if (p < 0)
+		    wb->unused = wb->w[u].forward;
+		else
+		    wb->w[p].forward = wb->w[u].forward;
+		return store_watch(device, inode, name, len,
+				   parent, wb, u, how, wbdev);
 	    }
+	    p = u;
+	    u = wb->w[u].forward;
 	}
 	wb = wb->next;
     }
-    /* not found */
-    if (! name) return NULL;
-    wb = allocate_watch_block(block);
+    /* look for an unused area at least 2 blocks longer than we need, resize
+     * it and use part of it (a * gap of a single block cannot be used, so
+     * we need to leave at least 2 blocks after resizing) */
+    wb = all_watches;
+    while (wb) {
+	int u = wb->unused;
+	while (u >= 0) {
+	    int nl = wb->w[u].name_length;
+	    if (nl > blocks + 1) {
+		/* resize this and use the end */
+		wb->w[u].name_length -= blocks;
+		u += wb->w[u].name_length;
+		return store_watch(device, inode, name, len,
+				   parent, wb, u, how, wbdev);
+	    }
+	    u = wb->w[u].forward;
+	}
+	wb = wb->next;
+    }
+    /* need to allocate a new block */
+    wb = allocate_watch_block(blocks);
     if (! wb) return NULL;
-    return store_watch(device, inode, name, parent, wb, offset, how);
+    return store_watch(device, inode, name, len, parent, wb, 0, how, wbdev);
 }
 
 /* find watch given its kernel ID */
 
 static notify_watch_t * find_watch_by_id(int watch_id) {
-    unsigned int block = (unsigned int)watch_id / notify_watch_block;
-    unsigned int offset = (unsigned int)watch_id % notify_watch_block;
-    watch_by_id_t * wi;
-    wi = watches_by_id;
-    while (wi) {
-	if (wi->block_num == block) {
-	    if (wi->w[offset])
-		return wi->w[offset];
-	    return NULL;
-	}
-	wi = wi->next;
+    int hash = watch_id % WATCH_HASH;
+    notify_watch_t * nw = id_to_watch[hash];
+    while (nw) {
+	if (nw->watch_id == watch_id)
+	    return nw;
+	nw = nw->next_by_id;
     }
     /* not found */
     return NULL;
 }
 
-/* allocates space for one watch-by-id block */
-
-static watch_by_id_t * allocate_watch_by_id(int block) {
-    int i;
-    watch_by_id_t * b =
-	mymalloc(sizeof(watch_by_id_t) +
-		 notify_watch_block * sizeof(notify_watch_t *));
-    if (! b)
-	return NULL;
-    b->block_num = block;
-    for (i = 0; i < notify_watch_block; i++)
-	b->w[i] = NULL;
-    b->next = watches_by_id;
-    b->prev = NULL;
-    if (watches_by_id) watches_by_id->prev = b;
-    watches_by_id = b;
-    return b;
-}
-
 /* set watch ID on an existing watch: this is used when the watch becomes
  * active; note that we expect not to find it already stored */
 
-static int set_watch_id(notify_watch_t * wp, int watch_id) {
-    unsigned int block = (unsigned int)watch_id / notify_watch_block;
-    unsigned int offset = (unsigned int)watch_id % notify_watch_block;
-    watch_by_id_t * wi;
-    wi = watches_by_id;
-    while (wi) {
-	if (wi->block_num == block) {
-	    if (wi->w[offset]) {
-	    /* shouldn't happen(TM) */
+static void set_watch_id(notify_watch_t * wp, int watch_id) {
+    int hash = watch_id % WATCH_HASH;
+    notify_watch_t * nw = id_to_watch[hash];
+    while (nw) {
+	if (nw->watch_id == watch_id) {
 #if USE_SHOULDBOX
-		main_shouldbox++;
-		error_report(error_internal, "set_watch_id",
-			     "duplicate watch");
+	    main_shouldbox++;
+	    error_report(error_internal, "set_watch_id", "duplicate watch");
 #endif
-		return 1;
-	    }
-	    wi->w[offset] = wp;
-	    wp->watch_id = watch_id;
-	    watch_active++;
-	    return 1;
+	    return;
 	}
-	wi = wi->next;
+	nw = nw->next_by_id;
     }
-    /* need to create new block */
-    wi = allocate_watch_by_id(block);
-    if (! wi) return 0;
-    wi->w[offset] = wp;
+    wp->next_by_id = id_to_watch[hash];
     wp->watch_id = watch_id;
+    id_to_watch[hash] = wp;
     watch_active++;
-    return 1;
+    return;
 }
 
 /* calculate length of file name given watch and name */
@@ -701,7 +553,7 @@ static inline void store_name(notify_watch_t * wp, const char * name,
 	name = "";
 	if (len < wp->name_length) return;
 	len -= wp->name_length;
-	strncpy(buffer + len, watch_dir_name(wp), wp->name_length);
+	strncpy(buffer + len, wp->name, wp->name_length);
 	wp = wp->parent;
     }
 }
@@ -831,67 +683,99 @@ static void queue_event(notify_event_type_t type, int is_dir, int notify_max,
 /* remove watch from its parent */
 
 static void orphan_watch(notify_watch_t * wp) {
-    if (wp->next_name)
-	wp->next_name->prev_name = wp->prev_name;
-    if (wp->prev_name)
-	wp->prev_name->next_name = wp->next_name;
-    else if (wp->parent)
-	wp->parent->subdir[wp->name_hash] = wp->next_name;
+    if (wp->parent) {
+	/* find its previous sibling */
+	notify_watch_t * s = wp->parent->subdir[wp->name_hash];
+	if (s) {
+	    if (s == wp) {
+		wp->parent->subdir[wp->name_hash] = s->sibling;
+	    } else {
+		while (s->sibling && s->sibling != wp) s = s->sibling;
+		if (s->sibling == wp)
+		    s->sibling = wp->sibling;
+	    }
+	}
+    }
     wp->parent = NULL;
-    wp->next_name = NULL;
-    wp->prev_name = NULL;
+    wp->sibling = NULL;
 }
 
 /* gives a watch a parent */
 
-#if NOTIFY == NOTIFY_INOTIFY
 static void adopt_watch(notify_watch_t * parent, notify_watch_t * child) {
-    child->next_name = parent->subdir[child->name_hash];
-    if (parent->subdir[child->name_hash])
-	parent->subdir[child->name_hash]->prev_name = child;
+    child->sibling = parent->subdir[child->name_hash];
     parent->subdir[child->name_hash] = child;
-    child->prev_name = NULL;
     child->parent = parent;
 }
-#endif
 
-/* removes watch id and if appropriate deallocate watch block */
+/* removes watch id */
 
 static void remove_watch_id(notify_watch_t * wp) {
-    watch_by_id_t * wi;
-    unsigned int wid = wp->watch_id;
-    unsigned int block = wid / notify_watch_block;
-    unsigned int offset = wid % notify_watch_block;
+    int hash = wp->watch_id % WATCH_HASH;
+    notify_watch_t * rw = id_to_watch[hash], * prev = NULL;
     wp->watch_id = -1;
-    wi = watches_by_id;
-    while (wi) {
-	if (wi->block_num == block) {
-	    wi->w[offset] = NULL;
+    while (rw && rw != wp) {
+	prev = rw;
+	rw = rw->next_by_id;
+    }
+    if (rw) {
+	if (prev)
+	    prev->next_by_id = rw->next_by_id;
+	else
+	    id_to_watch[hash] = rw->next_by_id;
+    }
+}
+
+/* remove a watch from the inode index */
+
+static void rm_inode(notify_watch_t * wp) {
+    watch_by_device_t * wbdev = dev_to_watch, * wbprev = NULL;
+    int hash;
+    notify_watch_t * nw, * prev = NULL;
+    while (wbdev && wbdev->device != wp->device) {
+	wbprev = wbdev;
+	wbdev = wbdev->next;
+    }
+    if (! wbdev) return;
+    hash = wp->inode % WATCH_HASH;
+    nw = wbdev->w[hash];
+    while (nw) {
+	if (nw->inode == wp->inode) {
+	    if (prev) {
+		prev->next_by_inode = nw->next_by_inode;
+	    } else {
+		wbdev->w[hash] = nw->next_by_inode;
+		if (! wbdev->w[hash]) {
+		    /* this device may be empty */
+		    int j, ok = 1;
+		    for (j = 0; j < WATCH_HASH; j++)
+			if (wbdev->w[j]) ok = 0;
+		    if (ok) {
+			if (wbprev)
+			    wbprev->next = wbdev->next;
+			else
+			    dev_to_watch = wbdev->next;
+			myfree(wbdev);
+		    }
+		}
+	    }
 	    return;
 	}
-	wi = wi->next;
+	prev = nw;
+	nw = nw->next_by_inode;
     }
 }
 
 /* deallocates a watch and its descendents */
 
 static void deallocate_watch(notify_watch_t * wp, int rmroot) {
-    int i;
-#if USE_SHOULDBOX
-    if (! wp->valid) {
-	main_shouldbox++;
-	error_report(error_shouldbox_int, "deallocate_watch",
-		     "wp->valid", wp->valid);
-	return;
-    }
-#endif
-    free_watch_name(wp);
+    int i, p, ub[notify_watch_block], blocks;
+    watch_block_t * wb;
     for (i = 0; i < NAME_HASH; i++)
 	while (wp->subdir[i])
 	    deallocate_watch(wp->subdir[i], rmroot);
-    if (wp == root_watch && ! rmroot)
+    if (wp->locked && ! rmroot)
 	return;
-    wp->valid = 0;
     orphan_watch(wp);
 #if USE_SHOULDBOX
     if (watch_count < 1) {
@@ -900,26 +784,52 @@ static void deallocate_watch(notify_watch_t * wp, int rmroot) {
 		     "watch_count--", watch_count);
 	return;
     }
-    if (wp->block_ptr) {
-	unsigned int id = (unsigned int)wp->inode + (unsigned int)wp->device;
-	int offset = id % notify_watch_block;
-	watch_block_t * b = wp->block_ptr;
-	if (&b->w[offset] != wp) {
-	    error_report(error_shouldbox_misptr,
-			 "deallocate_watch", "wp->block_ptr");
-	    return;
-	}
-    } else {
-	error_report(error_shouldbox_null,
-		     "deallocate_watch", "wp->block_ptr");
-	return;
-    }
 #endif
-    /* we must do this AFTER going through the subdirs, otherwise another
-     * thread may notice the watch has been removed and call deallocate_watch
-     * with the same watch, leading to a race condition; it is safe here:
-     * by the time the other thread makes the call, there is nothing to
-     * recurse on, and wp->watch_id is negative */
+    /* remove it from the inode index */
+    rm_inode(wp);
+    /* and mark the containing block free */
+    wb = wp->block_ptr;
+    i = wb->used;
+    p = -1;
+    while (i >= 0) {
+	if (wp == &wb->w[i]) {
+	    if (p < 0)
+		wb->used = wp->forward;
+	    else
+		wb->w[p].forward = wp->forward;
+	    break;
+	}
+	p = i;
+	i = wb->w[i].forward;
+    }
+    /* mark this block as unused; we scan the unused list and make a list
+     * of unused blocks, then create a new unused list from that and remove
+     * any fragmentstion; it's only 32 elements per block anyway... */
+    for (i = 0; i < notify_watch_block; i++)
+	ub[i] = 0;
+    blocks = watch_size(wp->name_length);
+    p = wp - &wb->w[0];
+    for (i = 0; i < blocks; i++)
+	ub[p + i] = 1;
+    p = wb->unused;
+    while (p >= 0) {
+	blocks = wb->w[p].name_length;
+	for (i = 0; i < blocks; i++)
+	    ub[p + i] = 1;
+	p = wb->w[p].forward;
+    }
+    p = -1;
+    for (i = 0; i < notify_watch_block; i++) {
+	int j;
+	if (! ub[i]) continue;
+	for (j = i; j < notify_watch_block && ub[j]; j++) ;
+	wb->w[i].forward = p;
+	wb->w[i].name_length = j - i;
+	p = i;
+	i = j - 1;
+    }
+    wb->unused = p;
+    /* if it is an active watch, remove it */
     if (wp->watch_id >= 0) {
 	int watch_id = wp->watch_id;
 	watch_active--;
@@ -930,42 +840,19 @@ static void deallocate_watch(notify_watch_t * wp, int rmroot) {
 }
 
 static void deallocate_watch_blocks(void) {
-    watch_block_t * wb = watches_by_inode;
-    watch_by_id_t * wi = watches_by_id;
+    watch_block_t * wb = all_watches;
     while (wb) {
-	int i, valid;
 	watch_block_t * this = wb;
 	wb = wb->next;
-	for (i = valid = 0; i < notify_watch_block; i++)
-	    if (this->w[i].valid)
-		valid++;
-	if (valid == 0) {
+	if (this->used < 0) {
 	    /* this block is not used, can be deleted */
 	    if (this->prev)
 		this->prev->next = this->next;
 	    else
-		watches_by_inode = this->next;
+		all_watches = this->next;
 	    if (this->next)
 		this->next->prev = this->prev;
 	    watch_memory -= notify_watch_block * sizeof(notify_watch_t);
-	    myfree(this);
-	}
-    }
-    while (wi) {
-	watch_by_id_t * this = wi;
-	int i, valid;
-	wi = wi->next;
-	for (i = valid = 0; i < notify_watch_block; i++)
-	    if (this->w[i])
-		valid++;
-	if (valid == 0) {
-	    /* this block is not used, can be deleted */
-	    if (this->prev)
-		this->prev->next = this->next;
-	    else
-		watches_by_id = this->next;
-	    if (this->next)
-		this->next->prev = this->prev;
 	    myfree(this);
 	}
     }
@@ -975,28 +862,24 @@ static void deallocate_watch_blocks(void) {
 
 static void deallocate_buffers(void) {
     watch_block_t * wb;
-    watch_by_id_t * wi;
+    watch_by_device_t * wd;
     if (root_watch)
 	deallocate_watch(root_watch, 1);
-    wb = watches_by_inode;
+    wb = all_watches;
     while (wb) {
 	int i;
 	watch_block_t * this = wb;
 	wb = wb->next;
-	for (i = 0; i < notify_watch_block; i++)
-	    if (this->w[i].valid)
-		deallocate_watch(&this->w[i], 1);
+	i = this->used;
+	while (i >= 0) {
+	    deallocate_watch(&this->w[i], 1);
+	    i = this->w[i].forward;
+	}
     }
-    wb = watches_by_inode;
-    while (wb) {
-	watch_block_t * g = wb;
-	wb = wb->next;
-	myfree(g);
-    }
-    wi = watches_by_id;
-    while (wi) {
-	watch_by_id_t * g = wi;
-	wi = wi->next;
+    wd = dev_to_watch;
+    while (wd) {
+	watch_by_device_t * g = wd;
+	wd = wd->next;
 	myfree(g);
     }
     if (event_buffer)
@@ -1006,6 +889,7 @@ static void deallocate_buffers(void) {
     inotify_fd = -1;
 #endif
     deallocate_queue();
+    deallocate_watch_blocks();
 }
 
 /* initialisation required before the notify thread starts;
@@ -1014,6 +898,7 @@ static void deallocate_buffers(void) {
 const char * notify_init(void) {
     const config_data_t * cfg = config_get();
     struct stat sbuff;
+    int i;
     const char * err = initialise_queue(cfg);
     if (err) {
 	config_put(cfg);
@@ -1022,10 +907,10 @@ const char * notify_init(void) {
     notify_watch_block = config_intval(cfg, cfg_notify_watch_block);
     /* in case we need to undo init midway */
     root_watch = NULL;
-    watch_by_id = NULL;
     event_buffer = NULL;
-    watches_by_inode = NULL;
-    watches_by_id = NULL;
+    dev_to_watch = NULL;
+    for (i = 0; i < WATCH_HASH; i++)
+	id_to_watch[i] = 0;
     how_cache = NULL;
 #if NOTIFY == NOTIFY_INOTIFY
     inotify_fd = -1;
@@ -1059,7 +944,6 @@ const char * notify_init(void) {
     if (config_intval(cfg, cfg_event_create)) i_mask |= CREATE_EVENT;
     if (config_intval(cfg, cfg_event_delete)) i_mask |= DELETE_EVENT;
     if (config_intval(cfg, cfg_event_rename)) i_mask |= RENAME_EVENT;
-    if (config_intval(cfg, cfg_event_hardlink)) i_mask |= RENAME_EVENT;
 #endif
     config_put(cfg);
     /* set up root watch */
@@ -1076,76 +960,188 @@ const char * notify_init(void) {
 	deallocate_buffers();
 	return err;
     }
+    root_watch->locked = 1;
     return NULL;
 }
 
 /* queue a rename event */
 
 #if NOTIFY != NOTIFY_NONE
-static void queue_rename(EVENT * evp, notify_watch_t * evw,
-			 EVENT * destp, notify_watch_t * destw,
-			 int is_dir, int notify_max)
+static void rename_watch(EVENT * evp, notify_watch_t * evw,
+			 EVENT * destp, notify_watch_t * destw)
 {
-    queue_event(notify_rename, is_dir, notify_max,
-		evw, evp->name, destw, destp->name, 1);
-#if NOTIFY == NOTIFY_INOTIFY
     /* do we need to update our watch data? */
-    if (evp->mask & IN_ISDIR) {
-	int dlen, namelen;
-	char * wname;
-	int evh = name_hash(evp->name);
-	notify_watch_t * evx;
+    int evlen = strlen(evp->name), evblocks, destblocks;
+    int evh = name_hash(evp->name, evlen);
+    notify_watch_t * evx;
 #if USE_SHOULDBOX
-	notify_watch_t * destx;
-	int desth = name_hash(destp->name);
+    int destlen = strlen(destp->name);
+    notify_watch_t * destx;
+    int desth = name_hash(destp->name, destlen);
 #endif
-	/* find the watch being renamed */
-	evx = evw->subdir[evh];
-	namelen = strlen(evp->name);
-	while (evx) {
-	    if (evx->name_length == namelen &&
-		strncmp(watch_dir_name(evx), evp->name, namelen) == 0)
-		    break;
-	    evx = evx->next_name;
-	}
+    // XXX if evw->how->exclude excludes the new name, remove the
+    // XXX watch instead of renaming it
+    /* find the watch being renamed */
+    evx = evw->subdir[evh];
+    while (evx) {
+	if (evx->name_length == evlen &&
+	    strncmp(evx->name, evp->name, evlen) == 0)
+		break;
+	evx = evx->sibling;
+    }
 #if USE_SHOULDBOX
-	if (! evx) {
-	    /* shouldn't happen(TM) */
+    if (! evx) {
+	/* shouldn't happen(TM) */
+	main_shouldbox++;
+	error_report(error_rename_unknown, evp->name);
+	return;
+    }
+    /* we shouldn't(TM) find a watch for the destination, but if there is
+     * one we get rid of it */
+    destx = destw->subdir[desth];
+    while (destx) {
+	if (destx->name_length == destlen &&
+	    strncmp(destx->name, destp->name, destlen) == 0)
+	{
 	    main_shouldbox++;
-	    error_report(error_rename_unknown, evp->name);
+	    error_report(error_rename_exists, destp->name);
+	    deallocate_watch(destx, 0);
+	    break;
+	}
+	destx = destx->sibling;
+    }
+#endif
+    evblocks = watch_size(evlen);
+    destblocks = watch_size(destlen);
+    if (evblocks != destblocks) {
+	/* we'll need to allocate new space; to do this we first remove
+	 * the watch from the inode index, then allocate it again (by
+	 * inode) and finally deallocate the old watch; yes, it is
+	 * messy, but directory renames are officially messy: see for
+	 * example this comment in the Linux 2.6.30 kernel sources
+	 * (fs/namei.c):
+	 *     The worst of all namespace operations - renaming directory.
+	 *     "Perverted" doesn't even start to describe it. Somebody in
+	 *     UCB had a heck of a trip... */
+	int watch_id = evx->watch_id;
+	notify_watch_t * neww;
+	rm_inode(evx);
+	remove_watch_id(evx);
+	orphan_watch(evx);
+	neww = find_watch_by_inode(evx->device, evx->inode, destp->name,
+				   destw, evx->how);
+	if (! neww) {
+	    RMWATCH(watch_id);
 	    return;
 	}
-	/* we shouldn't(TM) find a watch for the destination, but if there is
-	 * one we get rid of it */
-	destx = destw->subdir[desth];
-	namelen = strlen(destp->name);
-	while (destx) {
-	    if (destx->name_length == namelen &&
-		strncmp(watch_dir_name(destx), destp->name, namelen) == 0)
-	    {
-		main_shouldbox++;
-		error_report(error_rename_exists, destp->name);
-		deallocate_watch(destx, 0);
-		break;
-	    }
-	    destx = destx->next_name;
-	}
-#endif
-	/* change parent and name */
+	set_watch_id(neww, watch_id);
+	deallocate_watch(evx, 1);
+    } else {
+	/* easy case: just overwrite the name and change parent */
 	if (evw != destw) {
 	    orphan_watch(evx);
 	    adopt_watch(destw, evx);
 	}
-	dlen = strlen(destp->name);
-	free_watch_name(evx);
-	wname = allocate_watch_name(evx, dlen);
-	if (wname)
-	    strncpy(wname, destp->name, dlen);
-	evx->name_length = dlen;
+	strncpy(evx->name, destp->name, destlen);
+	evx->name_length = destlen;
     }
-#endif
 }
 #endif
+
+/* adds a directory watch; returns NULL, and sets errno, on error;
+ * parent is an existing directory watch; name is relative to that
+ * directory and must not contain directory separator characters;
+ * the last parameter just tells us how this was added, as this will
+ * be required when new directories are created inside this one;
+ * must be called with the queue lock held */
+
+static notify_watch_t * add(notify_watch_t * parent, const char * path,
+			    const config_add_t * how)
+{
+    struct stat sbuff;
+    notify_watch_t * wc;
+    int wid, plen = path ? strlen(path) : -1;
+    int namelen = store_length(parent, plen);
+    char full_path[1 + namelen];
+    store_name(parent, path, plen, full_path, namelen, 1);
+    if (stat(full_path, &sbuff) < 0)
+	return NULL;
+    wc = find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, path, parent, how);
+    if (! wc)
+	return NULL;
+    if (wc->watch_id >= 0)
+	return wc;
+    wid = ADDWATCH(full_path);
+    if (wid < 0)
+	return NULL;
+    set_watch_id(wc, wid);
+    return wc;
+}
+
+static void watch_new_dir(notify_watch_t * evw, const char * name) {
+    int addit = 1;
+    /* check if we do want to add this one */
+    if (addit && evw->how) {
+	int len = strlen(name);
+	int pathlen = store_length(evw, len);
+	char path[pathlen + 1];
+	store_name(evw, name, len, path, pathlen, 1);
+	if (! evw->how->crossmount) {
+	    /* check parent and subdir on same device */
+	    struct stat sp;
+	    addit = 0;
+	    if (stat(path, &sp) >= 0) {
+		struct stat sc;
+		char sv = path[pathlen - len];
+		path[pathlen - len] = 0;
+		if (stat(path, &sc) >= 0)
+		    addit = sp.st_dev == sc.st_dev;
+		path[pathlen - len] = sv;
+	    }
+	}
+	if (addit && evw->how->exclude) {
+	    /* check the name against the exclude list */
+	    const char * data[cfg_dacl_COUNT];
+	    data[cfg_dacl_name] = name;
+	    data[cfg_dacl_path] = path;
+	    if (config_check_acl_cond(evw->how->exclude, 0,
+				      data, cfg_dacl_COUNT))
+		addit = 0;
+	}
+    }
+    if (addit) {
+	notify_watch_t * added = add(evw, name, evw->how);
+	if (! added)
+	    error_report(error_add_watch, errno, name);
+    }
+}
+
+/* removes a directory watch; returns 1 if found, 0 if not found,
+ * -1 if found but has children; parent and name are the same as
+ * notify_add(); must be called with the queue lock held */
+
+static int remove_watch(notify_watch_t * parent, const char * path, int recurse)
+{
+    int namelen = strlen(path), hash = name_hash(path, namelen);
+    notify_watch_t * wp;
+    wp = parent->subdir[hash];
+    while (wp) {
+	if (wp->name_length == namelen &&
+	    strncmp(wp->name, path, namelen) == 0)
+	{
+	    if (! recurse) {
+		int i;
+		for (i = 0; i < NAME_HASH; i++)
+		    if (wp->subdir[i])
+			return -1;
+	    }
+	    deallocate_watch(wp, 0);
+	    return 1;
+	}
+	wp = wp->sibling;
+    }
+    return 0;
+}
 
 /* run notify thread; returns NULL on normal termination,
  * or an error message */
@@ -1210,10 +1206,9 @@ const char * notify_thread(void) {
 	    if (evp->mask & (IN_UNMOUNT | IN_DELETE_SELF | IN_IGNORED)) {
 		/* kernel automatically removes the watch; we need to free our
 		 * data structures */
-		if (evw->valid) {
-		    evw->watch_id = -1;
-		    deallocate_watch(evw, 0);
-		}
+		if (evw->watch_id >= 0)
+		    remove_watch_id(evw);
+		deallocate_watch(evw, 1);
 		continue;
 	    }
 #endif
@@ -1224,6 +1219,7 @@ const char * notify_thread(void) {
 	     * then be optimised away if the copy was from one of our
 	     * clients */
 	    if (skip_should &&
+		! is_dir &&
 		strncmp(evp->name, ".should.", 8) == 0 &&
 		strlen(evp->name) == 14)
 		    continue;
@@ -1248,13 +1244,11 @@ const char * notify_thread(void) {
 		    EVENT * destp = (void *)&event_buffer[buffer_start];
 		    if (destp->mask & (IN_MOVED_FROM | IN_MOVED_TO)) {
 			if (destp->cookie == evp->cookie) {
-			    /* this is a rename or hardlink event... */
+			    /* this is a rename event... */
 			    notify_watch_t * destw =
 				find_watch_by_id(destp->wd);
 			    if (destw) {
-				int is_link = 0;
 				buffer_start += sizeof(EVENT) + destp->len;
-#if NOTIFY == NOTIFY_INOTIFY
 				/* make sure the rename is from evp to destp */
 				if (evp->mask & IN_MOVED_TO) {
 				    EVENT * swp;
@@ -1262,50 +1256,12 @@ const char * notify_thread(void) {
 				    swp = destp; destp = evp; evp = swp;
 				    sww = destw; destw = evw; evw = sww;
 				}
-#endif
-				/* is it rename or hardlink? the only way to
-				 * find out is to check if both source and
-				 * destination exist and they are the same
-				 * file; also, we don't hardlink to dirs,
-				 * and we only need to check the destination
-				 * if the source has link count > 1 */
-				if (! is_dir) {
-				    int evnlen = strlen(evp->name);
-				    int evplen = store_length(evw, evnlen);
-				    struct stat evstat;
-				    char evname[evplen + 1];
-				    store_name(evw, evp->name, evnlen, evname,
-					       evplen, 1);
-				    if (lstat(evname, &evstat) >= 0 &&
-					evstat.st_nlink > 1)
-				    {
-					int destnlen = strlen(destp->name);
-					int destplen =
-					    store_length(destw, destnlen);
-					struct stat deststat;
-					char destname[destplen + 1];
-					store_name(destw, destp->name,
-						   destnlen, destname,
-						   destplen, 1);
-					if (lstat(destname, &deststat) >= 0 &&
-					    deststat.st_ino == evstat.st_ino &&
-					    deststat.st_dev == evstat.st_dev)
-					{
-					    is_link = 1;
-					}
-				    }
-				}
-				if (is_link) {
-				    if (filter[cfg_event_hardlink] &
-					    filter_mask)
-					queue_event(notify_hardlink, is_dir,
-						    notify_max, evw, evp->name,
-						    destw, destp->name, 1);
-				} else {
-				    if (filter[cfg_event_rename] & filter_mask)
-					queue_rename(evp, evw, destp, destw,
-						     is_dir, notify_max);
-				}
+				if (filter[cfg_event_rename] & filter_mask)
+				    queue_event(notify_rename, is_dir,
+						notify_max, evw, evp->name,
+						destw, destp->name, 1);
+				if (is_dir)
+				    rename_watch(evp, evw, destp, destw);
 				continue;
 			    }
 			}
@@ -1317,49 +1273,13 @@ const char * notify_thread(void) {
 	    if (evp->mask & CREATE_EVENT) {
 		evtype = notify_create;
 		filter_data = cfg_event_create;
-		if (is_dir) {
-		    int addit = 1;
-		    /* check if we do want to add this one */
-		    if (evw->how) {
-			int len = strlen(evp->name);
-			int pathlen = store_length(evw, len);
-			char path[pathlen + 1];
-			store_name(evw, evp->name, len, path, pathlen, 1);
-			if (! evw->how->crossmount) {
-			    /* check parent and subdir on same device */
-			    struct stat sp;
-			    addit = 0;
-			    if (stat(path, &sp) >= 0) {
-				struct stat sc;
-				char sv = path[pathlen - len];
-				path[pathlen - len] = 0;
-				if (stat(path, &sc) >= 0)
-				    addit = sp.st_dev == sc.st_dev;
-				path[pathlen - len] = sv;
-			    }
-			}
-			if (addit && evw->how->exclude) {
-			    /* check the name against the exclude list */
-			    const char * data[cfg_dacl_COUNT];
-			    data[cfg_dacl_name] = evp->name;
-			    data[cfg_dacl_path] = path;
-			    if (! config_check_acl_cond(evw->how->exclude, 0,
-							data, cfg_dacl_COUNT))
-				addit = 0;
-			}
-		    }
-		    if (addit) {
-			notify_watch_t * added =
-			    notify_add(evw, evp->name, evw->how);
-			if (! added)
-			    error_report(error_add_watch, errno, evp->name);
-		    }
-		}
+		if (is_dir)
+		    watch_new_dir(evw, evp->name);
 	    } else if (evp->mask & DELETE_EVENT) {
 		evtype = notify_delete;
 		filter_data = cfg_event_delete;
-		if (evp->mask & IN_ISDIR)
-		    notify_remove(evw, evp->name, 1);
+		if (is_dir)
+		    remove_watch(evw, evp->name, 1);
 	    } else if (evp->mask & CHANGE_EVENT) {
 		evtype = notify_change_data;
 		filter_data = cfg_event_data;
@@ -1384,10 +1304,10 @@ const char * notify_thread(void) {
 	}
 	/* if reader is waiting for data, let them know */
 	pthread_cond_signal(&queue_read_cond);
-	/* unlock queue */
-	pthread_mutex_unlock(&queue_lock);
 	/* periodic cleanup */
 	deallocate_watch_blocks();
+	/* unlock queue */
+	pthread_mutex_unlock(&queue_lock);
     }
     return NULL;
 }
@@ -1414,21 +1334,21 @@ void notify_exit(void) {
     }
     deallocate_buffers();
     while (how_cache) {
-	config_dir_t * this = how_cache;
+	how_cache_t * this = how_cache;
 	how_cache = this->next;
-	this->find = NULL;
-	this->next = NULL;
-	this->path = NULL;
-	config_dir_free(this);
+	config_free_acl_cond(this->how.exclude);
+	myfree(this);
     }
 }
 
 /* look up a directory by name and return the corresponding watch, if
- * found; if not found, return NULL if addit is 0, otherwise it will
- * try to add it: returns NULL if that is not possible. */
+ * found; if not found, return NULL if addit is NULL, otherwise it will
+ * try to add it: returns NULL if that is not possible; the value
+ * of addit is the same as for notify_add; this function must be called
+ * with the queue lock held */
 
-notify_watch_t * notify_find_bypath(const char * path,
-				    const config_dir_t * addit)
+static notify_watch_t * find_bypath(const char * path,
+				    const config_add_t * addit)
 {
     const config_data_t * cfg = config_get();
     struct stat sbuff;
@@ -1455,17 +1375,10 @@ notify_watch_t * notify_find_bypath(const char * path,
     wc = find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, NULL, NULL, addit);
     if (wc) {
 	if (addit && wc->watch_id < 0) {
-	    int wid, errcode;
-	    errcode = pthread_mutex_lock(&queue_lock);
-	    if (errcode) {
-		close(pathdir);
-		errno = errcode;
-		return NULL;
-	    }
+	    int wid;
 	    queue_event(notify_add_tree, 1, notify_max,
 			NULL, path, NULL, NULL, 1);
 	    pthread_cond_signal(&queue_read_cond);
-	    pthread_mutex_unlock(&queue_lock);
 	    wid = ADDWATCH(path);
 	    if (wid < 0) {
 		int e = errno;
@@ -1473,13 +1386,7 @@ notify_watch_t * notify_find_bypath(const char * path,
 		errno = e;
 		return NULL;
 	    }
-	    if (! set_watch_id(wc, wid)) {
-		int e = errno;
-		RMWATCH(wid);
-		close(pathdir);
-		errno = e;
-		return NULL;
-	    }
+	    set_watch_id(wc, wid);
 	}
 	close(pathdir);
 	return wc;
@@ -1528,7 +1435,7 @@ notify_watch_t * notify_find_bypath(const char * path,
 	if (wc) {
 	    /* we found one we already know about */
 	    while (com > 0) {
-		int namelen = store_length(wc, 0), found = 0, wid, errcode;
+		int namelen = store_length(wc, 0), found = 0, wid;
 		char name[namelen + NAME_MAX + 2];
 		DIR * D;
 		struct dirent * E;
@@ -1576,24 +1483,13 @@ notify_watch_t * notify_find_bypath(const char * path,
 		close(olddir);
 		close(pathdir);
 		olddir = pathdir = -1;
-		errcode = pthread_mutex_lock(&queue_lock);
-		if (errcode) {
-		    errno = errcode;
-		    goto error;
-		}
 		queue_event(notify_add_tree, 1, notify_max,
 			    NULL, path, NULL, NULL, 1);
 		pthread_cond_signal(&queue_read_cond);
-		pthread_mutex_unlock(&queue_lock);
 		wid = ADDWATCH(path);
 		if (wid < 0)
 		    return NULL;
-		if (! set_watch_id(wc, wid)) {
-		    int e = errno;
-		    RMWATCH(wid);
-		    errno = e;
-		    return NULL;
-		}
+		set_watch_id(wc, wid);
 		return wc;
 	    }
 	    errno = EINVAL;
@@ -1621,10 +1517,67 @@ error:
     return NULL;
 }
 
+/* look up a directory by name and return the corresponding watch, if
+ * found; if not found, return NULL if addit is NULL, otherwise it will
+ * try to add it: returns NULL if that is not possible; the value
+ * of addit is the same as for notify_add; the returned watch is left in
+ * a "locked" state and cannot be removed until the caller calls
+ * notify_unlock_watch() */
+
+notify_watch_t * notify_find_bypath(const char * path,
+				    const config_add_t * addit)
+{
+    int errcode;
+    notify_watch_t * wc;
+    /* lock queue - this is so we lock all watch structures */
+    errcode = pthread_mutex_lock(&queue_lock);
+    if (errcode) {
+	errno = errcode;
+	return NULL;
+    }
+    wc = find_bypath(path, addit);
+    if (wc) {
+	notify_watch_t * pv = wc;
+	while (pv) {
+	    pv->locked++;
+	    pv = pv->parent;
+	}
+    }
+    errcode = errno;
+    pthread_mutex_unlock(&queue_lock);
+    errno = errcode;
+    return wc;
+}
+
+void notify_unlock_watch(notify_watch_t * wc) {
+    int errcode;
+    errcode = pthread_mutex_lock(&queue_lock);
+    if (errcode)
+	return;
+    while (wc) {
+	if (wc->locked > 0) wc->locked--;
+	wc = wc->parent;
+    }
+    pthread_mutex_unlock(&queue_lock);
+}
+
 /* remove a watch and all its subdirectories */
 
-void notify_remove_under(notify_watch_t * wp) {
+const char * notify_remove_under(const char * path) {
+    int errcode;
+    notify_watch_t * wp;
+    /* lock queue - this also locka all watch structures */
+    errcode = pthread_mutex_lock(&queue_lock);
+    if (errcode)
+	return "Error locking watch structure";
+    wp = find_bypath(path, 0);
+    if (! wp) {
+	pthread_mutex_unlock(&queue_lock);
+	return "No such tree";
+    }
     deallocate_watch(wp, 0);
+    pthread_mutex_unlock(&queue_lock);
+    return NULL;
 }
 
 /* adds a directory watch; returns NULL, and sets errno, on error;
@@ -1634,14 +1587,10 @@ void notify_remove_under(notify_watch_t * wp) {
  * be required when new directories are created inside this one */
 
 notify_watch_t * notify_add(notify_watch_t * parent, const char * path,
-			    const config_dir_t * how)
+			    const config_add_t * how)
 {
-    struct stat sbuff;
+    int errcode, wid;
     notify_watch_t * wc;
-    int wid, plen = path ? strlen(path) : -1;
-    int namelen = store_length(parent, plen);
-    char full_path[1 + namelen];
-    store_name(parent, path, plen, full_path, namelen, 1);
     if (path[0] == '.' && ! path[1]) {
 	errno = EINVAL;
 	return NULL;
@@ -1656,48 +1605,17 @@ notify_watch_t * notify_add(notify_watch_t * parent, const char * path,
 	    return NULL;
 	}
     }
-    if (stat(full_path, &sbuff) < 0)
-	return NULL;
-    wc = find_watch_by_inode(sbuff.st_dev, sbuff.st_ino, path, parent, how);
-    if (! wc)
-	return NULL;
-    if (wc->watch_id >= 0)
-	return wc;
-    wid = ADDWATCH(full_path);
-    if (wid < 0)
-	return NULL;
-    if (! set_watch_id(wc, wid)) {
-	int e = errno;
-	RMWATCH(wid);
-	errno = e;
+    /* lock queue - this also locks the watch structure */
+    errcode = pthread_mutex_lock(&queue_lock);
+    if (errcode) {
+	errno = errcode;
 	return NULL;
     }
+    wc = add(parent, path, how);
+    errcode = errno;
+    pthread_mutex_unlock(&queue_lock);
+    errno = errcode;
     return wc;
-}
-
-/* removes a directory watch; returns 1 if found, 0 if not found,
- * -1 if found but has children; parent and name are the same as
- * notify_add() */
-
-int notify_remove(notify_watch_t * parent, const char * path, int recurse) {
-    int hash = name_hash(path), namelen = strlen(path);
-    notify_watch_t * wp = parent->subdir[hash];
-    while (wp) {
-	if (wp->name_length == namelen &&
-	    strncmp(watch_dir_name(wp), path, namelen) == 0)
-	{
-	    if (! recurse) {
-		int i;
-		for (i = 0; i < NAME_HASH; i++)
-		    if (wp->subdir[i])
-			return -1;
-	    }
-	    deallocate_watch(wp, 0);
-	    return 1;
-	}
-	wp = wp->next_name;
-    }
-    return 0;
 }
 
 /* returns root watch */
@@ -1896,7 +1814,6 @@ int notify_get(notify_event_t * nev, int blocking, char * buffer, int * bsz) {
 	    statit = nev->from_name;
 	fill_stat:
 	    if (lstat(statit, &sbuff) >= 0) {
-	lstat_done:
 		nev->stat_valid = 1;
 		nev->file_type = notify_filetype(sbuff.st_mode);
 		nev->file_mode = sbuff.st_mode & 07777;
@@ -1920,10 +1837,6 @@ int notify_get(notify_event_t * nev, int blocking, char * buffer, int * bsz) {
 		}
 	    }
 	    break;
-	case notify_hardlink :
-	    if (lstat(statit, &sbuff) >= 0) goto lstat_done;
-	    statit = nev->to_name;
-	    goto fill_stat;
 	case notify_rename :
 	    statit = nev->to_name;
 	    goto fill_stat;
@@ -1968,7 +1881,7 @@ out:
 	 * everything already in it */
 	notify_watch_t * wp;
 	DIR * D;
-	wp = notify_find_bypath(nev->from_name, NULL);
+	wp = find_bypath(nev->from_name, NULL);
 	D = opendir(nev->from_name);
 	if (wp && D) {
 	    int slen = strlen(nev->from_name);
@@ -1997,6 +1910,8 @@ out:
 		/* don't wait if there isn't space, but try to queue this */
 		queue_event(notify_create, S_ISDIR(ebuff.st_mode), notify_max,
 			    wp, E->d_name, NULL, NULL, 0);
+		if (is_dir)
+		    watch_new_dir(wp, E->d_name);
 	    }
 	}
 	if (D)
@@ -2012,22 +1927,27 @@ out:
 /* executes a callback once for each active watch */
 
 int notify_forall_watches(int (*cb)(const char *, void *), void * P) {
-    watch_block_t * wb = watches_by_inode;
-    while (wb) {
-	int offset;
-	for (offset = 0; offset < notify_watch_block; offset++) {
-	    if (wb->w[offset].valid && wb->w[offset].watch_id >= 0) {
-		int nl = store_length(wb->w[offset].parent,
-				      wb->w[offset].name_length);
-		char wname[nl + 1];
-		store_name(wb->w[offset].parent, watch_dir_name(&wb->w[offset]),
-			   wb->w[offset].name_length, wname, nl, 1);
-		if (! cb(wname, P))
-		    return 0;
+    int hash, errcode;
+    /* lock queue - this also locks the watch structure */
+    errcode = pthread_mutex_lock(&queue_lock);
+    if (errcode)
+	return 0;
+    for (hash = 0; hash < WATCH_HASH; hash++) {
+	const notify_watch_t * wl = id_to_watch[hash];
+	while (wl) {
+	    int nl = store_length(wl->parent, wl->name_length);
+	    char wname[nl + 1];
+	    store_name(wl->parent, wl->name, wl->name_length, wname, nl, 1);
+	    if (! cb(wname, P)) {
+		int e = errno;
+		pthread_mutex_unlock(&queue_lock);
+		errno = e;
+		return 0;
 	    }
+	    wl = wl->next_by_id;
 	}
-	wb = wb->next;
     }
+    pthread_mutex_unlock(&queue_lock);
     return 1;
 }
 #endif /* NOTIFY != NOTIFY_NONE */

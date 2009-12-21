@@ -32,6 +32,7 @@ typedef enum {
     client_ext_encrypt     = 0x02,
     client_ext_ignore      = 0x04,
     client_ext_rsync       = 0x08,
+    client_ext_evbatch     = 0x10,
     client_ext_none        = 0x00
 } client_extensions_t;
 

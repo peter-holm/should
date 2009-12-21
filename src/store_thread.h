@@ -73,10 +73,10 @@ store_get_t * store_prepare(int filenum, int filepos, const char * root);
  * "fd". Returns 0 if OK, -1 if timeout, -2 if other error: in this case,
  * the error fields are filled with the message; if there is an event but its
  * variable part is larger than "size" bytes, returns the actual size of the
- * event */
+ * event; if evsize is not NULL the variable size is also stored there */
 
 int store_get(store_get_t *, notify_event_t *, int timeout, int size,
-	      int fd, char * errmsg, int errsize);
+	      int fd, char * errmsg, int errsize, int * evsize);
 
 /* get file number and position */
 

@@ -1,65 +1,51 @@
-TEST for 1.0.-3:
-* errors via email
-* extra fork and cleanup
-
-TODO for 1.0.-3:
-* copy does not seem to close files correctly - and to rm tempfile
-* hard links seem to get notified as renames! find out why
-* change rdiff --> librsync
+TODO for 1.0.-2:
+* have a separate lock for watch structure, without using the queue lock;
+  must be careful of deadlocks as some code will need to lock both
+* dev_t can be 64 bits (in Linux) and ino_t can be 64 bits (in BSD); find
+  all places where they are treated as ints, and replace that with int64_t
+* check "exclude" on directory renames: if the new name is excluded, we need
+  to remove the watch after queueing the rename event
+* split config.c into config.c and config-package.c
+* rewrite config.c to use a table instead of the huge switch(); the
+  table could also be used to print the current configuration (and would
+  be provided by config-package.c); doesn't have to be very efficient to
+  search by keyword (unlike control thread) as it's used rarely.
+* should.conf(5) manpage
+* should.1 - external_copy
 * change external_copy to open on demand and close as soon as a different
   type of event, or a timeout, occurs
-* timed dirsyncs: change to have an array of "last done" times for each
-  one, initially (now-86400). Periodically make a list of each one which
-  is 1) enabled today, 2) in the future, 3) last done <= now-86400; then
-  if the list is not empty do one and record last-done on the whole list
-  to be now.
-* finish wrapper process and cleanup
-* should.1 - external_copy
-* watch struct uses more RAM then necessary by about 1 order of magnitude.
-* move config_dirs_t to config-package and replace with a generic pointer
-  configuration element
-* split config.c into config.c and config-package.c
-* should.conf(5) manpage
+* add a signal handler for SIGABRT and make sure it does not return (this
+  is not as easy as it sounds as we need to figure out what to do with the
+  thread which called it), This is to stop librsync being dangerous. May
+  be easier to rewrite librsync to behave sensibly.
 * client / should.1 - copy catch up: for example "should catchup=FILE"
 * server: if disallow_unix removes the last user, need to make the socket
   accessible by the owner only (if then allow_unix adds a user again, it
   can give the socket more permissions). This is only important during
   config_commit_update. Or maybe we just prohibit removing the last user.
-* review and test dirsync mechanism
-* review and test event filtering
-* review and test initscripts
-* notify - review and test exclude/crossmount on automatic watch
-* review and test new ACL for exclude, find
-* copy - test timed / periodic dirsync as per dirsync_interval / dirsync_timed
-
-TODO for 1.0.-2:
+* librsync will send data for signatures and deltas in small chunks;
+  see if we can batch it.
 * server - IGNORE command and EXTENSION
 * copy - multi-master mode, connects to a local server as well as a remote
   one, and uses IGNORE on the local server before doing any file operation as
   a result of replication from the remote server.
-* client / should.1 - copy modify: for example "should modify=FILE new_options"
-* client / should.1 - copy display: for example "should display=FILE"
+* review and test initscripts
+* review and test extra fork and cleanup
+* review and test dirsync mechanism
+* review and test timed / periodic dirsync
 
 Possible future improvements:
+* the code could do with some more documentation
 * a nicer interface to the "should" configuration
 * disallow_unix / disallow_tcp - accept a socket/host and remove them
   from the existing list
 * link encryption (ENCRYPT command and EXTENSION, etc).
-* rewrite config.c to use a table instead of the huge switch(); the
-  table could also be used to print the current configuration.
-* rewrite control thread to use a table instead of the huge switch();
-  the table could also contain a bitmap of which modes allow which
-  command, and produce a helpful message if a command is recognised
-  but not supported.
 * lzo compression
-* lzma compression
 * generate locale files with the error messages instead (or in addition to)
   of reading them from config
 * split out client code to a client library to connect/do things/etc, which
   encapsulates the protocol and just offers library calls. Modify client.c
   and Should::Client to use this library.
-* extend allow_tcp with options like "host=IP/bits" where IP is an IPv4 or
-  IPv6 range, or "host=IP/mask" where IP is an IPv4 address.
 * maybe the control thread could provide periodic stats (if enabled in config)
 * "should remove" could also remove the parent watch (etc) if its only subdir
   has just been removed
@@ -75,10 +61,10 @@ Possible future improvements:
   store_thread.c:store_init()
 * "retry" mode where if the server/copy dies and it has not been explicitely
   stopped the wrapper process will wait some time (specified by retry=interval)
-  and then try again. This means running the second fork() in a look and
+  and then try again. This means running the second fork() in a loop and
   checking for exit via stop.
-* [i]exclude_event[_path][_glob] -- does filtering at the event level rather
-  than at the watch level.
+* [i]exclude_event[_path][_glob] -- filter events by name/path (in addition
+  to the existing filter by event type / object type)
 * improve the check whether a file needs to be copied during dirsync by
   using the event we've already created from get_local_dir()
 

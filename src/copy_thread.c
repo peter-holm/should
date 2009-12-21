@@ -88,6 +88,27 @@ typedef enum {
     evr_toobig
 } evresult_t;
 
+typedef struct {
+    enum {
+	data_file,
+	data_socket
+    } mode;
+    int fd;
+    const char * command;
+    int do_empty;
+    int wsize;
+    int compression;
+    char * buffer;
+    char * cbuffer;
+    const char * fname;
+} data_t;
+
+typedef struct {
+    const char * fname;
+    void * pagemap;
+    size_t maplen;
+} from_t;
+
 static socket_t * p;
 static client_extensions_t extensions;
 static int fnum, fpos, event_count, num_dirsyncs;
@@ -270,6 +291,157 @@ static int rmtree(const char * dname) {
     return rmdir(dname);
 }
 
+static rs_result getdata(rs_job_t * rs_job, rs_buffers_t * buf, void * _p) {
+    data_t * data = _p;
+    ssize_t nr;
+    int nf, csize, usize;
+    char cmdbuff[REPLSIZE], repl[REPLSIZE], * wp;
+    if (buf->next_in && buf->avail_in > 0)
+	return RS_DONE;
+    switch (data->mode) {
+	case data_file :
+	    nr = read(data->fd, data->buffer, DATA_BLOCKSIZE);
+	    if (nr < 0)
+		return RS_IO_ERROR;
+	    buf->avail_in = nr;
+	    buf->next_in = data->buffer;
+	    if (nr == 0)
+		buf->eof_in = 1;
+	    return RS_DONE;
+	case data_socket :
+	    snprintf(cmdbuff, REPLSIZE, "%s %d", data->command, DATA_BLOCKSIZE);
+	    errno = 0;
+	    if (! client_send_command(p, cmdbuff, NULL, repl)) {
+		errno = EINVAL;
+		return RS_IO_ERROR;
+	    }
+	    if (errno == EINTR)
+		return RS_IO_ERROR;
+	    nf = sscanf(repl + 2, "%d %d", &csize, &usize);
+	    if (nf < 1 || csize < 0 || csize > DATA_BLOCKSIZE) {
+		error_report(error_copy_invalid, data->fname, repl);
+		errno = EINVAL;
+		return RS_IO_ERROR;
+	    }
+	    if (nf >= 2) {
+		if (usize < 0 || usize <= csize) {
+		    error_report(error_copy_invalid, data->fname, repl);
+		    errno = EINVAL;
+		    return RS_IO_ERROR;
+		}
+		wp = data->cbuffer;
+	    } else {
+		usize = csize;
+		wp = data->buffer;
+	    }
+	    tbytes += usize;
+	    xbytes += csize;
+	    if (! socket_get(p, wp, csize)) {
+		error_report(error_client, "socket_get", errno);
+		errno = EBADF;
+		return RS_IO_ERROR;
+	    }
+	    if (nf >= 2) {
+		int bs = DATA_BLOCKSIZE;
+		const char * err =
+		    uncompress_data(data->compression, data->cbuffer,
+				    csize, data->buffer, &bs);
+		if (err) {
+		    error_report(error_copy_uncompress, err);
+		    errno = EINVAL;
+		    return RS_IO_ERROR;
+		}
+		if (bs != usize) {
+		    error_report(error_copy_uncompress, "Data size differ");
+		    errno = EINVAL;
+		    return RS_IO_ERROR;
+		}
+	    }
+	    buf->avail_in = usize;
+	    buf->next_in = data->buffer;
+	    return RS_DONE;
+    }
+    return RS_INTERNAL_ERROR;
+}
+
+static rs_result putdata(rs_job_t * rs_job, rs_buffers_t * buf, void * _p) {
+    data_t * data = _p;
+    int ds;
+    const char * wp;
+    char cmdbuff[REPLSIZE];
+    ds = DATA_BLOCKSIZE - buf->avail_out;
+    if (! buf->next_out || ds < 0 || (ds == 0 && ! data->do_empty)) {
+	buf->next_out = data->buffer;
+	buf->avail_out = DATA_BLOCKSIZE;
+	return RS_DONE;
+    }
+    wp = data->buffer;
+    do {
+	ssize_t nw, csize;
+	const char * cdata;
+	nw = 0;
+	switch (data->mode) {
+	    case data_file :
+		nw = write(data->fd, wp, ds);
+		if (nw < 0)
+		    return RS_IO_ERROR;
+		break;
+	    case data_socket :
+		nw = ds;
+		if (nw > data->wsize) nw = data->wsize;
+		if (data->compression >= 0)
+		    csize = compress_data(data->compression, wp,
+					  nw, data->cbuffer);
+		else
+		    csize = -1;
+		if (csize < 0) {
+		    snprintf(cmdbuff, REPLSIZE, "%s %ld",
+			     data->command, (long)nw);
+		    csize = nw;
+		    cdata = wp;
+		} else {
+		    snprintf(cmdbuff, REPLSIZE, "%s %ld %ld",
+			     data->command, (long)csize, (long)nw);
+		    cdata = data->cbuffer;
+		}
+		if (! client_send_command(p, cmdbuff, NULL, NULL)) {
+		    errno = EINVAL;
+		    return RS_IO_ERROR;
+		}
+		if (! socket_put(p, cdata, csize))
+		    return RS_IO_ERROR;
+		if (! socket_gets(p, cmdbuff, REPLSIZE))
+		    return RS_IO_ERROR;
+		if (cmdbuff[0] != 'O' || cmdbuff[1] != 'K') {
+		    errno = EINVAL;
+		    return RS_IO_ERROR;
+		}
+		break;
+	}
+	if (nw == 0) {
+	    errno = EBADF;
+	    return RS_IO_ERROR;
+	}
+	wp += nw;
+	ds -= nw;
+	data->do_empty = 0;
+    } while (ds > 0);
+    buf->next_out = data->buffer;
+    buf->avail_out = DATA_BLOCKSIZE;
+    return RS_DONE;
+}
+
+static rs_result getfrom(void * _p, rs_long_t pos, size_t * len, void ** dst) {
+    from_t * from = _p;
+    if (pos >= from->maplen) {
+	*len = 0;
+	return RS_INPUT_ENDED;
+    }
+    if (pos + *len > from->maplen) *len = from->maplen - pos;
+    *dst = from->pagemap + pos;
+    return RS_DONE;
+}
+
 static int copy_file_data(socket_t * p, int flen, const char * fname,
 			  const char * sname, const notify_event_t * ev,
 			  struct stat * exists, notify_filetype_t filetype,
@@ -296,14 +468,13 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 	    }
 	    return 1;
 	} else {
-	    int ffd, must_close = 0, digest_size = 0, rv;
+	    int ffd, must_close = 0, digest_size = 0, rv, efd = -1;
 	    const char * sl;
 	    long long done, esize = 0;
-	    int pagesize = sysconf(_SC_PAGESIZE), efd = -1;
-	    off_t emapsize = 0;
 	    char * epagemap = NULL;
 	    char tempname[flen + 16], * dp = tempname, cmdbuff[64];
 	    char repl[REPLSIZE], data[DATA_BLOCKSIZE], ud[DATA_BLOCKSIZE];
+	    char wdata[DATA_BLOCKSIZE];
 	    /* create parent dir and open temporary file */
 	    sl = strrchr(fname, '/');
 	    if (sl) {
@@ -350,10 +521,8 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 		    {
 			fcntl(efd, F_SETFL, 0L);
 			esize = sbuff.st_size;
-			emapsize = (esize + pagesize - 1) / pagesize;
-			emapsize *= pagesize;
-			epagemap = mmap(NULL, emapsize, PROT_READ,
-					MAP_PRIVATE, efd, (off_t)0);
+			epagemap = mmap(NULL, esize, PROT_READ,
+					MAP_PRIVATE|MAP_FILE, efd, (off_t)0);
 		    }
 		    if (! epagemap || epagemap == MAP_FAILED) {
 			close(efd);
@@ -363,11 +532,13 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 #if THEY_HAVE_LIBRSYNC
 		    /* if they've asked to use librsync, and we can,
 		     * use it */
-		    if (use_librsync && epagemap) {
+		    if (use_librsync && efd >= 0) {
 			long long block, rsize;
-			pipe_t rdiff_pipe;
-			const char * cmd[6];
-			int sig_done = 0;
+			rs_job_t * rs_job;
+			rs_result rs_res;
+			rs_buffers_t rs_buffers;
+			data_t data_in, data_out;
+			from_t data_cp;
 			sprintf(cmdbuff, "RSYNC 0 %lld", ev->file_size);
 			if (! client_send_command(p, cmdbuff, NULL, repl))
 			    goto error_tempname_noreport;
@@ -379,130 +550,69 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 			}
 			if (rsize > DATA_BLOCKSIZE)
 			    rsize = DATA_BLOCKSIZE;
-			// XXX replace the following with librsync
-			cmd[0] = "rdiff";
-			cmd[1] = "signature";
-			cmd[2] = fname;
-			cmd[3] = "-";
-			cmd[4] = NULL;
-			if (! pipe_openfrom((char * const *)cmd, &rdiff_pipe)) {
-			    error_report(error_client, "rdiff", errno);
+			/* beware that librsync is dangerous and will call
+			 * abort() on error, which will kill the whole
+			 * process, not just a thread; plus we cannot log
+			 * the error */
+			rs_job = rs_sig_begin(RS_DEFAULT_BLOCK_LEN,
+					      RS_DEFAULT_STRONG_LEN);
+			data_in.mode = data_file;
+			data_in.fd = efd;
+			data_in.buffer = data;
+			data_in.cbuffer = ud;
+			data_in.compression = compression;
+			data_in.fname = fname;
+			data_out.mode = data_socket;
+			data_out.command = "SIGNATURE";
+			data_out.do_empty = 1;
+			data_out.wsize = rsize;
+			data_out.buffer = wdata;
+			data_out.cbuffer = ud;
+			data_out.compression = compression;
+			data_out.fname = fname;
+			rs_res = rs_job_drive(rs_job, &rs_buffers,
+					      getdata, &data_in,
+					      putdata, &data_out);
+			if (rs_res != RS_DONE) {
+			    if (rs_res == RS_IO_ERROR)
+				error_report(error_copy_librsync_sys,
+					     fname, errno);
+			    else
+				error_report(error_copy_librsync, fname);
+			    rs_job_free(rs_job);
 			    goto error_tempname_noreport;
 			}
-			while (1) {
-			    ssize_t nr = read(rdiff_pipe.fromchild,
-					      data, rsize);
-			    if (nr < 0) {
-				error_report(error_client, "rdiff", errno);
-				pipe_close(&rdiff_pipe);
-				goto error_tempname_noreport;
-			    }
-			    if (nr == 0 && sig_done) break;
-			    // XXX try to compress this block?
-			    sprintf(cmdbuff, "SIGNATURE %lld", (long long)nr);
-			    if (! client_send_command(p, cmdbuff, NULL, NULL)) {
-				pipe_close(&rdiff_pipe);
-				goto error_tempname_noreport;
-			    }
-			    if (! socket_put(p, data, nr)) {
-				pipe_close(&rdiff_pipe);
-				goto error_tempname_noreport;
-			    }
-			    if (! socket_gets(p, repl, REPLSIZE)) {
-				pipe_close(&rdiff_pipe);
-				goto error_tempname_noreport;
-			    }
-			    if (repl[0] != 'O' || repl[1] != 'K') {
-				error_report(error_copy_invalid, fname, repl);
-				pipe_close(&rdiff_pipe);
-				goto error_tempname_noreport;
-			    }
-			    if (nr == 0) break;
-			    sig_done = 1;
-			}
-			pipe_close(&rdiff_pipe);
-			// XXX replace the following with librsync
-			cmd[0] = "rdiff";
-			cmd[1] = "patch";
-			cmd[2] = fname;
-			cmd[3] = "-";
-			cmd[4] = tempname;
-			cmd[5] = NULL;
-			if (! pipe_opento((char * const *)cmd, &rdiff_pipe)) {
-			    error_report(error_client, "rdiff", errno);
+			rs_job_free(rs_job);
+			/* now get the deltas from server and patch file */
+			data_cp.fname = fname;
+			data_cp.pagemap = epagemap;
+			data_cp.maplen = esize;
+			rs_job = rs_patch_begin(getfrom, &data_cp);
+			data_in.mode = data_socket;
+			data_in.command = "DELTA";
+			data_in.buffer = wdata;
+			data_in.cbuffer = ud;
+			data_in.compression = compression;
+			data_in.fname = fname;
+			data_out.mode = data_file;
+			data_out.fd = ffd;
+			data_out.buffer = data;
+			data_out.cbuffer = ud;
+			data_out.compression = compression;
+			data_out.fname = tempname;
+			rs_res = rs_job_drive(rs_job, &rs_buffers,
+					      getdata, &data_in,
+					      putdata, &data_out);
+			if (rs_res != RS_DONE) {
+			    if (rs_res == RS_IO_ERROR)
+				error_report(error_copy_librsync_sys,
+					     fname, errno);
+			    else
+				error_report(error_copy_librsync, fname);
+			    rs_job_free(rs_job);
 			    goto error_tempname_noreport;
 			}
-			while (1) {
-			    int nf;
-			    const char * dp;
-			    sprintf(cmdbuff, "DELTA %d", DATA_BLOCKSIZE);
-			    if (! client_send_command(p, cmdbuff, NULL, repl)) {
-				pipe_close(&rdiff_pipe);
-				goto error_tempname_noreport;
-			    }
-			    if (errno == EINTR) {
-				pipe_close(&rdiff_pipe);
-				goto error_tempname_noreport;
-			    }
-			    nf = sscanf(repl + 2, "%lld %lld", &block, &rsize);
-			    if (nf < 1 || block < 0 || block > DATA_BLOCKSIZE) {
-				error_report(error_copy_invalid, fname, repl);
-				pipe_close(&rdiff_pipe);
-				goto error_tempname_noreport;
-			    }
-			    if (nf >= 2) {
-				if (rsize < 0 || rsize <= block) {
-				    error_report(error_copy_invalid,
-						 fname, repl);
-				    pipe_close(&rdiff_pipe);
-				    goto error_tempname_noreport;
-				}
-			    } else {
-				rsize = block;
-			    }
-			    if (rsize == 0)
-				break;
-			    tbytes += rsize;
-			    xbytes += block;
-			    if (! socket_get(p, data, block)) {
-				error_report(error_client, "socket_get", errno);
-				pipe_close(&rdiff_pipe);
-				goto error_tempname_noreport;
-			    }
-			    if (nf >= 2) {
-				int bs = DATA_BLOCKSIZE;
-				const char * err =
-				    uncompress_data(compression, data,
-						    block, ud, &bs);
-				if (err) {
-				    error_report(error_copy_uncompress, err);
-				    pipe_close(&rdiff_pipe);
-				    goto error_tempname_noreport;
-				}
-				if (bs != rsize) {
-				    error_report(error_copy_uncompress,
-						 "Data size differ");
-				    pipe_close(&rdiff_pipe);
-				    goto error_tempname_noreport;
-				}
-				dp = ud;
-			    } else {
-				dp = data;
-			    }
-			    while (rsize > 0) {
-				ssize_t nw = write(rdiff_pipe.tochild,
-						   dp, rsize);
-				if (nw < 0) {
-				    int e = errno;
-				    pipe_close(&rdiff_pipe);
-				    errno = e;
-				    goto error_tempname;
-				}
-				rsize -= nw;
-				dp += nw;
-			    }
-			}
-			pipe_close(&rdiff_pipe);
+			rs_job_free(rs_job);
 			goto rename_temp;
 		    }
 #endif
@@ -618,9 +728,11 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 		    dp += nw;
 		}
 	    }
+#if THEY_HAVE_LIBRSYNC
 	rename_temp:
+#endif
 	    if (epagemap)
-		munmap(epagemap, emapsize);
+		munmap(epagemap, esize);
 	    epagemap = NULL;
 	    if (efd >= 0)
 		close(efd);
@@ -646,7 +758,7 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 	    error_report(error_copy_sys, tempname, errno);
 	error_tempname_noreport:
 	    if (epagemap)
-		munmap(epagemap, emapsize);
+		munmap(epagemap, esize);
 	    if (efd >= 0)
 		close(efd);
 	    if (ffd >= 0) {
@@ -888,9 +1000,9 @@ static int cp(const config_data_t * cfg, const notify_event_t * ev,
 	    if (! ev->stat_valid)
 		/* means file was deleted before we got to it */
 		return 1;
-	adjust_meta:
 	    if (! (config_intval(cfg, cfg_event_meta) & filter))
 		return 1;
+	adjust_meta:
 	    if (do_lstat && lstat(fname, &sbuff) < 0)
 		goto error_fname;
 	    if (ev->file_user != sbuff.st_uid &&
@@ -995,28 +1107,6 @@ static int cp(const config_data_t * cfg, const notify_event_t * ev,
 		error_report(error_copy_rename, fname, tname, errno);
 	    }
 	    return 1;
-	case notify_hardlink :
-	    if (! (config_intval(cfg, cfg_event_hardlink) & filter))
-		return 1;
-	    if (do_debug)
-		error_report(info_replication_hardlink, fname, tname);
-	    if (link(fname, tname) < 0) {
-		if (errno == ENOENT) {
-		    int se = errno;
-		    if (lstat(fname, &sbuff) < 0) {
-			/* try executing it as a copy */
-			if (config_intval(cfg, cfg_event_delete) & filter)
-			    unlink(fname);
-			cptr = tname;
-			clen = tlen;
-			sptr = ev->to_name;
-			goto copy_data;
-		    }
-		    errno = se;
-		}
-		error_report(error_copy_hardlink, fname, tname, errno);
-	    }
-	    return 1;
 	case notify_overflow :
 	case notify_nospace :
 	    /* if configured, schedule a full dirsync */
@@ -1073,15 +1163,23 @@ static int find_event(int len, const char ** name,
 
 static evresult_t get_next_event(char ** evstart, int * evspace, char ** freeit,
 				 int timeout, notify_event_t * ev, int tr_ids,
-				 const notify_event_t * evlist, int evcount)
+				 const notify_event_t * evlist, int evcount,
+				 int use_batch)
 {
     int etype, ftype, tvalid, rsz, csz;
     char * buffer, command[REPLSIZE], uname[REPLSIZE], gname[REPLSIZE];
-    sprintf(uname, "EVENT %d %d", timeout, freeit ? -1 : *evspace - 2);
-    if (! client_send_command(p, uname, NULL, command))
-	return evr_syserr;
-    if (errno == EINTR)
-	return evr_signal;
+    if (use_batch) {
+	if (! socket_gets(p, command, REPLSIZE))
+	    return evr_syserr;
+	if (strncasecmp(command, "Interrupt", 9) == 0)
+	    return evr_signal;
+    } else {
+	sprintf(uname, "EVENT %d %d", timeout, freeit ? -1 : *evspace - 2);
+	if (! client_send_command(p, uname, NULL, command))
+	    return evr_syserr;
+	if (errno == EINTR)
+	    return evr_signal;
+    }
     buffer = command + 2;
     while (*buffer && isspace((int)*buffer)) buffer++;
     if (buffer[0] == 'N' && buffer[1] == 'O')
@@ -1235,7 +1333,6 @@ static void delete_events(int evcount, notify_event_t evlist[],
 	    if (evlist[evcount].from_name == name)
 		return;
 	}
-	// XXX hardlink
 	/* if this event refers to something about to be deleted, might
 	 * as well skip it */
 	if (evlist[evcount].from_name == name)
@@ -1265,8 +1362,6 @@ static void rename_events(int evcount, notify_event_t evlist[], int valid[]) {
 		evlist[evcount + 1].to_name = rev.to_name;
 		rev.from_name = evlist[evcount].from_name;
 	    }
-	} else if (evlist[evcount].event_type == notify_hardlink) {
-	    // XXX hardlink
 	} else {
 	    if (evlist[evcount].from_name == rev.from_name) {
 		/* this event now applies to the destination of
@@ -1315,8 +1410,6 @@ static void optimise_events(int evcount,
 		 * start */
 		rename_events(evnum, evlist, valid);
 		break;
-	    case notify_hardlink :
-		// XXX hardlink
 	    case notify_create :
 	    case notify_change_data :
 	    case notify_change_meta :
@@ -1616,7 +1709,8 @@ static dirscan_t ** get_local_dir(const config_data_t * cfg,
 static void do_dirsync(int compression, int checksum, pipe_t * extcopy) {
     dirsync_queue_t * dq;
     dirscan_t ** server_dir;
-    int errcode = pthread_mutex_lock(&dirsyncs_lock), i, use_librsync;
+    int errcode = pthread_mutex_lock(&dirsyncs_lock), i, use_librsync, flags;
+    int tplen;
     const config_data_t * cfg;
     if (errcode) {
 	error_report(error_copy_sys, "locking", errno);
@@ -1632,15 +1726,16 @@ static void do_dirsync(int compression, int checksum, pipe_t * extcopy) {
     num_dirsyncs--;
     pthread_mutex_unlock(&dirsyncs_lock);
     cfg = config_get();
-    use_librsync = config_intval(cfg, cfg_flags) & config_flag_use_librsync;
+    flags = config_intval(cfg, cfg_flags);
+    use_librsync = flags & config_flag_use_librsync;
     server_dir = get_server_dir(cfg, dq->pathlen, dq->path);
+    tplen = config_strlen(cfg, cfg_to_prefix);
     if (server_dir) {
 	dirscan_t ** local_dir = get_local_dir(cfg, dq->pathlen, dq->path);
 	if (local_dir) {
 	    /* determine differences and do copy/deletes as appropriate */
 	    int sp, lp, maxname = 0;
-	    int delete =
-		config_intval(cfg, cfg_flags) & config_flag_dirsync_delete;
+	    int delete = flags & config_flag_dirsync_delete;
 	    for (sp = 0; server_dir[sp]; sp++) {
 		int l = strlen(server_dir[sp]->ev.from_name);
 		if (l > maxname) maxname = l;
@@ -1651,8 +1746,7 @@ static void do_dirsync(int compression, int checksum, pipe_t * extcopy) {
 	    }
 	    sp = lp = 0;
 	    while (server_dir[sp] || local_dir[lp]) {
-		char lname[dq->pathlen + config_strlen(cfg, cfg_to_prefix) +
-			   maxname + 2];
+		char lname[dq->pathlen + tplen + maxname + 2];
 		int c;
 		if (server_dir[sp] && local_dir[lp])
 		    c = strcmp(server_dir[sp]->ev.from_name,
@@ -1703,12 +1797,9 @@ static void do_dirsync(int compression, int checksum, pipe_t * extcopy) {
 	}
 	for (i = 0; server_dir[i]; i++) {
 	    if (server_dir[i]->ev.file_type == notify_filetype_dir) {
-		int len = server_dir[i]->ev.from_length +
-			  config_strlen(cfg, cfg_to_prefix);
-		char fname[len + 1];
+		char fname[server_dir[i]->ev.from_length + tplen + 1];
 		strcpy(fname, config_strval(cfg, cfg_to_prefix));
-		strcpy(fname + config_strlen(cfg, cfg_to_prefix),
-		       server_dir[i]->ev.from_name);
+		strcpy(fname + tplen, server_dir[i]->ev.from_name);
 		copy_dirsync(NULL, fname);
 	    }
 	    myfree(server_dir[i]);
@@ -1765,16 +1856,24 @@ void copy_thread(void) {
 	notify_event_t evlist[evmax];
 	char evarea[evbuff], * evstart = evarea, * freeit = NULL;
 	int evspace = evbuff, evcount = 1, evnum, valid[evmax];
-	int fnum_l[evmax], fpos_l[evmax], use_librsync;
+	int fnum_l[evmax], fpos_l[evmax], use_librsync, timeout, use_batch;
 	evresult_t cmdok;
 	struct timespec before, after;
 	cfg = config_get();
 	check_events = config_intval(cfg, cfg_checkpoint_events);
 	config_put(cfg);
 	/* read first event */
-	cmdok = get_next_event(&evstart, &evspace, &freeit,
-			       num_dirsyncs || oneshot ? 0 : -1,
-			       &evlist[0], tr_ids, NULL, 0);
+	timeout = num_dirsyncs || oneshot ? 0 : -1;
+	if ((extensions & client_ext_evbatch) && timeout < 0) {
+	    sprintf(command, "EVBATCH %d %d", evmax - 1, evspace);
+	    if (! socket_puts(p, command))
+		goto out;
+	    use_batch = 1;
+	} else {
+	    use_batch = 0;
+	}
+	cmdok = get_next_event(&evstart, &evspace, &freeit, timeout,
+			       &evlist[0], tr_ids, NULL, 0, use_batch);
 	clock_gettime(CLOCK_REALTIME, &before);
 	switch (cmdok) {
 	    case evr_ok :
@@ -1802,7 +1901,8 @@ void copy_thread(void) {
 	while (evcount < evmax) {
 	    /* read next event */
 	    cmdok = get_next_event(&evstart, &evspace, NULL, 0,
-				   &evlist[evcount], tr_ids, evlist, evcount);
+				   &evlist[evcount], tr_ids, evlist,
+				   evcount, use_batch);
 	    if (cmdok != evr_ok) break;
 	    valid[evcount] = 1;
 	    fnum_l[evcount] = fnum;

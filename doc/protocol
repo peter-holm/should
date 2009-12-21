@@ -109,6 +109,9 @@ EXTENSIONS
     ENCRYPT
 	The server supports the ENCRYPT command.
 
+    EVBATCH
+	The server supports event batching (EVBATCH command).
+
     IGNORE
 	The server supports the IGNORE command.
 
@@ -546,7 +549,6 @@ EVENT timeout max
     5            0      0    events were lost
     6            0      0    block size too small: event could not be stored
     7            0      1    tree was added to the watch list
-    8            1      1    new name was added to an existing file (hard link)
 
     The file type is one of:
 
@@ -560,6 +562,26 @@ EVENT timeout max
     5           symlink
     6           socket
     7           unknown
+
+EVBATCH count size
+(server, read)
+    This command is only available if the server lists EVBATCH in the reply
+    to the EXTENSIONS command.
+
+    The server sends up to "count" events. If there are no processing errors,
+    at least one event is always sent, no matter how big it is. Subsequent
+    events are only sent if the total event size fits in "size" bytes.
+
+    Each event is sent using a format similar to the result of the "EVENT"
+    command:
+
+    OK EV file pos evtype filetype stat? time? (from) (to)
+    [STAT mode uid gid size rmaj rmin]
+    [NSTAT mode user_name uid group_name gid size rmaj rmin]
+    [MTIME YYYY-MM-DD:HH:MM:SS]
+
+    After the last event, a "OK NO" line signifies that there are no more
+    events.
 
 IGNORE evtype (file1) (file2)
 (server, ignore)

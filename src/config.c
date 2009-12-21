@@ -77,7 +77,6 @@ struct config_data_s {
     char * strval[cfg_str_COUNT];
     config_strlist_t * strlist[cfg_strlist_COUNT];
     char ** strarrval[cfg_strarr_COUNT];
-    config_dir_t * treeval[cfg_tree_COUNT];
     config_acl_t * aclval[cfg_acl_COUNT];
     errdata_t errdata[error_MAX];
 };
@@ -150,7 +149,6 @@ static const int default_ints[cfg_int_COUNT] = {
     [cfg_event_create]             = config_file_all,
     [cfg_event_delete]             = config_file_all,
     [cfg_event_rename]             = config_file_all,
-    [cfg_event_hardlink]           = config_file_all,
     [cfg_flags]                    = config_flag_translate_ids
                                    | config_flag_skip_matching,
                                    // | config_flag_use_librsync,
@@ -510,10 +508,8 @@ static int assign_strlist(const char * line, const char * kw, int rev,
     int slen;
     if (assign_string(line, kw, assign_none, &st, &slen, err)) {
 	config_strlist_t * elem;
-	if (* err) {
-	    myfree(st);
+	if (* err)
 	    return 1;
-	}
 	if (check) {
 	    *err = check(st, arg);
 	    if (* err) {
@@ -521,15 +517,19 @@ static int assign_strlist(const char * line, const char * kw, int rev,
 		return 1;
 	    }
 	}
-	elem = mymalloc(sizeof(config_strlist_t));
+	elem = mymalloc(sizeof(config_strlist_t) + slen + 1);
 	if (! elem) {
 	    int e = errno;
 	    myfree(st);
 	    *err = error_sys_errno_r(errbuff, LINE_SIZE, "config", "malloc", e);
 	    return 1;
 	}
-	elem->data = st;
+	memcpy(elem->data, st, slen);
+	elem->data[slen] = 0;
 	elem->datalen = slen;
+	elem->privdata = NULL;
+	elem->freepriv = NULL;
+	elem->duppriv = NULL;
 	if (rev)  {
 	    elem->next = *sl;
 	    *sl = elem;
@@ -544,6 +544,7 @@ static int assign_strlist(const char * line, const char * kw, int rev,
 		*sl = elem;
 	    }
 	}
+	myfree(st);
 	return 1;
     }
     return 0;
@@ -1046,10 +1047,13 @@ static int assign_match(const char * line, const char * kw, int cn, int which,
     config_acl_cond_t * el;
     char * st = NULL;
     int stlen;
+    config_add_t * av;
     if (! assign_string(line, kw, assign_none, &st, &stlen, err))
 	return 0;
     if (*err) return 1;
-    if (! configs[cn].treeval[cfg_tree_add]) {
+    if (! configs[cn].strlist[cfg_add_path] ||
+	! configs[cn].strlist[cfg_add_path]->privdata)
+    {
 	myfree(st);
 	snprintf(errbuff, LINE_SIZE, "%s must follow a dir", kw);
 	*err = errbuff;
@@ -1061,12 +1065,13 @@ static int assign_match(const char * line, const char * kw, int cn, int which,
 	myfree(st);
 	return 1;
     }
+    av = configs[cn].strlist[cfg_add_path]->privdata;
     if (which) {
-	el->next = configs[cn].treeval[cfg_tree_add]->find;
-	configs[cn].treeval[cfg_tree_add]->find = el;
+	el->next = av->find;
+	av->find = el;
     } else {
-	el->next = configs[cn].treeval[cfg_tree_add]->exclude;
-	configs[cn].treeval[cfg_tree_add]->exclude = el;
+	el->next = av->exclude;
+	av->exclude = el;
     }
     strcpy(el->pattern, st);
     myfree(st);
@@ -1186,17 +1191,18 @@ static int print_match(int (*p)(void *, const char *), void * arg,
 }
 
 static int print_dirs(int (*p)(void *, const char *), void * arg,
-		      const char * name, const config_dir_t * d)
+		      const char * name, const config_strlist_t * d)
 {
     char nbuff[10 + strlen(name)];
     int ok = 1;
     strcpy(nbuff, name);
     strcat(nbuff, " = ");
     while (d) {
-	printname(p, arg, nbuff, d->path);
-	if (! p(arg, d->crossmount ? "#mount" : "mount")) ok = 0;
-	print_match(p, arg, "exclude", d->exclude);
-	print_match(p, arg, "find", d->find);
+	const config_add_t * av = d->privdata;
+	printname(p, arg, nbuff, d->data);
+	print_match(p, arg, "exclude", av->exclude);
+	print_match(p, arg, "find", av->find);
+	if (! p(arg, av->crossmount ? "#mount" : "mount")) ok = 0;
 	if (! p(arg, "")) ok = 0;
 	d = d->next;
     }
@@ -1345,8 +1351,6 @@ static int convert_filters(const char * title, char * buffer, const int orig[])
 	      list[cfg_event_delete], "delete");
     add_event(buffer, &len, &sep, orig[cfg_event_rename],
 	      list[cfg_event_rename], "rename");
-    add_event(buffer, &len, &sep, orig[cfg_event_hardlink],
-	      list[cfg_event_rename], "hardlink");
     if (sep == '=')
 	add_string(buffer, &len, "none");
     return len;
@@ -1977,12 +1981,13 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     }
     p(arg, "");
     p(arg, HASH);
-    p(arg, "# Server: initial watches and operation mode");
+    p(arg, "# Server");
     p(arg, "");
+    p(arg, "# Initial watches and operation mode");
     if (! (configs[cn].intval[cfg_client_mode] & config_client_add) &&
-	   configs[cn].treeval[cfg_tree_add])
+	   configs[cn].strlist[cfg_add_path])
     {
-	print_dirs(p, arg, "dir", configs[cn].treeval[cfg_tree_add]);
+	print_dirs(p, arg, "dir", configs[cn].strlist[cfg_add_path]);
     } else {
 	p(arg, "#dir = /some/path");
 	p(arg, "#dir = /some/other/path");
@@ -2020,9 +2025,9 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     p(arg, "");
     p(arg, "# add directories to watch");
     if ((configs[cn].intval[cfg_client_mode] & config_client_add) &&
-	configs[cn].treeval[cfg_tree_add])
+	configs[cn].strlist[cfg_add_path])
     {
-	print_dirs(p, arg, "add", configs[cn].treeval[cfg_tree_add]);
+	print_dirs(p, arg, "add", configs[cn].strlist[cfg_add_path]);
     } else {
 	p(arg, "#add = /some/path");
 	p(arg, "#add = /some/other/path");
@@ -2030,9 +2035,13 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     }
     p(arg, "# remove directories from server's watch list");
     if ((configs[cn].intval[cfg_client_mode] & config_client_remove) &&
-	configs[cn].treeval[cfg_tree_remove])
+	configs[cn].strlist[cfg_remove_path])
     {
-	print_dirs(p, arg, "remove", configs[cn].treeval[cfg_tree_remove]);
+	config_strlist_t * r = configs[cn].strlist[cfg_remove_path];
+	while (r) {
+	    printname(p, arg, "remove = ", r->data);
+	    r = r->next;
+	}
     } else {
 	p(arg, "#remove = /some/path");
 	p(arg, "#remove = /some/other/path");
@@ -2434,8 +2443,6 @@ static int get_event_filter(const char * token, int * eventmap) {
 	*eventmap = 1 << cfg_event_delete;
     else if (strcmp(token, "rename") == 0)
 	*eventmap = 1 << cfg_event_rename;
-    else if (strcmp(token, "hardlink") == 0)
-	*eventmap = 1 << cfg_event_hardlink;
     else
 	return 0;
     return 1;
@@ -2595,6 +2602,52 @@ static const char * check_socket(char * st, void * arg) {
     return NULL;
 }
 
+/* free a private data for add / dir */
+
+void config_free_add(config_add_t * this) {
+    config_free_acl_cond(this->exclude);
+    config_free_acl_cond(this->find);
+    myfree(this);
+}
+
+static void free_add(void * _p) {
+    config_free_add(_p);
+}
+
+/* copies a private data for add / dir */
+
+static void * dup_add(const void * _p) {
+    const config_add_t * old = _p;
+    config_add_t * av = mymalloc(sizeof(config_add_t));
+    if (av) {
+	av->crossmount = old->crossmount;
+	if (old->exclude) {
+	    av->exclude = config_copy_acl_cond(old->exclude);
+	    if (! av->exclude) {
+		int e = errno;
+		myfree(av);
+		errno = e;
+		return NULL;
+	    }
+	} else {
+	    av->exclude = NULL;
+	}
+	if (old->find) {
+	    av->find = config_copy_acl_cond(old->find);
+	    if (! av->find) {
+		int e = errno;
+		config_free_acl_cond(av->exclude);
+		myfree(av);
+		errno = e;
+		return NULL;
+	    }
+	} else {
+	    av->find = NULL;
+	}
+    }
+    return av;
+}
+
 /* parse single argument - things which make sense only during initial
  * configuration */
 
@@ -2604,37 +2657,41 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
     int cn = currnum, iv;
     switch (line[0]) {
 	case '/' : {
-	    config_dir_t * dl;
-	    st = mystrdup(line);
-	    if (! st)
+	    int slen = strlen(line);
+	    config_strlist_t * dl =
+		mymalloc(sizeof(config_strlist_t) + slen + 1);
+	    config_add_t * al;
+	    if (! dl)
 		return error_sys_r(errbuff, LINE_SIZE, "config", "malloc");
+	    memcpy(dl->data, line, slen);
+	    dl->data[slen] = 0;
+	    dl->datalen = slen;
+	    dl->next = configs[cn].strlist[cfg_add_path];
+	    configs[cn].strlist[cfg_add_path] = dl;
 	add_watch :
-	    dl = mymalloc(sizeof(config_dir_t));
-	    if (! dl) {
-		int e = errno;
-		myfree(st);
-		return error_sys_errno_r(errbuff, LINE_SIZE, "config",
-					 "malloc", e);
-	    }
-	    dl->crossmount = 1;
-	    dl->next = configs[cn].treeval[cfg_tree_add];
-	    dl->find = NULL;
-	    dl->exclude = NULL;
-	    dl->path = st;
-	    configs[cn].treeval[cfg_tree_add] = dl;
+	    dl = configs[cn].strlist[cfg_add_path];
+	    dl->freepriv = free_add;
+	    dl->duppriv = dup_add;
+	    al = dl->privdata = mymalloc(sizeof(config_add_t));
+	    if (! dl->privdata)
+		return error_sys_r(errbuff, LINE_SIZE, "config", "malloc");
+	    al->crossmount = 1;
+	    al->find = NULL;
+	    al->exclude = NULL;
 	    return NULL;
 	}
 	break;
 	case 'a' :
-	    st = NULL;
-	    if (assign_string(line, "add_watch", assign_isdir, &st, NULL, &err))
+	    if (assign_strlist(line, "add_watch", 1, NULL, NULL,
+		&configs[cn].strlist[cfg_add_path], &err))
 	    {
 		if (err) return err;
 		configs[cn].intval[cfg_client_mode] |= config_client_add;
 		goto add_watch;
 	    }
-	    st = NULL;
-	    if (assign_string(line, "add", assign_isdir, &st, NULL, &err)) {
+	    if (assign_strlist(line, "add", 1, NULL, NULL,
+		&configs[cn].strlist[cfg_add_path], &err))
+	    {
 		if (err) return err;
 		configs[cn].intval[cfg_client_mode] |= config_client_add;
 		goto add_watch;
@@ -2843,8 +2900,9 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 		configs[cn].intval[cfg_client_mode] |= config_client_dirsync;
 		return err;
 	    }
-	    st = NULL;
-	    if (assign_string(line, "dir", assign_isdir, &st, NULL, &err)) {
+	    if (assign_strlist(line, "dir", 1, NULL, NULL,
+		&configs[cn].strlist[cfg_add_path], &err))
+	    {
 		if (err) return err;
 		goto add_watch;
 	    }
@@ -3006,9 +3064,11 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 	    break;
 	case 'm' :
 	    if (strcmp(line, "mount") == 0) {
-		if (! configs[cn].treeval[cfg_tree_add])
+		config_add_t * al;
+		if (! configs[cn].strlist[cfg_add_path])
 		    return "mount must follow a dir";
-		configs[cn].treeval[cfg_tree_add]->crossmount = 0;
+		al = configs[cn].strlist[cfg_add_path]->privdata;
+		al->crossmount = 0;
 		return NULL;
 	    }
 	    break;
@@ -3099,24 +3159,11 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 		return err;
 	    break;
 	case 'r' :
-	    st = NULL;
-	    if (assign_string(line, "remove", assign_isdir, &st, NULL, &err)) {
-		config_dir_t * rl;
-		if (err) return err;
-		rl = mymalloc(sizeof(config_dir_t));
-		if (! rl) {
-		    int e = errno;
-		    myfree(st);
-		    return error_sys_errno_r(errbuff, LINE_SIZE, "config",
-					     "malloc", e);
-		}
-		rl->crossmount = 1;
-		rl->next = configs[cn].treeval[cfg_tree_remove];
-		rl->exclude = NULL;
-		rl->path = st;
-		configs[cn].treeval[cfg_tree_remove] = rl;
+	    if (assign_strlist(line, "remove", 0, NULL, NULL,
+		&configs[cn].strlist[cfg_remove_path], &err))
+	    {
 		configs[cn].intval[cfg_client_mode] |= config_client_remove;
-		return NULL;
+		return err;
 	    }
 	    if (assign_command(line, "remote_should",
 			       &configs[cn].strarrval[cfg_strarr_remote_should],
@@ -3739,7 +3786,7 @@ static const char * includefile(const char * name, include_t how,
 				locfl_t * locfl)
 {
     char buffer[CONFIG_LINESIZE];
-    int check_state = how & include_state;
+    int check_state = how & include_state, lineno = 0;
     FILE * IF = fopen(name, check_state ? "r+" : "r");
     const char * err = NULL;
     if (! IF) {
@@ -3766,21 +3813,24 @@ static const char * includefile(const char * name, include_t how,
     while (fgets(buffer, CONFIG_LINESIZE, IF)) {
 	int le = strlen(buffer);
 	char * line = buffer;
+	lineno++;
 	while (le > 0 && isspace((int)buffer[le - 1])) le--;
 	buffer[le] = 0;
 	while (le > 0 && buffer[le - 1] == '\\') {
 	    le--;
 	    if (le >= CONFIG_LINESIZE - 10) {
-		snprintf(errbuff, LINE_SIZE, "%s: line too long", name);
+		snprintf(errbuff, LINE_SIZE,
+			 "%s.%d: line too long", name, lineno);
 		err = errbuff;
 		goto problem;
 	    }
 	    if (! fgets(buffer + le, CONFIG_LINESIZE - le, IF)) {
 		snprintf(errbuff, LINE_SIZE,
-			 "%s: backslash ends last line", name);
+			 "%s.%d: backslash ends last line", name, lineno);
 		err = errbuff;
 		goto problem;
 	    }
+	    lineno++;
 	    le += strlen(buffer + le);
 	    while (le > 0 && isspace((int)buffer[le - 1])) le--;
 	    buffer[le] = 0;
@@ -3791,14 +3841,14 @@ static const char * includefile(const char * name, include_t how,
 	    double vn;
 	    if (sscanf(line, IDENTIFY_COPY, &vn) < 1) {
 		snprintf(errbuff, LINE_SIZE,
-			 "%s: not a copy state file", name);
+			 "%s.%d: not a copy state file", name, lineno);
 		err = errbuff;
 		goto problem;
 	    }
 	    if (vn < IDENTIFY_MINIMUM) {
 		snprintf(errbuff, LINE_SIZE,
-			 "%s: version %lf is too old (minimum %lf)",
-			 name, vn, IDENTIFY_MINIMUM);
+			 "%s.%d: version %lf is too old (minimum %lf)",
+			 name, lineno, vn, IDENTIFY_MINIMUM);
 		err = errbuff;
 		goto problem;
 	    }
@@ -3816,8 +3866,14 @@ static const char * includefile(const char * name, include_t how,
 	    return NULL;
 	}
 	err = parsearg(buffer, locfl, 1);
-	if (err)
+	if (err) {
+	    /* copy error message in case it is in errbuff */
+	    strncpy(buffer, err, sizeof(buffer));
+	    buffer[sizeof(buffer) - 1] = 0;
+	    snprintf(errbuff, LINE_SIZE, "%s.%d: %s", name, lineno, buffer);
+	    err = errbuff;
 	    goto problem;
+	}
     }
     fclose(IF);
     return NULL;
@@ -3966,8 +4022,6 @@ static int init_one(int cn) {
 	configs[cn].intarrval[uc] = NULL;
 	configs[cn].intarrlen[uc] = 0;
     }
-    for (uc = 0; uc < cfg_tree_COUNT; uc++)
-	configs[cn].treeval[uc] = NULL;
     for (uc = 0; uc < cfg_acl_COUNT; uc++)
 	configs[cn].aclval[uc] = NULL;
     for (uc = 0; uc < error_MAX; uc++) {
@@ -4006,32 +4060,42 @@ static char ** array_dup(char * const * arr) {
 static config_strlist_t * strlist_dup(const config_strlist_t * ls) {
     config_strlist_t * res = NULL, * last = NULL;
     while (ls) {
-	config_strlist_t * new = mymalloc(sizeof(config_strlist_t));
+	config_strlist_t * new =
+	    mymalloc(sizeof(config_strlist_t) + 1 + ls->datalen);
 	int e;
 	if (new) {
-	    char * p = mymalloc(1 + ls->datalen);
-	    if (p) {
-		new->data = p;
-		new->datalen = ls->datalen;
-		new->next = NULL;
-		memcpy(new->data, ls->data, ls->datalen + 1);
-		if (last)
-		    last->next = new;
-		else
-		    res = new;
-		last = new;
-		ls = ls->next;
-		continue;
+	    if (ls->privdata && ls->duppriv) {
+		new->privdata = ls->duppriv(ls->privdata);
+		if (! new->privdata) {
+		    e = errno;
+		    myfree(new);
+		    errno = e;
+		    goto fail;
+		}
+	    } else {
+		new->privdata = ls->privdata;
 	    }
-	    e = errno;
-	    myfree(new);
-	    errno = e;
+	    new->freepriv = ls->freepriv;
+	    new->duppriv = ls->duppriv;
+	    new->datalen = ls->datalen;
+	    new->next = NULL;
+	    strncpy(new->data, ls->data, ls->datalen);
+	    new->data[ls->datalen] = 0;
+	    if (last)
+		last->next = new;
+	    else
+		res = new;
+	    last = new;
+	    ls = ls->next;
+	    continue;
 	}
+    fail:
 	e = errno;
 	while (res) {
 	    config_strlist_t * this = res;
 	    res = res->next;
-	    myfree(this->data);
+	    if (this->privdata && this->freepriv)
+		this->freepriv(this->privdata);
 	    myfree(this);
 	}
 	errno = e;
@@ -4075,12 +4139,13 @@ config_acl_cond_t * config_copy_acl_cond(const config_acl_cond_t * cond) {
 		ok = this->subcond != NULL;
 	    }
 	    if (ok) {
-		this->next = last;
+		this->next = NULL;
 		if (last)
 		    last->next = this;
 		else
 		    res = this;
 		last = this;
+		cond = cond->next;
 		continue;
 	    }
 	    e = errno;
@@ -4107,13 +4172,14 @@ config_acl_t * config_copy_acl(const config_acl_t * acl) {
 		ok = this->cond != NULL;
 	    }
 	    if (ok) {
-		this->next = last;
+		this->next = NULL;
 		this->result = acl->result;
 		if (last)
 		    last->next = this;
 		else
 		    res = this;
 		last = this;
+		acl = acl->next;
 		continue;
 	    }
 	    e = errno;
@@ -4350,23 +4416,29 @@ int config_init(int argc, char *argv[]) {
 	goto fail;
     if (! (locfl & locfl_has_socket)) {
 	/* need to add a control socket */
-	config_strlist_t * L = mymalloc(sizeof(config_strlist_t));
+	config_strlist_t * L;
 	char * sh = NULL;
-	if (! L) {
-	    perror("malloc");
-	    goto fail;
-	}
+	int slen;
 	if (! set_default_user(&sh, NULL, user, homedir, ROOT_SOCKET_DIR,
 			       configs[currnum].strval[cfg_base_name],
 			       "socket"))
-	{
-	    myfree(L);
+	    goto fail;
+	slen = strlen(sh);
+	L = mymalloc(sizeof(config_strlist_t) + slen + 1);
+	if (! L) {
+	    perror("malloc");
+	    myfree(sh);
 	    goto fail;
 	}
 	L->next = configs[currnum].strlist[cfg_listen];
-	L->data = sh;
-	L->datalen = strlen(sh);
+	memcpy(L->data, sh, slen);
+	L->data[slen] = 0;
+	L->datalen = slen;
+	L->privdata = NULL;
+	L->freepriv = NULL;
+	L->duppriv = NULL;
 	configs[currnum].strlist[cfg_listen] = L;
+	myfree(sh);
     }
     locfl &= ~locfl_has_socket;
     if (! set_strval(currnum, cfg_error_ident, "should"))
@@ -4468,15 +4540,6 @@ fail:
     return 0;
 }
 
-/* free a single directory tree */
-
-void config_dir_free(config_dir_t * this) {
-    config_free_acl_cond(this->exclude);
-    config_free_acl_cond(this->find);
-    myfree(this->path);
-    myfree(this);
-}
-
 /* free configuration data */
 
 void free_one(int cn) {
@@ -4488,7 +4551,8 @@ void free_one(int cn) {
 	while (configs[cn].strlist[uc]) {
 	    config_strlist_t * this = configs[cn].strlist[uc];
 	    configs[cn].strlist[uc] = configs[cn].strlist[uc]->next;
-	    myfree(this->data);
+	    if (this->privdata && this->freepriv)
+		this->freepriv(this->privdata);
 	    myfree(this);
 	}
     }
@@ -4501,13 +4565,6 @@ void free_one(int cn) {
     for (uc = 0; uc < cfg_intarr_COUNT; uc++)
 	if (configs[cn].intarrval[uc])
 	    myfree(configs[cn].intarrval[uc]);
-    for (uc = 0; uc < cfg_tree_COUNT; uc++) {
-	while (configs[cn].treeval[uc]) {
-	    config_dir_t * this = configs[cn].treeval[uc];
-	    configs[cn].treeval[uc] = configs[cn].treeval[uc]->next;
-	    config_dir_free(this);
-	}
-    }
     for (uc = 0; uc < cfg_acl_COUNT; uc++) {
 	while (configs[cn].aclval[uc]) {
 	    config_acl_t * this = configs[cn].aclval[uc];
@@ -4734,12 +4791,6 @@ const config_strlist_t * config_strlist(const config_data_t * cfg,
 					config_strlist_names_t sv)
 {
     return sv < 0 || sv >= cfg_strlist_COUNT ? NULL : cfg->strlist[sv];
-}
-
-const config_dir_t * config_treeval(const config_data_t * cfg,
-				    config_tree_names_t tv)
-{
-    return tv < 0 || tv >= cfg_tree_COUNT ? NULL : cfg->treeval[tv];
 }
 
 const config_acl_t * config_aclval(const config_data_t * cfg,

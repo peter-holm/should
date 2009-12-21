@@ -121,7 +121,6 @@ typedef enum {
     cfg_event_create,             /* event filter for create operations */
     cfg_event_delete,             /* event filter for delete operations */
     cfg_event_rename,             /* event filter for rename operations */
-    cfg_event_hardlink,           /* event filter for hard link creation */
     cfg_flags,                    /* bit-valued elements */
     cfg_client_mode,              /* do an operation to a running should */
     cfg_server_mode,              /* start server */
@@ -191,6 +190,8 @@ typedef enum {
     cfg_update,                   /* configuration updates to request */
     cfg_dirsync_path,             /* list of "dirsync"s to schedule */
     cfg_listen,                   /* sockets to listen on */
+    cfg_remove_path,              /* directories to stop watching */
+    cfg_add_path,                 /* directories to watch */
     cfg_strlist_COUNT             /* number of string-list elements */
 } config_strlist_names_t;
 
@@ -204,14 +205,6 @@ typedef enum {
     cfg_strarr_extcopy,           /* external copy program */
     cfg_strarr_COUNT
 } config_strarr_names_t;
-
-/* directory tree configuration elements */
-
-typedef enum {
-    cfg_tree_add,                 /* directories to watch */
-    cfg_tree_remove,              /* directories to stop watching */
-    cfg_tree_COUNT
-} config_tree_names_t;
 
 /* access control lists */
 
@@ -241,6 +234,18 @@ typedef enum {
     cfg_dacl_name,                /* last component of file name */
     cfg_dacl_COUNT
 } config_dir_acl_t;
+
+/* private data for add / dir */
+
+typedef struct {
+    int crossmount;
+    config_acl_cond_t * exclude;
+    config_acl_cond_t * find;
+} config_add_t;
+
+/* function to free a config_add_t */
+
+void config_free_add(config_add_t *);
 
 /* function to handle with hashed passwords */
 

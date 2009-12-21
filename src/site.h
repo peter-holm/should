@@ -32,7 +32,11 @@
 
 /* used to hash the directory names; make this a prime */
 
-#define NAME_HASH 31
+#define NAME_HASH 19
+
+/* used to hash watch IDs; make this a prime */
+
+#define WATCH_HASH 127
 
 /* use a "should box"? Some error conditions cannot be detected without this */
 

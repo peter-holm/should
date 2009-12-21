@@ -22,6 +22,13 @@
 #ifndef __SHOULD_CONFIG_H__
 #define __SHOULD_CONFIG_H__ 1
 
+/* forward declarations -- may be used by config-package.h */
+
+typedef struct config_acl_cond_s config_acl_cond_t;
+typedef struct config_acl_s config_acl_t;
+typedef struct config_strlist_s config_strlist_t;
+typedef struct config_unit_s config_unit_t;
+
 /* read package-dependent definitions; the configuration system is meant to
  * be reusable on different packages */
 
@@ -30,7 +37,6 @@
 
 /* generic ACL mechanism */
 
-typedef struct config_acl_cond_s config_acl_cond_t;
 struct config_acl_cond_s {
     config_acl_cond_t * next;
     enum {
@@ -55,40 +61,30 @@ struct config_acl_cond_s {
     char pattern[0];
 };
 
-typedef struct config_acl_s config_acl_t;
 struct config_acl_s {
     config_acl_t * next;
     config_acl_cond_t * cond;
     int result;
 };
 
-/* specification for a generic directory tree */
-
-typedef struct config_dir_s config_dir_t;
-struct config_dir_s {
-    config_dir_t * next;
-    int crossmount;
-    config_acl_cond_t * exclude;
-    config_acl_cond_t * find;
-    char * path;
-};
-
 /* list of strings */
 
-typedef struct config_strlist_s config_strlist_t;
 struct config_strlist_s {
     config_strlist_t * next;
+    void * privdata;
+    void (*freepriv)(void *);
+    void * (*duppriv)(const void *);
     int datalen;
-    char * data;
+    char data[0];
 };
 
 /* define units, for configuration elements which use name + unit */
 
-typedef struct {
+struct config_unit_s {
     int multiply;
     const char * name_singular;
     const char * name_plural;
-} config_unit_t;
+};
 
 /* predefined units */
 
@@ -124,8 +120,6 @@ int config_strarr_len(const config_data_t *, config_strarr_names_t);
 
 const config_strlist_t * config_strlist(const config_data_t *,
 					config_strlist_names_t);
-
-const config_dir_t * config_treeval(const config_data_t *, config_tree_names_t);
 
 const config_acl_t * config_aclval(const config_data_t *, config_acl_names_t);
 
@@ -164,10 +158,6 @@ extern FILE * config_copy_file;
 /* start of variable part of copy file, if it has been opened by config_init */
 
 extern long config_copy_start;
-
-/* free a single directory tree */
-
-void config_dir_free(config_dir_t *);
 
 /* print current configuration to a file */
 
