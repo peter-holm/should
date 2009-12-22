@@ -894,11 +894,11 @@ static void rename_watch(EVENT * evp, notify_watch_t * evw,
     /* do we need to update our watch data? */
     int evlen = strlen(evp->name);
     int evh = name_hash(evp->name, evlen);
+    int destlen = strlen(destp->name);
+    int desth = name_hash(destp->name, destlen);
     notify_watch_t * evx;
 #if USE_SHOULDBOX
-    int destlen = strlen(destp->name);
     notify_watch_t * destx;
-    int desth = name_hash(destp->name, destlen);
 #endif
     // XXX if evw->how->exclude excludes the new name, remove the
     // XXX watch instead of renaming it
@@ -935,12 +935,11 @@ static void rename_watch(EVENT * evp, notify_watch_t * evw,
     }
 #endif
     /* to finish the rename, overwrite the name and change parent */
-    if (evw != destw) {
-	orphan_watch(evx);
-	adopt_watch(destw, evx);
-    }
+    orphan_watch(evx);
+    evx->name_hash = desth;
     strncpy(evx->name, destp->name, destlen);
     evx->name_length = destlen;
+    adopt_watch(destw, evx);
 }
 #endif
 
