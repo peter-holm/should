@@ -69,6 +69,10 @@
 #define MAXPATHCOM 256
 #define NAME_LIMIT sizeof(char *)
 
+#if ! defined NAME_MAX && defined MAXNAMLEN
+#define NAME_MAX MAXNAMLEN
+#endif
+
 /* used to store one queue allocation block */
 typedef struct queue_block_s queue_block_t;
 struct queue_block_s {
@@ -97,12 +101,11 @@ struct notify_watch_s {
     watch_block_t * block_ptr;
     ino_t inode;
     dev_t device;
-    int forward;
     int watch_id;
     int locked;
     int name_length;
     int name_hash;
-    char name[0];
+    char name[NAME_MAX];
 };
 
 /* used to store a block of watches */
@@ -110,7 +113,6 @@ struct notify_watch_s {
 struct watch_block_s {
     watch_block_t * next, * prev;
     int used;
-    int unused;
     notify_watch_t w[0];
 };
 
@@ -267,19 +269,14 @@ static const char * initialise_queue(const config_data_t * cfg) {
 
 /* allocates space for one watch block */
 
-static watch_block_t * allocate_watch_block(int leave) {
+static watch_block_t * allocate_watch_block(void) {
     watch_block_t * b = mymalloc(sizeof(watch_block_t) +
 				 notify_watch_block * sizeof(notify_watch_t));
+    int i;
     if (! b)
 	return NULL;
-    if (leave < notify_watch_block) {
-	b->unused = leave;
-	b->w[leave].forward = -1;
-	b->w[leave].name_length = notify_watch_block - leave;
-    } else {
-	b->unused = -1;
-    }
-    b->used = -1;
+    for (i = 0; i < notify_watch_block; i++)
+	b->w[i].locked = -1;
     b->next = all_watches;
     b->prev = NULL;
     if (all_watches) all_watches->prev = b;
@@ -370,9 +367,7 @@ static inline notify_watch_t * store_watch(dev_t device, ino_t inode,
     wb->w[offset].inode = inode;
     wb->w[offset].block_ptr = wb;
     wb->w[offset].next_by_id = NULL;
-    wb->w[offset].forward = wb->used;
     wb->w[offset].locked = 0;
-    wb->used = offset;
     if (how) {
 	wb->w[offset].how = copy_how(how);
 	if (! wb->w[offset].how)
@@ -397,12 +392,6 @@ static inline notify_watch_t * store_watch(dev_t device, ino_t inode,
     return &wb->w[offset];
 }
 
-/* number of blocks we need to allocate to a watch, based on the name length */
-
-static int watch_size(int len) {
-    return 1 + ((len + sizeof(notify_watch_t) - 1) / sizeof(notify_watch_t));
-}
-
 /* find watch given its dev/inode, optionally allocates space for it */
 
 static notify_watch_t * find_watch_by_inode(dev_t device, ino_t inode,
@@ -413,7 +402,7 @@ static notify_watch_t * find_watch_by_inode(dev_t device, ino_t inode,
     watch_by_device_t * wbdev = dev_to_watch;
     notify_watch_t * nw;
     watch_block_t * wb;
-    int hash = inode % WATCH_HASH, len, blocks, j;
+    int hash = inode % WATCH_HASH, len, j;
     while (wbdev && wbdev->device != device) wbdev = wbdev->next;
     if (! wbdev) {
 	/* device not found, add it? */
@@ -436,51 +425,22 @@ static notify_watch_t * find_watch_by_inode(dev_t device, ino_t inode,
     if (! name) return NULL;
     /* first look for something with the exact space */
     len = strlen(name);
-    blocks = watch_size(len);
-    if (blocks > notify_watch_block) {
+    if (len > NAME_MAX) {
 	errno = ENAMETOOLONG;
 	return NULL;
     }
     wb = all_watches;
     while (wb) {
-	int u = wb->unused, p = -1;
-	while (u >= 0) {
-	    int nl = wb->w[u].name_length;
-	    if (nl == blocks) {
-		/* use this */
-		if (p < 0)
-		    wb->unused = wb->w[u].forward;
-		else
-		    wb->w[p].forward = wb->w[u].forward;
+	int bn;
+	for (bn = 0; bn < notify_watch_block; bn++) {
+	    if (wb->w[bn].locked < 0)
 		return store_watch(device, inode, name, len,
-				   parent, wb, u, how, wbdev);
-	    }
-	    p = u;
-	    u = wb->w[u].forward;
-	}
-	wb = wb->next;
-    }
-    /* look for an unused area at least 2 blocks longer than we need, resize
-     * it and use part of it (a * gap of a single block cannot be used, so
-     * we need to leave at least 2 blocks after resizing) */
-    wb = all_watches;
-    while (wb) {
-	int u = wb->unused;
-	while (u >= 0) {
-	    int nl = wb->w[u].name_length;
-	    if (nl > blocks + 1) {
-		/* resize this and use the end */
-		wb->w[u].name_length -= blocks;
-		u += wb->w[u].name_length;
-		return store_watch(device, inode, name, len,
-				   parent, wb, u, how, wbdev);
-	    }
-	    u = wb->w[u].forward;
+				   parent, wb, bn, how, wbdev);
 	}
 	wb = wb->next;
     }
     /* need to allocate a new block */
-    wb = allocate_watch_block(blocks);
+    wb = allocate_watch_block();
     if (! wb) return NULL;
     return store_watch(device, inode, name, len, parent, wb, 0, how, wbdev);
 }
@@ -769,13 +729,20 @@ static void rm_inode(notify_watch_t * wp) {
 /* deallocates a watch and its descendents */
 
 static void deallocate_watch(notify_watch_t * wp, int rmroot) {
-    int i, p, ub[notify_watch_block], blocks;
-    watch_block_t * wb;
+    int i;
     for (i = 0; i < NAME_HASH; i++)
 	while (wp->subdir[i])
 	    deallocate_watch(wp->subdir[i], rmroot);
     if (wp->locked && ! rmroot)
 	return;
+#if USE_SHOULDBOX
+    if (wp->locked < 0) {
+	main_shouldbox++;
+	error_report(error_shouldbox_int, "deallocate_watch",
+		     "locked", wp->locked);
+	return;
+    }
+#endif
     orphan_watch(wp);
 #if USE_SHOULDBOX
     if (watch_count < 1) {
@@ -787,48 +754,8 @@ static void deallocate_watch(notify_watch_t * wp, int rmroot) {
 #endif
     /* remove it from the inode index */
     rm_inode(wp);
-    /* and mark the containing block free */
-    wb = wp->block_ptr;
-    i = wb->used;
-    p = -1;
-    while (i >= 0) {
-	if (wp == &wb->w[i]) {
-	    if (p < 0)
-		wb->used = wp->forward;
-	    else
-		wb->w[p].forward = wp->forward;
-	    break;
-	}
-	p = i;
-	i = wb->w[i].forward;
-    }
-    /* mark this block as unused; we scan the unused list and make a list
-     * of unused blocks, then create a new unused list from that and remove
-     * any fragmentstion; it's only 32 elements per block anyway... */
-    for (i = 0; i < notify_watch_block; i++)
-	ub[i] = 0;
-    blocks = watch_size(wp->name_length);
-    p = wp - &wb->w[0];
-    for (i = 0; i < blocks; i++)
-	ub[p + i] = 1;
-    p = wb->unused;
-    while (p >= 0) {
-	blocks = wb->w[p].name_length;
-	for (i = 0; i < blocks; i++)
-	    ub[p + i] = 1;
-	p = wb->w[p].forward;
-    }
-    p = -1;
-    for (i = 0; i < notify_watch_block; i++) {
-	int j;
-	if (! ub[i]) continue;
-	for (j = i; j < notify_watch_block && ub[j]; j++) ;
-	wb->w[i].forward = p;
-	wb->w[i].name_length = j - i;
-	p = i;
-	i = j - 1;
-    }
-    wb->unused = p;
+    /* mark the watch unused */
+    wp->locked = -1;
     /* if it is an active watch, remove it */
     if (wp->watch_id >= 0) {
 	int watch_id = wp->watch_id;
@@ -861,26 +788,21 @@ static void deallocate_watch_blocks(void) {
 /* deallocate buffers and memory structures */
 
 static void deallocate_buffers(void) {
-    watch_block_t * wb;
-    watch_by_device_t * wd;
     if (root_watch)
 	deallocate_watch(root_watch, 1);
-    wb = all_watches;
-    while (wb) {
-	int i;
-	watch_block_t * this = wb;
-	wb = wb->next;
-	i = this->used;
-	while (i >= 0) {
-	    deallocate_watch(&this->w[i], 1);
-	    i = this->w[i].forward;
-	}
-    }
-    wd = dev_to_watch;
-    while (wd) {
-	watch_by_device_t * g = wd;
-	wd = wd->next;
+    while (dev_to_watch) {
+	watch_by_device_t * g = dev_to_watch;
+	dev_to_watch = dev_to_watch->next;
 	myfree(g);
+    }
+    while (all_watches) {
+	int i;
+	watch_block_t * this = all_watches;
+	all_watches = all_watches->next;
+	for (i = 0; i < notify_watch_block; i++)
+	    if (this->w[i].locked >= 0)
+		deallocate_watch(&this->w[i], 1);
+	myfree(this);
     }
     if (event_buffer)
 	myfree(event_buffer);
@@ -889,7 +811,6 @@ static void deallocate_buffers(void) {
     inotify_fd = -1;
 #endif
     deallocate_queue();
-    deallocate_watch_blocks();
 }
 
 /* initialisation required before the notify thread starts;
@@ -971,7 +892,7 @@ static void rename_watch(EVENT * evp, notify_watch_t * evw,
 			 EVENT * destp, notify_watch_t * destw)
 {
     /* do we need to update our watch data? */
-    int evlen = strlen(evp->name), evblocks, destblocks;
+    int evlen = strlen(evp->name);
     int evh = name_hash(evp->name, evlen);
     notify_watch_t * evx;
 #if USE_SHOULDBOX
@@ -996,6 +917,8 @@ static void rename_watch(EVENT * evp, notify_watch_t * evw,
 	error_report(error_rename_unknown, evp->name);
 	return;
     }
+    if (destlen > NAME_MAX)
+	return;
     /* we shouldn't(TM) find a watch for the destination, but if there is
      * one we get rid of it */
     destx = destw->subdir[desth];
@@ -1011,40 +934,13 @@ static void rename_watch(EVENT * evp, notify_watch_t * evw,
 	destx = destx->sibling;
     }
 #endif
-    evblocks = watch_size(evlen);
-    destblocks = watch_size(destlen);
-    if (evblocks != destblocks) {
-	/* we'll need to allocate new space; to do this we first remove
-	 * the watch from the inode index, then allocate it again (by
-	 * inode) and finally deallocate the old watch; yes, it is
-	 * messy, but directory renames are officially messy: see for
-	 * example this comment in the Linux 2.6.30 kernel sources
-	 * (fs/namei.c):
-	 *     The worst of all namespace operations - renaming directory.
-	 *     "Perverted" doesn't even start to describe it. Somebody in
-	 *     UCB had a heck of a trip... */
-	int watch_id = evx->watch_id;
-	notify_watch_t * neww;
-	rm_inode(evx);
-	remove_watch_id(evx);
+    /* to finish the rename, overwrite the name and change parent */
+    if (evw != destw) {
 	orphan_watch(evx);
-	neww = find_watch_by_inode(evx->device, evx->inode, destp->name,
-				   destw, evx->how);
-	if (! neww) {
-	    RMWATCH(watch_id);
-	    return;
-	}
-	set_watch_id(neww, watch_id);
-	deallocate_watch(evx, 1);
-    } else {
-	/* easy case: just overwrite the name and change parent */
-	if (evw != destw) {
-	    orphan_watch(evx);
-	    adopt_watch(destw, evx);
-	}
-	strncpy(evx->name, destp->name, destlen);
-	evx->name_length = destlen;
+	adopt_watch(destw, evx);
     }
+    strncpy(evx->name, destp->name, destlen);
+    evx->name_length = destlen;
 }
 #endif
 

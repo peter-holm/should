@@ -1,4 +1,6 @@
 TODO for 1.0.-2:
+* Sometimes the copy does not adjust timestamps; it may be a create(A)
+  followed by rename(A, B) which does not take the timestamp from the rename
 * have a separate lock for watch structure, without using the queue lock;
   must be careful of deadlocks as some code will need to lock both
 * dev_t can be 64 bits (in Linux) and ino_t can be 64 bits (in BSD); find
