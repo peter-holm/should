@@ -148,7 +148,7 @@ $defines"
 	echo "gcc $LDFLAGS $ldflags"
 	echo
 	cat "$TMP/stderr"
-	exit 1
+	return 1
     fi
 }
 
@@ -162,6 +162,7 @@ check_extra -Wall -Wall '' '' stdlib 'int ptr=1'
 check_extra -O2 -O2 '' '' stdlib 'int ptr=1'
 check_extra -g -g '' '' stdlib 'int ptr=1'
 check_extra -Werror -Werror '' '' stdlib 'int ptr=1'
+check_extra -Wno-unused-but-set-variable -Wno-unused-but-set-variable '' '' stdlib 'int ptr=1'
 
 # see if gcc recognises -R; if it does, it may not work without it
 
