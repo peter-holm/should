@@ -291,6 +291,7 @@ static int rmtree(const char * dname) {
     return rmdir(dname);
 }
 
+#if THEY_HAVE_LIBRSYNC
 static rs_result getdata(rs_job_t * rs_job, rs_buffers_t * buf, void * _p) {
     data_t * data = _p;
     ssize_t nr;
@@ -363,7 +364,9 @@ static rs_result getdata(rs_job_t * rs_job, rs_buffers_t * buf, void * _p) {
     }
     return RS_INTERNAL_ERROR;
 }
+#endif
 
+#if THEY_HAVE_LIBRSYNC
 static rs_result putdata(rs_job_t * rs_job, rs_buffers_t * buf, void * _p) {
     data_t * data = _p;
     int ds;
@@ -430,7 +433,9 @@ static rs_result putdata(rs_job_t * rs_job, rs_buffers_t * buf, void * _p) {
     buf->avail_out = DATA_BLOCKSIZE;
     return RS_DONE;
 }
+#endif
 
+#if THEY_HAVE_LIBRSYNC
 static rs_result getfrom(void * _p, rs_long_t pos, size_t * len, void ** dst) {
     from_t * from = _p;
     if (pos >= from->maplen) {
@@ -441,6 +446,7 @@ static rs_result getfrom(void * _p, rs_long_t pos, size_t * len, void ** dst) {
     *dst = from->pagemap + pos;
     return RS_DONE;
 }
+#endif
 
 static int copy_file_data(socket_t * p, int flen, const char * fname,
 			  const char * sname, const notify_event_t * ev,
@@ -474,7 +480,9 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 	    char * epagemap = NULL;
 	    char tempname[flen + 16], * dp = tempname, cmdbuff[64];
 	    char repl[REPLSIZE], data[DATA_BLOCKSIZE], ud[DATA_BLOCKSIZE];
+#if THEY_HAVE_LIBRSYNC
 	    char wdata[DATA_BLOCKSIZE];
+#endif
 	    /* create parent dir and open temporary file */
 	    sl = strrchr(fname, '/');
 	    if (sl) {

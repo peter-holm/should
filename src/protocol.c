@@ -47,7 +47,7 @@ const char * protocol_status_send(socket_t * p, const protocol_status_t * S) {
     if (! socket_puts(p, buffer)) \
 	return error_sys("protocol_status_send", "socket_puts");
 #define SEND_TIME(n, v) \
-    sprintf(buffer, "%s: %ld.%09ld", n, v.tv_sec, v.tv_nsec); \
+    sprintf(buffer, "%s: %lld.%09lld", n, (long long)v.tv_sec, (long long)v.tv_nsec); \
     if (! socket_puts(p, buffer)) \
 	return error_sys("protocol_status_send", "socket_puts");
     SEND_INT("server_mode", S->server_mode);
@@ -132,10 +132,13 @@ static int store_long(const char * line, const char * kw, long long * res) {
 static int store_time(const char * line, const char * kw,
 		      struct timespec * res)
 {
+    long long sec, nsec;
     line = store_kw(line, kw);
     if (! line) return 0;
-    if (sscanf(line, "%ld.%ld", &res->tv_sec, &res->tv_nsec) < 2)
+    if (sscanf(line, "%lld.%lld", &sec, &nsec) < 2)
 	return 0;
+    res->tv_sec = sec;
+    res->tv_nsec = nsec;
     if (res->tv_nsec < 1000L) {
 	/* older servers sent seconds.milliseconds */
 	const char * p = line;

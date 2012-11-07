@@ -1390,12 +1390,16 @@ const static command_t commands[] = {
 #if NOTIFY != NOTIFY_NONE
     { "REMOVE",       config_op_remove,   cm_server,  op_remove },
 #endif
+#if THEY_HAVE_LIBRSYNC
     { "RSYNC",        config_op_read,     cm_server,  op_rsync },
+#endif
     { "SETCHECKSUM",  config_op_read,     cm_server,  op_setchecksum },
 #if NOTIFY != NOTIFY_NONE
     { "SETROOT",      config_op_read,     cm_server,  op_setroot },
 #endif
+#if THEY_HAVE_LIBRSYNC
     { "SIGNATURE",    config_op_read,     cm_server,  op_signature },
+#endif
     { "STAT",         config_op_read,     cm_server,  op_stat },
     { "STATFS",       config_op_read,     cm_server,  op_statfs },
     { "STATUS",       config_op_status,   cm_any,     op_status },
