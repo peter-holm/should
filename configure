@@ -121,7 +121,7 @@ int main(int argc, char *argv[]) {
 EOF
     exec 2>"$TMP/stderr"
     if gcc $CFLAGS $cflags $xcflags -c -o "$TMP/test.o" "$TMP/test.c" && \
-       gcc $LDFLAGS $ldflags -o "$TMP/test" "$TMP/test.o" && \
+       gcc $LDFLAGS $ldflags -o "$TMP/test" "$TMP/test.o" $LDFLAGS $ldflags && \
        [ "`"$TMP/test" a b c d`" = 5 ]
     then
 	[ "$defines" != '' ] && DEFINES="$DEFINES
@@ -199,8 +199,8 @@ check_lib () {
     return 0
 }
 
-check_lib /usr/local/lib64 || check_lib /usr/local/lib
-check_lib /usr/pkg/lib64   || check_lib /usr/pkg/lib
+check_lib /usr/local/lib64          || check_lib /usr/local/lib
+check_lib /usr/pkg/lib64            || check_lib /usr/pkg/lib
 
 echo
 echo "Finding dirent.h"
@@ -235,6 +235,8 @@ echo
 echo "Checking for extra libraries"
 check_extra librt "" -lrt '' pthread 'pthread_t ptr = pthread_self()'
 if check_extra openssl '' -lssl '#define THEY_HAVE_SSL 1' \
+	       openssl/rand 'unsigned char b; int ptr = RAND_bytes(&b, 1)' || \
+   check_extra openssl+crypto '' -lcrypto '#define THEY_HAVE_SSL 1' \
 	       openssl/rand 'unsigned char b; int ptr = RAND_bytes(&b, 1)'
 then
     check_extra md5 '' '' '#define THEY_HAVE_MD5 1' openssl/md5 \

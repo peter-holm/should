@@ -738,6 +738,7 @@ socket_t * socket_accept(socket_t * p, int timeout) {
 
 /* make sure we do have a username and password */
 
+#ifdef THEY_HAVE_SSL
 static int get_user(socket_t * p, const config_data_t * cfg) {
     static char ubuffer[AUXSIZE], pbuffer[AUXSIZE];
     const char * user, * pass, * server;
@@ -783,6 +784,7 @@ static int get_user(socket_t * p, const config_data_t * cfg) {
 	return 0;
     return 1;
 }
+#endif
 
 /* open a tunnel to another copy of should somewhere */
 
