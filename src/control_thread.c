@@ -755,7 +755,7 @@ static const char * op_dirsync(char * lptr, state_t * state) {
     if (namelen < 1)
 	return "EINVAL Invalid name";
     path = mymalloc(1 + namelen);
-    if (! path) {
+    if (! path)
 	return error_sys_r(state->cblock, DATA_BLOCKSIZE, "DIRSYNC", "malloc");
     if (! socket_get(state->p, path, namelen)) {
 	const char * rep = error_sys_r(state->cblock, DATA_BLOCKSIZE,
@@ -768,7 +768,6 @@ static const char * op_dirsync(char * lptr, state_t * state) {
     myfree(path);
     if (ok)
 	return "OK scheduled";
-    }
     return error_sys_r(state->cblock, DATA_BLOCKSIZE,
 		      "DIRSYNC", "schedule_dirsync");
 }

@@ -3555,6 +3555,10 @@ static const char * parsearg(const char * line, locfl_t * locfl, int is_initial)
 		configs[cn].intval[cfg_flags] &= ~config_flag_use_librsync;
 		return NULL;
 	    }
+	    if (strcmp(line, "do_initial_dirsync") == 0) {
+		configs[cn].intval[cfg_flags] |= config_flag_initial_dirsync;
+		return NULL;
+	    }
 	    if (assign_user(line, "disallow_unix", 0, 0, &udata, &err) ||
 		assign_user(line, "disallow_local", 0, 0, &udata, &err) ||
 		assign_user(line, "disallow_tcp", 1, 0, &udata, &err))
