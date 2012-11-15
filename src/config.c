@@ -173,6 +173,7 @@ static const int default_ints[cfg_int_COUNT] = {
     [cfg_optimise_client]          = 128,
     [cfg_optimise_buffer]          = 262144,
     [cfg_dirsync_interval]         = 0,
+    [cfg_dirsync_deadline]         = 10,
 };
 
 FILE * config_copy_file = NULL;
@@ -1749,6 +1750,11 @@ int config_store_copy(int fnum, int fpos, const char * user, const char * pass)
 		     config_print_unit(config_intervals,
 			configs[currnum].intval[cfg_dirsync_interval])))
 	goto problem_c;
+    if (configs[currnum]. intval[cfg_dirsync_deadline] > 0 &&
+	! sendformat(sendout, CF, "dirsync_deadline = %s",
+		     config_print_unit(config_intervals,
+			configs[currnum].intval[cfg_dirsync_deadline])))
+	goto problem_c;
     if (! sendformat(sendout, CF, "bwlimit = %d",
 		     configs[currnum].intval[cfg_bwlimit]))
 	goto problem_c;
@@ -2189,6 +2195,15 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
 		    configs[cn].intval[cfg_dirsync_interval]));
     } else {
 	p(arg, "#dirsync_interval = 2 hours");
+    }
+    p(arg, "");
+    p(arg, "# Max time we allow a scheduled dirsync to remain in the queue?");
+    if (configs[cn].intval[cfg_dirsync_deadline] > 0) {
+	sendformat(p, arg, "dirsync_deadline = %s",
+		   config_print_unit(config_intervals,
+		    configs[cn].intval[cfg_dirsync_deadline]));
+    } else {
+	p(arg, "#dirsync_deadline = 1 minute");
     }
     p(arg, "");
     p(arg, "# Do we do a timed dirsync?");
@@ -3438,6 +3453,9 @@ static const char * parsearg(const char * line, locfl_t * locfl, int is_initial)
 	case 'd' :
 	    if (assign_unit(line, "dirsync_interval", config_intervals,
 			    &configs[cn].intval[cfg_dirsync_interval], &err))
+		return err;
+	    if (assign_unit(line, "dirsync_deadline", config_intervals,
+			    &configs[cn].intval[cfg_dirsync_deadline], &err))
 		return err;
 	    st = NULL;
 	    if (assign_string(line, "dirsync_timed", assign_none,

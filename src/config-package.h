@@ -145,6 +145,8 @@ typedef enum {
     cfg_optimise_buffer,          /* buffer allocated by the client to optimise
 				   * events received from server. */
     cfg_dirsync_interval,         /* frequency of periodic dirsyncs, 0=never */
+    cfg_dirsync_deadline,         /* max time in seconds we allow a scheduled
+                                   * dirsync to remain in the queue */
     cfg_int_COUNT,                /* number of integer elements */
     cfg_event_COUNT = cfg_flags,  /* end of filter */
     cfg_event_all = (1 << cfg_event_COUNT) - 1

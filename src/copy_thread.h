@@ -74,7 +74,7 @@ void copy_status(copy_status_t *);
 
 /* schedules an immediate dirsync of server:from/path to client:to/path */
 
-int copy_dirsync(const char * reason, const char * path);
+int copy_dirsync(const char * reason, const char * path, time_t deadline);
 
 /* time of the last full dirsync */
 

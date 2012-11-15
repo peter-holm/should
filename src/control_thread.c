@@ -751,7 +751,10 @@ static const char * op_delta(char * lptr, state_t * state) {
 
 static const char * op_dirsync(char * lptr, state_t * state) {
     char * path;
+    const config_data_t * cfg = config_get();
     int ok, namelen = atoi(lptr);
+    time_t deadline = config_intval(cfg, cfg_dirsync_deadline);
+    config_put(cfg);
     if (namelen < 1)
 	return "EINVAL Invalid name";
     path = mymalloc(1 + namelen);
@@ -764,7 +767,8 @@ static const char * op_dirsync(char * lptr, state_t * state) {
 	return rep;
     }
     path[namelen] = 0;
-    ok = copy_dirsync("user", path);
+    if (deadline > 0) deadline += time(NULL);
+    ok = copy_dirsync("user", path, deadline);
     myfree(path);
     if (ok)
 	return "OK scheduled";
@@ -1575,6 +1579,7 @@ const char * control_thread(void) {
 	    /* see if we need to schedule dirsyncs */
 	    time_t ld = copy_last_dirsync(), now = time(NULL);
 	    const config_data_t * cfg = config_get();
+	    time_t deadline = config_intval(cfg, cfg_dirsync_deadline);
 	    int interval = config_intval(cfg, cfg_dirsync_interval);
 	    const char * do_one = NULL;
 	    /* for periodic rsyncs, check that we haven't done one in
@@ -1619,8 +1624,10 @@ const char * control_thread(void) {
 		}
 	    }
 	    config_put(cfg);
-	    if (do_one)
-		copy_dirsync(do_one, "");
+	    if (do_one) {
+		if (deadline > 0) deadline += now;
+		copy_dirsync(do_one, "", deadline);
+	    }
 	}
 	p = socket_accept(server, POLL_TIME);
 	if (! p) {

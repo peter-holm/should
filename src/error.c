@@ -553,6 +553,18 @@ static deferr_t deferr[error_MAX] = {
 	.argtype  = { arg_string, arg_string, arg_void, arg_void, arg_void },
 	.name     = "info_sched_dirsync",
     },
+    [info_start_dirsync] = {
+	.level    = error_level_info,
+	.defmsg   = "starting dirsync \"%s\"",
+	.argtype  = { arg_string, arg_void, arg_void, arg_void, arg_void },
+	.name     = "info_start_dirsync",
+    },
+    [info_end_dirsync] = {
+	.level    = error_level_info,
+	.defmsg   = "ending dirsync \"%s\": %s copied, %s deleted, %s subdirs",
+	.argtype  = { arg_string, arg_int, arg_int, arg_int, arg_void },
+	.name     = "info_end_dirsync",
+    },
 };
 
 /* prepares for error reports */

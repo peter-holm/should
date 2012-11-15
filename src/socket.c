@@ -1145,6 +1145,8 @@ socket_t * socket_connect(void) {
 	if (p->w_fd >= 0 && p->w_fd != p->r_fd) close(p->w_fd);
 	if (p->pid >= 0) waitpid(p->pid, &ws, 0);
 	if (p->r_fd >= 0) close(p->r_fd);
+	if (p->username) myfree(p->username);
+	if (p->password) myfree(p->password);
 	myfree(p);
 	config_put(cfg);
 	errno = e;

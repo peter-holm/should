@@ -139,6 +139,8 @@ typedef enum {
     info_replication_delete,  /* const char * */
     info_replication_rename,  /* const char *, const char * */
     info_sched_dirsync,       /* const char *, const char * */
+    info_start_dirsync,       /* const char * */
+    info_end_dirsync,         /* const char *, int, int, int */
     error_MAX
 } error_message_t;
 
