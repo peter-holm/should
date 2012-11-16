@@ -167,7 +167,8 @@ typedef enum {
     error_level_info,                /* informational */
     error_level_warn,                /* warning */
     error_level_err,                 /* error */
-    error_level_crit                 /* critical */
+    error_level_crit,                /* critical */
+    error_level_all                  /* all of the above */
 } error_level_t;
 
 /* get an error code from its name */

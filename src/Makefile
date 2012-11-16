@@ -31,7 +31,7 @@ PROGRAMS = should
 
 all : depend $(OBJECTS) $(THREADS) $(PROGRAMS)
 
-depend : *.c *.h ../Configure.make
+depend : *.c *.h ../Configure.make Makefile
 	$(CC) $(CFLAGS) -MM *.c > depend
 
 should : $(OBJECTS) $(THREADS)

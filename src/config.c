@@ -877,6 +877,7 @@ static error_message_t assign_error(const char * line, const char * keyword,
     while (line[namelen] &&
 	   ! isspace((int)line[namelen]) && line[namelen] != '=')
 	namelen++;
+    if (byclass) *byclass = -1;
     erm = error_code(line, namelen);
     if (erm == error_MAX) {
 	int fail = 1;
@@ -896,6 +897,8 @@ static error_message_t assign_error(const char * line, const char * keyword,
 		*byclass = error_level_crit;
 	    else if (namelen == 8 && strncmp(line, "critical", 8) == 0)
 		*byclass = error_level_crit;
+	    else if (namelen == 3 && strncmp(line, "all", 3) == 0)
+		*byclass = error_level_all;
 	    else
 		fail = 1;
 	}
@@ -928,8 +931,7 @@ static error_message_t assign_error(const char * line, const char * keyword,
 	return error_invalid;
     }
     unquote_string(*result);
-    *err = NULL;;
-    if (*byclass) *byclass = -1;
+    *err = NULL;
     return erm;
 }
 
@@ -3766,6 +3768,9 @@ static const char * parsearg(const char * line, locfl_t * locfl, int is_initial)
 		myfree(st);
 		if (elv < 0)
 		    configs[cn].errdata[erm].dest = dest;
+		else if (elv >= error_level_all)
+		    for (erm = 0; erm < error_MAX; erm++)
+			configs[cn].errdata[erm].dest = dest;
 		else
 		    for (erm = 0; erm < error_MAX; erm++)
 			if (error_level(erm) == elv)
@@ -4486,7 +4491,8 @@ int config_init(int argc, char *argv[]) {
 	goto fail;
     /* if not detaching, send all messages to stderr unless they specified
      * a different destination */
-    ed = configs[currnum].intval[cfg_client_mode] ||
+    ed = (configs[currnum].intval[cfg_client_mode] &&
+	  ! (configs[currnum].intval[cfg_client_mode] & config_client_copy)) ||
 	 ! (configs[currnum].intval[cfg_server_mode] & config_server_detach)
        ? error_dest_stderr
        : error_dest_file;
@@ -4520,6 +4526,7 @@ int config_init(int argc, char *argv[]) {
 			LOG_LOCAL0 | LOG_ERR;
 		    break;
 		case error_level_crit :
+		case error_level_all :
 		    configs[currnum].errdata[em].facility =
 			LOG_LOCAL0 | LOG_CRIT;
 		    break;

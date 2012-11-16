@@ -1,0 +1,10 @@
+Configure.make
+perl/MYMETA.json
+perl/MYMETA.yml
+perl/Makefile
+perl/blib/
+perl/pm_to_blib
+src/*.o
+src/configure.h
+src/depend
+src/should
