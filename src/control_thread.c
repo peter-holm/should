@@ -377,18 +377,22 @@ static inline char * get_block(state_t * state,
 {
     ssize_t nr;
     if (*size < 1) return state->ublock;
-    if (state->block_start >= 0 && state->block_size >= 0) {
+#if 0 /* this doesn't work as advertised */
+    if (state->block_start >= 0 && state->block_size > 0)
 	if (state->block_start <= start &&
 	    state->block_start + state->block_size >= start + *size)
 		return state->ublock + (start - state->block_start);
-    }
+#endif
     if (lseek(state->rfd, (off_t)start, SEEK_SET) < 0)
 	return NULL;
     if (*size > DATA_BLOCKSIZE)
 	*size = DATA_BLOCKSIZE;
     nr = read(state->rfd, state->ublock, *size);
-    if (nr < 0)
+    if (nr < 0) {
+	state->block_size = 0;
+	state->block_start = -1;
 	return NULL;
+    }
     *size = state->block_size = nr;
     state->block_start = start;
     return state->ublock;
@@ -916,6 +920,7 @@ static const char * op_getdir(char * lptr, state_t * state) {
     state->cblock[len] = 0;
     dp = opendir(state->cblock);
     if (! dp) {
+	state->block_start = state->block_size = -1;
 	strcpy(state->ublock, state->cblock);
 	return error_sys_r(state->cblock, DATA_BLOCKSIZE,
 			   "GETDIR", state->ublock);

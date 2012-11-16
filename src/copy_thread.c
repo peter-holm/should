@@ -496,8 +496,6 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 		}
 		if (! mkpath(tempname)) {
 		    error_report(error_copy_sys, tempname, errno);
-		    if (must_close)
-			client_send_command(p, "CLOSEFILE", NULL, NULL);
 		    return 1;
 		}
 		*dp++ = '/';
@@ -671,8 +669,8 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 			for (i = 0; i < digest_size; i++)
 			    if (lhash[i] != rhash[i])
 				goto no_data;
-			/* OK, we have some data, copy it from the original
-			 * file, then go and try another block */
+			/* Block is unchanged from original file, so
+			 * copy it locally */
 			dp = epagemap + done;
 			while (eblock > 0) {
 			    ssize_t nw = write(ffd, dp, eblock);
@@ -686,6 +684,8 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 			continue;
 		    }
 		no_data:
+		    /* we don't have the data locally, so copy it over
+		     * the network */
 		    sprintf(cmdbuff, "DATA %lld %lld", done, block);
 		    if (! client_send_command(p, cmdbuff, NULL, repl))
 			goto error_tempname_noreport;
@@ -762,7 +762,7 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 						    : unlink(fname);
 		if (rename(tempname, fname) < 0)
 		    goto error_tempname;
-		if (ev->file_size > 0)
+		if (must_close)
 		    if (! client_send_command(p, "CLOSEFILE", NULL, NULL))
 			return 1;
 		return 2;
@@ -840,21 +840,21 @@ static int copy_file_data(socket_t * p, int flen, const char * fname,
 	    return 1;
     }
     return 1;
-    error_fname:
+error_fname:
     error_report(error_copy_sys, fname, errno);
-    return 1;
+    return 0;
 }
 
 /* copy a single file from the server; from is the path on the server, to
-* is the path on the client; if tr_ids is nonzero the server will look up
-* user and group IDs and send them as strings, and the client will translate
-* them back to IDs, if tr_ids is 0 the IDs are copied untranslated;
-* if compression is nonnegative it identifies a compression method to
-* use to copy the file data; if checksum is nonnegative it identifies a
-* checksum method to use to avoid copying data already present in the client;
-* both compression and checksum must have already been set up on the server;
-* extcopy is an open pipe descriptor to the external copy program, or
-* leave closed to use the internal copy */
+ * is the path on the client; if tr_ids is nonzero the server will look up
+ * user and group IDs and send them as strings, and the client will translate
+ * them back to IDs, if tr_ids is 0 the IDs are copied untranslated;
+ * if compression is nonnegative it identifies a compression method to
+ * use to copy the file data; if checksum is nonnegative it identifies a
+ * checksum method to use to avoid copying data already present in the client;
+ * both compression and checksum must have already been set up on the server;
+ * extcopy is an open pipe descriptor to the external copy program, or
+ * leave closed to use the internal copy */
 
 void copy_file(socket_t * p, const char * from, const char * to, int tr_ids,
 	   int compression, int checksum, pipe_t * extcopy,
@@ -1021,17 +1021,26 @@ static int cp(const config_data_t * cfg, const notify_event_t * ev,
 	    if ((ev->file_user != sbuff.st_uid ||
 		 ev->file_group != sbuff.st_gid) &&
 		lchown(fname, ev->file_user, ev->file_group) < 0)
-		    goto error_fname;
+	    {
+		error_report(error_copy_sys, fname, errno);
+		/* continue after error, try updating mode and mtime */
+	    }
 	    if ((sbuff.st_mode & 07777) != ev->file_mode &&
 		! S_ISLNK(sbuff.st_mode) &&
 		chmod(fname, ev->file_mode) < 0)
-		    goto error_fname;
+	    {
+		error_report(error_copy_sys, fname, errno);
+		/* continue after error, try updating mtime */
+	    }
 	    if (ev->file_mtime != sbuff.st_mtime) {
 		struct utimbuf timbuf;
 		timbuf.actime = sbuff.st_atime;
 		timbuf.modtime = ev->file_mtime;
-		if (utime(fname, &timbuf) < 0)
+		if (utime(fname, &timbuf) < 0) {
 		    goto error_fname;
+		    error_report(error_copy_sys, fname, errno);
+		    /* continue after error */
+		}
 	    }
 	    if (changed) (*changed)++;
 	    return 1;

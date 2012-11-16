@@ -33,7 +33,6 @@ TODO for 1.0.-2:
   a result of replication from the remote server.
 * review and test initscripts
 * review and test extra fork and cleanup
-* review and test dirsync mechanism
 * review and test timed / periodic dirsync
 
 Possible future improvements:
