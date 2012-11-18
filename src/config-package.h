@@ -36,21 +36,21 @@ typedef enum {
     config_client_watches       = 0x0000080,
     config_client_setup         = 0x0000100,
     config_client_copy          = 0x0000200,
-    config_client_peek          = 0x0000400,
-    config_client_config        = 0x0000800,
-    config_client_purge         = 0x0001000,
-    config_client_listcompress  = 0x0002000,
-    config_client_listchecksum  = 0x0004000,
-    config_client_telnet        = 0x0008000,
-    config_client_version       = 0x0010000,
-    config_client_ls            = 0x0020000,
-    config_client_cp            = 0x0040000,
-    config_client_df            = 0x0080000,
-    config_client_getpid        = 0x0100000,
-    config_client_setdebug      = 0x0200000,
-    config_client_cleardebug    = 0x0400000,
-    config_client_update        = 0x0800000,
-    config_client_dirsync       = 0x1000000,
+    config_client_config        = 0x0000400,
+    config_client_purge         = 0x0000800,
+    config_client_listcompress  = 0x0001000,
+    config_client_listchecksum  = 0x0002000,
+    config_client_telnet        = 0x0004000,
+    config_client_version       = 0x0008000,
+    config_client_ls            = 0x0010000,
+    config_client_cp            = 0x0020000,
+    config_client_df            = 0x0040000,
+    config_client_getpid        = 0x0080000,
+    config_client_setdebug      = 0x0100000,
+    config_client_cleardebug    = 0x0200000,
+    config_client_update        = 0x0400000,
+    config_client_dirsync       = 0x0800000,
+    config_client_rotatelog     = 0x1000000,
     config_client_NONE          = 0
 } config_client_t;
 
@@ -76,6 +76,8 @@ typedef enum {
     config_flag_socket_changed   = 0x00100,
     config_flag_use_librsync     = 0x00200,
     config_flag_extra_fork       = 0x00400,
+    config_flag_copy_peek        = 0x00800,
+    config_flag_copy_catchup     = 0x01000,
     config_flag_NONE             = 0
 } config_flags_t;
 
@@ -147,6 +149,8 @@ typedef enum {
     cfg_dirsync_interval,         /* frequency of periodic dirsyncs, 0=never */
     cfg_dirsync_deadline,         /* max time in seconds we allow a scheduled
                                    * dirsync to remain in the queue */
+    cfg_max_logfile_size,         /* max size of logfile before it is rotated */
+    cfg_max_logfile_count,        /* num of logfiles to keep after rotation */
     cfg_int_COUNT,                /* number of integer elements */
     cfg_event_COUNT = cfg_flags,  /* end of filter */
     cfg_event_all = (1 << cfg_event_COUNT) - 1

@@ -1878,22 +1878,27 @@ void copy_thread(void) {
 	? 1 : config_intval(cfg, cfg_optimise_client);
     int evbuff = config_intval(cfg, cfg_optimise_buffer) < 256
 	? 256 : config_intval(cfg, cfg_optimise_buffer);
-    int tr_ids = (config_intval(cfg, cfg_flags) & config_flag_translate_ids) ||
-		  config_copy_file == NULL;
-    int oneshot = config_intval(cfg, cfg_flags) & config_flag_copy_oneshot;
-    int init_ds = config_intval(cfg, cfg_flags) & config_flag_initial_dirsync;
+    int flags = config_intval(cfg, cfg_flags);
+    int tr_ids = flags & (config_flag_translate_ids|config_flag_copy_peek);
+    int do_peek = flags & config_flag_copy_peek;
+    int oneshot = flags & config_flag_copy_oneshot;
+    int init_ds = flags & config_flag_initial_dirsync;
+    int catchup = flags & config_flag_copy_catchup;;
     time_t deadline = config_intval(cfg, cfg_dirsync_deadline);
     int running = 1;
-    if (config_intval(cfg, cfg_client_mode) & config_client_copy) {
+    if (catchup) {
+	fnum = status.store.file_current;
+	fpos = status.store.file_pos;
+	if (oneshot) running = 0;
+	check_events = 0;
+    }
+    if (! do_peek) {
 	checksum = client_find_checksum(p, extensions);
 	compression = client_find_compress(p);
 	if (! client_setup_extcopy(&extcopy)) {
 	    perror("external_copy");
 	    goto out;
 	}
-    } else {
-	fnum = status.store.file_current;
-	fpos = status.store.file_pos;
     }
     config_put(cfg);
     if (! client_set_parameters(p))
@@ -1917,7 +1922,6 @@ void copy_thread(void) {
 	evresult_t cmdok;
 	struct timespec before, after;
 	cfg = config_get();
-	check_events = config_intval(cfg, cfg_checkpoint_events);
 	deadline = config_intval(cfg, cfg_dirsync_deadline);
 	config_put(cfg);
 	/* read first event */
@@ -1955,7 +1959,7 @@ void copy_thread(void) {
 	}
 	if (num_dirsyncs &&
 	    dirsync_deadline > 0 &&
-	    dirsync_deadline > time(NULL))
+	    dirsync_deadline >= time(NULL))
 	{
 	    /* we have been waiting too long */
 	    do_dirsync(compression, checksum, &extcopy);
@@ -1987,12 +1991,13 @@ void copy_thread(void) {
 	    int rv;
 	    check_events--;
 	    if (! valid[evnum]) continue;
-	    if (config_copy_file) {
+	    if (do_peek) {
+		store_printevent(&evlist[evnum], NULL, NULL);
+		continue;
+	    } else {
 		if (! cp(cfg, &evlist[evnum], compression, checksum,
 			 &extcopy, use_librsync, NULL))
 		    goto out;
-	    } else {
-		store_printevent(&evlist[evnum], NULL, NULL);
 	    }
 	    if (! config_copy_file) continue;
 	    if (check_events > 0) continue;
@@ -2032,7 +2037,7 @@ void copy_thread(void) {
 	error_report(info_signal_received, main_signal_seen);
     main_running = 0;
 out:
-    if (config_copy_file && (fnum != fnum_cp || fpos != fpos_cp))
+    if (! do_peek && (fnum != fnum_cp || fpos != fpos_cp))
 	fprintf(config_copy_file, "%d %d\n", fnum, fpos);
     pipe_close(&extcopy);
 }

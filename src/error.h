@@ -151,6 +151,11 @@ void error_report(error_message_t, ...);
 
 void error_closelog(void);
 
+/* rotate logfile; this can also be called by error_report if the logfile
+ * grows too big */
+
+void error_rotate(void);
+
 /* destination for an error message: OR one or more of the values */
 
 typedef enum {

@@ -988,6 +988,9 @@ int client_run(void) {
 	    d = d->next;
 	}
     }
+    if (cm & config_client_rotatelog)
+	if (! client_send_command(p, "ROTATELOG", NULL, NULL))
+	    goto out;
     if (cm & config_client_closelog)
 	if (! client_send_command(p, "CLOSELOG", NULL, NULL))
 	    goto out;

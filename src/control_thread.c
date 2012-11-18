@@ -42,6 +42,7 @@
 #include <sys/times.h>
 #include <string.h>
 #include <ctype.h>
+#include <poll.h>
 #if THEY_HAVE_LIBRSYNC
 #include <librsync.h>
 #endif
@@ -1087,6 +1088,11 @@ static const char * op_remove(char * lptr, state_t * state) {
 }
 #endif /* NOTIFY != NOTIFY_NONE */
 
+static const char * op_rotatelog(char * lptr, state_t * state) {
+    error_rotate();
+    return "OK rotated";
+}
+
 #if THEY_HAVE_LIBRSYNC
 static const char * op_rsync(char * lptr, state_t * state) {
     long long start, usize;
@@ -1349,72 +1355,73 @@ static const char * op_watches(char * lptr, state_t * state) {
 const static command_t commands[] = {
     /* keep commands grouped by letter and in upper case */
 #if NOTIFY != NOTIFY_NONE
-    { "ADD",          config_op_add,      cm_server,  op_add },
+    { "ADD",          config_op_add,       cm_server,  op_add },
 #endif
-    { "BWLIMIT",      config_op_read,     cm_server,  op_bwlimit },
-    { "CHECKSUM",     config_op_read,     cm_server,  op_checksum },
-    { "CLOSELOG",     config_op_closelog, cm_any,     op_closelog },
-    { "COMPRESS",     config_op_read,     cm_server,  op_compress },
-    { "CLOSEFILE",    config_op_read,     cm_server,  op_closefile },
-    { "CONFIG",       config_op_getconf,  cm_any,     op_config },
+    { "BWLIMIT",      config_op_read,      cm_server,  op_bwlimit },
+    { "CHECKSUM",     config_op_read,      cm_server,  op_checksum },
+    { "CLOSELOG",     config_op_closelog,  cm_any,     op_closelog },
+    { "COMPRESS",     config_op_read,      cm_server,  op_compress },
+    { "CLOSEFILE",    config_op_read,      cm_server,  op_closefile },
+    { "CONFIG",       config_op_getconf,   cm_any,     op_config },
 #if NOTIFY != NOTIFY_NONE
-    { "CROSS",        config_op_add,      cm_server,  op_cross },
+    { "CROSS",        config_op_add,       cm_server,  op_cross },
 #endif
-    { "DATA",         config_op_read,     cm_server,  op_data },
-    { "DEBUG",        config_op_debug,    cm_any,     op_debug },
+    { "DATA",         config_op_read,      cm_server,  op_data },
+    { "DEBUG",        config_op_debug,     cm_any,     op_debug },
 #if THEY_HAVE_LIBRSYNC
-    { "DELTA",        config_op_read,     cm_server,  op_delta },
+    { "DELTA",        config_op_read,      cm_server,  op_delta },
 #endif
-    { "DIRSYNC",      config_op_dirsync,  cm_copy,    op_dirsync },
+    { "DIRSYNC",      config_op_dirsync,   cm_copy,    op_dirsync },
 #if 0 // XXX ENCRYPT
-    { "ENCRYPT",      config_op_read,     cm_server,  op_encrypt },
+    { "ENCRYPT",      config_op_read,      cm_server,  op_encrypt },
 #endif
 #if NOTIFY != NOTIFY_NONE
-    { "EVBATCH",      config_op_read,     cm_server,  op_evbatch },
-    { "EVENT",        config_op_read,     cm_server,  op_event },
-    { "EXCL",         config_op_add,      cm_server,  op_excl },
+    { "EVBATCH",      config_op_read,      cm_server,  op_evbatch },
+    { "EVENT",        config_op_read,      cm_server,  op_event },
+    { "EXCL",         config_op_add,       cm_server,  op_excl },
 #endif
-    { "EXTENSIONS",   ~0,                 cm_any,     op_extensions },
+    { "EXTENSIONS",   ~0,                  cm_any,     op_extensions },
 #if NOTIFY != NOTIFY_NONE
-    { "FIND",         config_op_add,      cm_server,  op_find },
+    { "FIND",         config_op_add,       cm_server,  op_find },
 #endif
-    { "GETDIR",       config_op_read,     cm_server,  op_getdir },
+    { "GETDIR",       config_op_read,      cm_server,  op_getdir },
 #if 0 // XXX IGNORE
-    { "IGNORE",       config_op_ignore,   cm_server,  op_ignore },
+    { "IGNORE",       config_op_ignore,    cm_server,  op_ignore },
 #endif
     { "LISTCHECKSUM", config_op_read |
-		      config_op_getconf,  cm_server,  op_listchecksum },
+		      config_op_getconf,   cm_server,  op_listchecksum },
     { "LISTCOMPRESS", config_op_read |
-		      config_op_getconf,  cm_server,  op_listcompress },
+		      config_op_getconf,   cm_server,  op_listcompress },
 #if NOTIFY != NOTIFY_NONE
-    { "NOCROSS",      config_op_add,      cm_server,  op_nocross },
+    { "NOCROSS",      config_op_add,       cm_server,  op_nocross },
 #endif
-    { "NODEBUG",      config_op_debug,    cm_any,     op_nodebug },
-    { "OPEN",         config_op_read,     cm_server,  op_open },
+    { "NODEBUG",      config_op_debug,     cm_any,     op_nodebug },
+    { "OPEN",         config_op_read,      cm_server,  op_open },
 #if NOTIFY != NOTIFY_NONE
-    { "PURGE",        config_op_purge,    cm_server,  op_purge },
+    { "PURGE",        config_op_purge,     cm_server,  op_purge },
 #endif
-    { "QUIT",         ~0,                 cm_any,     op_quit },
+    { "QUIT",         ~0,                  cm_any,     op_quit },
 #if NOTIFY != NOTIFY_NONE
-    { "REMOVE",       config_op_remove,   cm_server,  op_remove },
+    { "REMOVE",       config_op_remove,    cm_server,  op_remove },
+#endif
+    { "ROTATELOG",    config_op_closelog,  cm_any,     op_rotatelog },
+#if THEY_HAVE_LIBRSYNC
+    { "RSYNC",        config_op_read,      cm_server,  op_rsync },
+#endif
+    { "SETCHECKSUM",  config_op_read,      cm_server,  op_setchecksum },
+#if NOTIFY != NOTIFY_NONE
+    { "SETROOT",      config_op_read,      cm_server,  op_setroot },
 #endif
 #if THEY_HAVE_LIBRSYNC
-    { "RSYNC",        config_op_read,     cm_server,  op_rsync },
+    { "SIGNATURE",    config_op_read,      cm_server,  op_signature },
 #endif
-    { "SETCHECKSUM",  config_op_read,     cm_server,  op_setchecksum },
+    { "STAT",         config_op_read,      cm_server,  op_stat },
+    { "STATFS",       config_op_read,      cm_server,  op_statfs },
+    { "STATUS",       config_op_status,    cm_any,     op_status },
+    { "STOP",         config_op_stop,      cm_any,     op_stop },
+    { "UPDATE",       config_op_setconf,   cm_any,     op_update },
 #if NOTIFY != NOTIFY_NONE
-    { "SETROOT",      config_op_read,     cm_server,  op_setroot },
-#endif
-#if THEY_HAVE_LIBRSYNC
-    { "SIGNATURE",    config_op_read,     cm_server,  op_signature },
-#endif
-    { "STAT",         config_op_read,     cm_server,  op_stat },
-    { "STATFS",       config_op_read,     cm_server,  op_statfs },
-    { "STATUS",       config_op_status,   cm_any,     op_status },
-    { "STOP",         config_op_stop,     cm_any,     op_stop },
-    { "UPDATE",       config_op_setconf,  cm_any,     op_update },
-#if NOTIFY != NOTIFY_NONE
-    { "WATCHES",      config_op_watches,  cm_server,  op_watches },
+    { "WATCHES",      config_op_watches,   cm_server,  op_watches },
 #endif
 };
 #define NR_COMMANDS (sizeof(commands) / sizeof(command_t))
@@ -1684,6 +1691,9 @@ const char * control_thread(void) {
 		//this->completed = 1;
 	    }
 	}
+	/* give other threads a chance to finish */
+	if (all_threads)
+	    poll(NULL, 0, 100);
     }
     return NULL;
 }

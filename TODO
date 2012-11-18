@@ -20,7 +20,6 @@ TODO for 1.0.-2:
   is not as easy as it sounds as we need to figure out what to do with the
   thread which called it), This is to stop librsync being dangerous. May
   be easier to rewrite librsync to behave sensibly.
-* client / should.1 - copy catch up: for example "should catchup=FILE"
 * server: if disallow_unix removes the last user, need to make the socket
   accessible by the owner only (if then allow_unix adds a user again, it
   can give the socket more permissions). This is only important during

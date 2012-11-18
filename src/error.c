@@ -31,6 +31,7 @@
 #include <ctype.h>
 #include <syslog.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
@@ -641,6 +642,29 @@ const char * error_sys_errno(const char * caller, const char * called,
     return error_sys_errno_r(err_name, LINE_SIZE, caller, called, code);
 }
 
+/* rotate log file without reopening: this is used both by error_report
+ * and error_rotate; called while holding a lock on stderr */
+
+static void rotatelog(const config_data_t * cfg) {
+    const char * lfname = config_strval(cfg, cfg_error_logfile);
+    int loglen = config_strlen(cfg, cfg_error_logfile);
+    int nrotate = config_intval(cfg, cfg_max_logfile_count), nf;
+    char from[loglen + 32], to[loglen + 32];
+    if (logfile) fclose(logfile);
+    logfile = NULL;
+    if (nrotate < 2) nrotate = 2;
+    snprintf(from, sizeof(from), "%s.%d", lfname, nrotate);
+    unlink(from);
+    for (nf = nrotate; nf > 0; nf--) {
+	if (nf > 1)
+	    snprintf(from, sizeof(from), "%s.%d", lfname, nf - 1);
+	else
+	    strcpy(from, lfname);
+	snprintf(to, sizeof(from), "%s.%d", lfname, nf);
+	rename(from, to);
+    }
+}
+
 /* reports an error during normal operation */
 
 void error_report(error_message_t em, ...) {
@@ -778,6 +802,21 @@ void error_report(error_message_t em, ...) {
     uselog = dest & (error_dest_file | error_dest_stderr);
     if (uselog) flockfile(stderr);
     if (dest & error_dest_file) {
+	off_t maxsize = config_intval(cfg, cfg_max_logfile_size);
+	if (maxsize > 0) {
+	    if (maxsize < 2048) maxsize = 2048; /* don't be silly */
+	    if (logfile) {
+		off_t size = ftello(logfile);
+		if (size >= maxsize)
+		    rotatelog(cfg);
+	    } else {
+		struct stat sbuff;
+		if (stat(config_strval(cfg, cfg_error_logfile), &sbuff) >= 0) {
+		    if (sbuff.st_size >= maxsize)
+			rotatelog(cfg);
+		}
+	    }
+	}
 	if (! logfile) {
 	    logfile = fopen(config_strval(cfg, cfg_error_logfile), "a");
 	    if (! logfile) {
@@ -812,8 +851,23 @@ void error_report(error_message_t em, ...) {
  * be used after rotating logs */
 
 void error_closelog(void) {
+    /* error_report uses a lock on stderr so we need to do the same */
+    flockfile(stderr);
     if (logfile) fclose(logfile);
     logfile = NULL;
+    funlockfile(stderr);
+}
+
+/* rotate logfile; this can also be called by error_report if the logfile
+ * grows too big */
+
+void error_rotate(void) {
+    const config_data_t * cfg = config_get();
+    /* error_report uses a lock on stderr so we need to do the same */
+    flockfile(stderr);
+    rotatelog(cfg);
+    funlockfile(stderr);
+    config_put(cfg);
 }
 
 /* get an error code from its name */

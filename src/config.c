@@ -174,6 +174,8 @@ static const int default_ints[cfg_int_COUNT] = {
     [cfg_optimise_buffer]          = 262144,
     [cfg_dirsync_interval]         = 0,
     [cfg_dirsync_deadline]         = 10,
+    [cfg_max_logfile_size]         = 10485760,
+    [cfg_max_logfile_count]        = 7,
 };
 
 FILE * config_copy_file = NULL;
@@ -395,6 +397,7 @@ static int assign_string(const char * line, const char * keyword,
     int len = strlen(keyword);
     if (strncmp(line, keyword, len) != 0) return 0;
     line += len;
+    if (*line && *line != '=' && ! isspace((int)*line)) return 0;
     while (*line && isspace((int)*line)) line++;
     if (*line != '=') {
 	snprintf(errbuff, LINE_SIZE, "Missing '=' after %s", keyword);
@@ -453,6 +456,7 @@ static int assign_int(const char * line, const char * keyword,
     char * endptr;
     if (strncmp(line, keyword, len) != 0) return 0;
     line += len;
+    if (*line && *line != '=' && ! isspace((int)*line)) return 0;
     while (*line && isspace((int)*line)) line++;
     if (*line != '=') {
 	snprintf(errbuff, LINE_SIZE, "Missing '=' after %s", keyword);
@@ -484,6 +488,7 @@ static int assign_unit(const char * line, const char * keyword,
     int len = strlen(keyword);
     if (strncmp(line, keyword, len) != 0) return 0;
     line += len;
+    if (*line && *line != '=' && ! isspace((int)*line)) return 0;
     while (*line && isspace((int)*line)) line++;
     if (*line != '=') {
 	snprintf(errbuff, LINE_SIZE, "Missing '=' after %s", keyword);
@@ -2095,6 +2100,10 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     p(arg, configs[cn].intval[cfg_client_mode] & config_client_closelog
 	    ? "closelog" : "#closelog");
     p(arg, "");
+    p(arg, "# Rotate logfiles");
+    p(arg, configs[cn].intval[cfg_client_mode] & config_client_rotatelog
+	    ? "rotatelog" : "#rotatelog");
+    p(arg, "");
     p(arg, "# Disable server's debugging mode for this connection");
     p(arg, configs[cn].intval[cfg_client_mode] & config_client_cleardebug
 	    ? "cleardebug" : "#cleardebug");
@@ -2268,8 +2277,12 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
 	    ? "oneshot" : "#oneshot");
     p(arg, "");
     p(arg, "# \"Peek\" mode, printing events to standard output");
-    p(arg, configs[cn].intval[cfg_client_mode] & config_client_peek
+    p(arg, configs[cn].intval[cfg_flags] & config_flag_copy_peek
 	    ? "peek" : "#peek");
+    p(arg, "");
+    p(arg, "# \"Catchup\" mode, ignoring events already present and waiting for new ones");
+    p(arg, configs[cn].intval[cfg_flags] & config_flag_copy_catchup
+	    ? "catchup" : "#catchup");
     p(arg, "");
     p(arg, HASH);
     p(arg, "# Error reporting");
@@ -2279,6 +2292,15 @@ void print_one(int (*p)(void *, const char *), void * arg, int cn) {
     p(arg, "");
     p(arg, "# Log file, for errors which are reported to file");
     printname(p, arg, "logfile = ", configs[cn].strval[cfg_error_logfile]);
+    p(arg, "");
+    p(arg, "# Maximum size of log file before forcing rotation");
+    sendformat(p, arg, "max_logfile_size = %s",
+	       config_print_unit(config_sizes,
+				 configs[cn].intval[cfg_max_logfile_size]));
+    p(arg, "");
+    p(arg, "# Number of old log files to keep after rotation");
+    sendformat(p, arg, "max_logfile_count = %d",
+	       configs[cn].intval[cfg_max_logfile_count]);
     p(arg, "");
     p(arg, "# Email address and submit program, for errors which are emailed");
     if (configs[cn].strval[cfg_error_email])
@@ -2410,6 +2432,7 @@ static void print_help(const char * bname) {
 	"    watches              lists all current watches (may give a lot of output)\n"
 	"    status               show server status\n"
 	"    closelog             close/reopen logfile: use this after rotating logfiles\n"
+	"    rotatelog            rotate logfile (implies closelog)\n"
 	"    stop, kill           stop running server\n"
 	"\n"
 	"Add options, can be specified after a /PATH (server) or add=/PATH (server\n"
@@ -2755,6 +2778,10 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 		*locfl |= locfl_checksum;
 		return NULL;
 	    }
+	    if (strcmp(line, "catchup") == 0) {
+		configs[cn].intval[cfg_flags] |= config_flag_copy_catchup;
+		return NULL;
+	    }
 	    st = NULL;
 	    if (assign_string(line, "config", assign_none, &st, NULL, &err)) {
 		if (err) return err;
@@ -2995,7 +3022,7 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 			      cn, cfg_from_prefix, &err))
 		return err;
 	    if (strcmp(line, "follow") == 0) {
-		configs[cn].intval[cfg_client_mode] |= config_client_peek;
+		configs[cn].intval[cfg_flags] |= config_flag_copy_peek;
 		return NULL;
 	    }
 	    break;
@@ -3148,7 +3175,7 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 			      cn, cfg_password, &err))
 		return err;
 	    if (strcmp(line, "peek") == 0) {
-		configs[cn].intval[cfg_client_mode] |= config_client_peek;
+		configs[cn].intval[cfg_flags] |= config_flag_copy_peek;
 		return NULL;
 	    }
 	    if (strcmp(line, "printconfig") == 0) {
@@ -3186,6 +3213,10 @@ static const char * parsearg_initial(const char * line, locfl_t * locfl) {
 			       &configs[cn].strarrval[cfg_strarr_remote_should],
 			       &err))
 		return err;
+	    if (strcmp(line, "rotatelog") == 0) {
+		configs[cn].intval[cfg_client_mode] |= config_client_rotatelog;
+		return NULL;
+	    }
 	    break;
 	case 's' :
 	    if (strcmp(line, "serverconfig") == 0) {
@@ -3694,6 +3725,12 @@ static const char * parsearg(const char * line, locfl_t * locfl, int is_initial)
 	    if (assign_int(line, "max_blocks",
 		&configs[cn].intval[cfg_notify_max], &err))
 		    return err;
+	    if (assign_unit(line, "max_logfile_size", config_sizes,
+			    &configs[cn].intval[cfg_max_logfile_size], &err))
+		return err;
+	    if (assign_int(line, "max_logfile_count",
+			   &configs[cn].intval[cfg_max_logfile_count], &err))
+		return err;
 	    st = NULL;
 	    erm = assign_error(line, "message", &st, &err, NULL);
 	    if (erm < error_MAX) {
@@ -4401,18 +4438,6 @@ int config_init(int argc, char *argv[]) {
 	{
 	    fprintf(stderr,
 		    "Incompatible options: copy and other client ops\n");
-	    goto fail;
-	}
-    }
-    if (configs[currnum].intval[cfg_client_mode] & config_client_peek) {
-	if (configs[currnum].intval[cfg_client_mode] &
-	    ~(config_client_peek |
-	      config_client_setdebug |
-	      config_client_client |
-	      config_client_cleardebug))
-	{
-	    fprintf(stderr,
-		    "Incompatible options: peek and other client ops\n");
 	    goto fail;
 	}
     }

@@ -176,8 +176,7 @@ int main(int argc, char *argv[]) {
     /* local client mode? */
     cfg = config_get();
     if (config_intval(cfg, cfg_client_mode) &&
-        ! (config_intval(cfg, cfg_client_mode) &
-	   (config_client_copy|config_client_peek)))
+        ! (config_intval(cfg, cfg_client_mode) & config_client_copy))
     {
 	status = client_run();
 	goto out_nothreads;
